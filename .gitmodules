@@ -1,0 +1,9 @@
+[submodule "pmm"]
+	path = pmm
+	url = git@github.com:percona/pmm.git
+[submodule "SEP"]
+	path = SEP
+	url = git@github.com:percona/SEP.git
+[submodule "mongo_terraform_ansible"]
+	path = mongo_terraform_ansible
+	url = https://github.com/plebioda/mongo_terraform_ansible

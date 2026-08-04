@@ -1,0 +1,115 @@
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			// Debug a run-python payload (pbm_logical_payload etc.) with the file open.
+			// Payloads run on the Nomad executor, never in the SEP process, so the
+			// backend config below never hits a breakpoint in them. This reproduces the
+			// executor contract locally: NOMAD_META_CONFIG, NOMAD_TASK_DIR, $HOME with
+			// a .mongodb_uri, and a stub `pbm` that records argv instead of touching a
+			// cluster. Breakpoints in the payload bind because runpy keeps its filename.
+			"name": "Payload: debug current file (stub pbm)",
+			"type": "debugpy",
+			"request": "launch",
+			"program": "${workspaceFolder}/debug/payload_runner.py",
+			"args": [
+				"${file}",
+				"--config",
+				"${workspaceFolder}/debug/example-backup-config.yaml"
+			],
+			"cwd": "${workspaceFolder}",
+			"python": "${workspaceFolder}/SEP/venv/bin/python",
+			"console": "integratedTerminal",
+			"justMyCode": false
+		},
+		{
+			// Debug the test file currently open — the payload tests stub subprocess and
+			// set NOMAD_META_CONFIG themselves, so this steps through payload logic too.
+			"name": "Pytest: current file",
+			"type": "debugpy",
+			"request": "launch",
+			"module": "pytest",
+			"args": [
+				"${file}",
+				"-vv",
+				"-s",
+				"--no-cov",
+				"-p",
+				"no:xdist"
+			],
+			"cwd": "${workspaceFolder}/SEP",
+			"python": "${workspaceFolder}/SEP/venv/bin/python",
+			"console": "integratedTerminal",
+			"justMyCode": false
+		},
+		{
+			"name": "Pytest: backup_mongo (payload + contract)",
+			"type": "debugpy",
+			"request": "launch",
+			"module": "pytest",
+			"args": [
+				"tests/app/sep/apps/backup_mongo/",
+				"-vv",
+				"-s",
+				"--no-cov",
+				"-p",
+				"no:xdist"
+			],
+			"cwd": "${workspaceFolder}/SEP",
+			"python": "${workspaceFolder}/SEP/venv/bin/python",
+			"console": "integratedTerminal",
+			"justMyCode": false
+		},
+		{
+			"name": "Debug SEP FastAPI Backend (Python)",
+			"type": "debugpy",
+			"request": "launch",
+			"module": "app.main",
+			"cwd": "${workspaceFolder}/SEP",
+			"python": "${workspaceFolder}/SEP/venv/bin/python",
+			"args": [],
+			"env": {
+				"PYTHONPATH": "${workspaceFolder}/SEP"
+			},
+			"console": "integratedTerminal"
+		},
+		{
+			"name": "Pytest SEP (All Tests)",
+			"type": "debugpy",
+			"request": "launch",
+			"module": "pytest",
+			"cwd": "${workspaceFolder}/SEP",
+			"python": "${workspaceFolder}/SEP/venv/bin/python",
+			"args": [
+				"tests/"
+			],
+			"console": "integratedTerminal"
+		},
+		{
+			"name": "Debug PMM Managed (Go)",
+			"type": "go",
+			"request": "launch",
+			"mode": "auto",
+			"program": "${workspaceFolder}/pmm/managed/main.go",
+			"cwd": "${workspaceFolder}/pmm",
+			"env": {}
+		},
+		{
+			"name": "Debug PMM Agent (Go)",
+			"type": "go",
+			"request": "launch",
+			"mode": "auto",
+			"program": "${workspaceFolder}/pmm/agent/main.go",
+			"cwd": "${workspaceFolder}/pmm",
+			"env": {}
+		},
+		{
+			"name": "Run PMM Go Tests (Package)",
+			"type": "go",
+			"request": "launch",
+			"mode": "test",
+			"program": "${fileDirname}",
+			"cwd": "${workspaceFolder}/pmm"
+		}
+	]
+}

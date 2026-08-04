@@ -1,0 +1,24 @@
+# Runtime state written by ./om — pids, logs, and whatever a component leaves
+# behind. Recreated on every `./om start`.
+.om/
+sandbox.log
+*.log
+
+# Secrets. None of these are templates or examples — they hold live values.
+#   passwd.txt          scratch credentials for the dev stack
+#   nomad/secrets/      PBM_MONGODB_URI and AWS credentials that ./om psmdb-link
+#                       lifts out of a deployed sandbox environment. `./om start
+#                       nomad` recreates both as empty 600 files when absent, so
+#                       ignoring the directory outright costs nothing.
+passwd.txt
+nomad/secrets/
+.env
+*.pem
+*.key
+
+# Working notes, kept local. docs/ is the committed documentation.
+notes/
+todo/
+
+# Per-machine Claude Code permissions. .claude/settings.json IS committed.
+.claude/settings.local.json

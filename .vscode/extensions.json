@@ -1,0 +1,18 @@
+{
+	"recommendations": [
+		"golang.go",
+		"ms-python.python",
+		"ms-python.vscode-pylance",
+		"charliermarsh.ruff",
+		"esbenp.prettier-vscode",
+		"dbaeumer.vscode-eslint",
+		"oxc.oxc-vscode",
+		"saoudrizwan.claude-dev",
+		"anthropic.claude-code",
+		"ms-azuretools.vscode-docker",
+		"redhat.vscode-yaml",
+		"ms-vscode.makefile-tools",
+		"tamasfe.even-better-toml",
+		"eamodio.gitlens"
+	]
+}

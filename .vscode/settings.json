@@ -1,0 +1,103 @@
+{
+	// Claude Code Extension Settings
+	"claudeCode.useTerminal": false,
+
+	// Python Settings (SEP)
+	"python.defaultInterpreterPath": "${workspaceFolder}/SEP/venv/bin/python",
+	"python.languageServer": "Pylance",
+	"python.analysis.typeCheckingMode": "basic",
+	"python.analysis.indexing": true,
+	"python.analysis.autoSearchPaths": true,
+	"python.analysis.extraPaths": [
+		"${workspaceFolder}/SEP/app",
+		"${workspaceFolder}/SEP"
+	],
+	"python.terminal.activateEnvironment": true,
+	"[python]": {
+		"editor.defaultFormatter": "charliermarsh.ruff",
+		"editor.formatOnSave": true,
+		"editor.codeActionsOnSave": {
+			"source.organizeImports.ruff": "explicit",
+			"source.fixAll.ruff": "explicit"
+		}
+	},
+
+	// Go Settings (PMM)
+	"go.useLanguageServer": true,
+	"go.formatTool": "gofmt",
+	"go.lintTool": "golangci-lint",
+	"go.lintFlags": [
+		"--fast"
+	],
+	"go.goplsOptions": {
+		"formatting.gofumpt": true,
+		"ui.completion.usePlaceholders": true,
+		"ui.diagnostic.staticcheck": true
+	},
+	"[go]": {
+		"editor.defaultFormatter": "golang.go",
+		"editor.formatOnSave": true,
+		"editor.codeActionsOnSave": {
+			"source.organizeImports": "explicit"
+		}
+	},
+
+	// ESLint & TypeScript Settings
+	"eslint.workingDirectories": [
+		"./pmm/ui",
+		"./SEP/frontend"
+	],
+	"typescript.suggest.completeFunctionCalls": true,
+	"[typescript]": {
+		"editor.defaultFormatter": "esbenp.prettier-vscode",
+		"editor.formatOnSave": true
+	},
+	"[typescriptreact]": {
+		"editor.defaultFormatter": "esbenp.prettier-vscode",
+		"editor.formatOnSave": true
+	},
+	"[javascript]": {
+		"editor.defaultFormatter": "esbenp.prettier-vscode",
+		"editor.formatOnSave": true
+	},
+	"[javascriptreact]": {
+		"editor.defaultFormatter": "esbenp.prettier-vscode",
+		"editor.formatOnSave": true
+	},
+
+	// Formatting for Config Files
+	"[json]": {
+		"editor.defaultFormatter": "esbenp.prettier-vscode",
+		"editor.formatOnSave": true
+	},
+	"[jsonc]": {
+		"editor.defaultFormatter": "esbenp.prettier-vscode",
+		"editor.formatOnSave": true
+	},
+	"[yaml]": {
+		"editor.defaultFormatter": "redhat.vscode-yaml",
+		"editor.formatOnSave": true
+	},
+
+	// Performance Exclusions
+	"files.watcherExclude": {
+		"**/.git/objects/**": true,
+		"**/.git/subtree-cache/**": true,
+		"**/node_modules/*/**": true,
+		"**/venv/*/**": true,
+		"**/build/**": true,
+		"**/dist/**": true,
+		"**/.ruff_cache/**": true
+	},
+	"search.exclude": {
+		"**/node_modules": true,
+		"**/venv": true,
+		"**/build": true,
+		"**/dist": true,
+		"**/.coverage": true,
+		"**/.ruff_cache": true,
+		"**/go.sum": true,
+		"**/pnpm-lock.yaml": true,
+		"**/yarn.lock": true
+	}
+}

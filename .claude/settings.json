@@ -1,0 +1,33 @@
+{
+	"projectName": "OpenManager (PMM & SEP Cross-Repo)",
+	"primaryLanguages": ["go", "python", "typescript"],
+	"docEntrypoint": "CLAUDE.md",
+	"components": [
+		{
+			"name": "PMM",
+			"path": "pmm",
+			"language": "go",
+			"documentation": "pmm/AGENTS.md"
+		},
+		{
+			"name": "SEP",
+			"path": "SEP",
+			"language": "python",
+			"documentation": "SEP/AGENTS.md"
+		}
+	],
+	"commands": {
+		"lint": {
+			"pmm": "cd pmm && golangci-lint run ./...",
+			"sep": "cd SEP && make lint"
+		},
+		"test": {
+			"pmm": "cd pmm && make test",
+			"sep": "cd SEP && make test"
+		},
+		"format": {
+			"pmm": "cd pmm && gofmt -w .",
+			"sep": "cd SEP && make format"
+		}
+	}
+}

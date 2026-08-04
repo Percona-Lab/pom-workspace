@@ -1,0 +1,180 @@
+# Dev-infrastructure compose for the OpenManager workspace.
+#
+# Runs only the services SEP depends on. SEP itself (backend + frontend) runs
+# natively from the working tree via `make dev-backend` / `make dev-frontend` in
+# SEP/, so your edits are live with no image rebuild.
+#
+# Normally you do not invoke this file directly — `./om` orchestrates it together
+# with SEP (native) and PMM (its own devcontainer):
+#
+#   ./om start            # everything
+#   ./om start deps       # just this compose file
+#   ./om status
+#
+# Driving it by hand still works; it is the default compose file for the
+# workspace root, so no `-f` is needed when run from /home/plebioda/openmanager:
+#
+#   docker compose up -d                    # Casdoor
+#   docker compose down                     # stop, keep data
+#   docker compose down -v                  # stop and wipe data (re-seeds Casdoor)
+#   docker compose ps
+#
+# Distinct from the two in-repo compose files, which it neither merges with nor
+# replaces:
+#   SEP/docker-compose.yml       full production-shaped SEP topology (SEP from a
+#                                built image, Postgres, Redis, Celery, nginx/TLS)
+#   pmm/docker-compose.dev.yml   PMM's own dev stack
+# The explicit project name below keeps this stack's containers and networks
+# separate from theirs — SEP/docker-compose.yml also defines a `casdoor` service
+# and a `casdoor-data` volume.
+name: openmanager-dev
+
+services:
+  # Auth provider. SEP's settings.yaml ships AUTH.PROVIDER.casdoor pointing at
+  # localhost:9999 with application_name `sep-app`, so this must be published on
+  # 9999 and seeded from SEP/data/casdoor_init_data.json — the stock image's
+  # `app-built-in` application will NOT satisfy that config.
+  #
+  # Seed that file first, from inside SEP/ (one time only — re-running rotates
+  # the client secret, so you would also have to refresh SEP/.env):
+  #   cd SEP && ./generate_casdoor_init_data.sh -p devpassword
+  casdoor:
+    image: docker.io/casbin/casdoor-all-in-one
+    ports:
+      # Container listens on 8000; 9999 is what settings.yaml's allowed_issuers expect.
+      - "${CASDOOR_PORT:-9999}:8000"
+    volumes:
+      # The all-in-one image bundles MySQL; this persists the seeded users/app
+      # across restarts. Drop it (`down -v`) to force a re-seed.
+      #
+      # Deliberately without SEP/docker-compose.yml's `:z,rw` suffix. `rw` is the
+      # default, and `:z` (SELinux relabel) is only meaningful for bind mounts —
+      # on a named volume Compose normalizes it to `bind: {selinux: z}` on a
+      # `type: volume` mount and warns on every `up`. Docker labels named-volume
+      # content itself, so dropping it changes nothing, SELinux host or not.
+      - casdoor-data:/var/lib/mysql
+      # Long-form bind with create_host_path: false so a missing init-data file
+      # is a hard error. With the short `./SEP/data/...:/init_data.json` form
+      # Docker silently creates a *directory* at that path and Casdoor boots
+      # unseeded — surfacing much later as an unexplained login failure.
+      - type: bind
+        source: ./SEP/data/casdoor_init_data.json
+        target: /init_data.json
+        read_only: true
+        bind:
+          create_host_path: false
+    restart: unless-stopped
+
+  # Nomad executor for SEP task dispatch. OPT-IN via profile:
+  #
+  #   ./om start nomad         (or: docker compose --profile nomad up -d)
+  #
+  # SEP needs an executor for *any* task form to be usable, not just to run
+  # tasks: every task app inherits a HostRef "Execution Host" field whose options
+  # come from GET /api/sep/hosts/ -> Tasks /hosts/ -> executor.get_hosts(). With
+  # no Nomad the UI shows "Failed to get a response from Nomad" and the form
+  # cannot be submitted at all. SEP has a CELERY backend in TaskBackendEnum, but
+  # nothing in the UI path selects it (the hosts proxy passes no `backend` param
+  # and there is no setting), so Nomad is the only route today.
+  #
+  # SEP reaches this on the published port via its default
+  # TASKS__NOMAD__ENDPOINT of http://127.0.0.1:4646 — no SEP config needed.
+  #
+  # To run tasks against a PSMDB sandbox cluster, this container must also join
+  # that environment's docker network, because PMM registers those services by
+  # *container* hostname (omtest1-cl01-mongos00) and their host ports are
+  # randomised. `./om psmdb-link <env>` attaches it alongside the repo PMM.
+  nomad:
+    profiles:
+      - nomad
+    build:
+      context: ./nomad
+    container_name: om-nomad
+    # Nomad names the client node after its hostname, which otherwise defaults to
+    # the container ID. SEP persists that string on each task as `executor_host`
+    # and shows it in the Execution Host dropdown, so letting it change on every
+    # recreate would orphan existing tasks.
+    hostname: om-nomad
+    # Nomad wants to write cgroups and manage processes for raw_exec. Scoped to
+    # a local dev sandbox; do not copy this into anything shared.
+    privileged: true
+    # Running a Nomad *client* in a container on cgroups v2 needs both of these.
+    # Without them the agent dies at startup with:
+    #   failed to create nomad cgroup: write /sys/fs/cgroup/cgroup.subtree_control:
+    #   device or resource busy
+    # because a cgroup that already holds processes cannot enable subtree_control.
+    # Sharing the host cgroup namespace plus a writable mount lets Nomad manage
+    # its own /sys/fs/cgroup/nomad subtree instead of the container's busy root.
+    cgroup: host
+    ports:
+      - "${NOMAD_PORT:-4646}:4646"
+    volumes:
+      - type: bind
+        source: ./nomad/nomad.hcl
+        target: /etc/nomad.d/nomad.hcl
+        read_only: true
+        bind:
+          create_host_path: false
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - nomad-data:/nomad/data
+      # Credentials the SEP payloads read, bind-mounted from the host so they
+      # survive `docker compose up --force-recreate` (a rebuilt image previously
+      # wiped them and every backup failed with "Credentials file not found:
+      # /root/.mongodb_uri" until psmdb-link was re-run).
+      #   .mongodb_uri     -> PBM_MONGODB_URI, set by the backup/restore payloads
+      #   .aws/credentials -> the AWS chain, since SEP's form carries no S3 secrets
+      # `./om start nomad` creates both as empty 600 files if absent, and
+      # `./om psmdb-link <env>` fills them in from the environment's own containers.
+      # create_host_path: false so a missing file is an error rather than Docker
+      # silently creating a directory in its place.
+      - type: bind
+        source: ./nomad/secrets/mongodb_uri
+        target: /root/.mongodb_uri
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./nomad/secrets/aws-credentials
+        target: /root/.aws/credentials
+        bind:
+          create_host_path: false
+    restart: unless-stopped
+
+# NOTE: there is deliberately no `pmm-server` service here.
+#
+# PMM runs from its own repo instead, via pmm/docker-compose.dev.yml, which
+# mounts the working tree into a devcontainer so `make run-all` compiles your Go
+# changes into the running server. A stock `percona/pmm-server:3` service here
+# would collide with it on both the `pmm-server` container name and port 8443,
+# and would run release binaries rather than your code. `./om start pmm` drives
+# PMM's own tooling — see ./om and notes/sep-dev-quickstart.md.
+
+# ---------------------------------------------------------------------------
+# Connecting SEP to PMM (only once PMM is running — `./om start pmm`)
+#
+# 1. Open https://localhost:8443 and log in (admin / admin by default).
+#    Accept the self-signed certificate warning.
+# 2. PMM 3 has no "API keys" page — that was PMM 2. Create a **service account
+#    token**: Administration > Users and access > Service accounts > Add service
+#    account, give it the Admin role, then Add service account token.
+# 3. Put the token in SEP/.env (NOT settings.yaml — it's a secret):
+#       PMM__API_KEY=<the token>
+#    SEP sends it as `Authorization: Bearer <key>` (see
+#    SEP/app/core/requests/remote_api.py::auth), which is exactly how a PMM 3
+#    service account token is consumed — so the PMM__API_KEY name still fits.
+# 4. Enable the syncer in SEP/settings.yaml under SEP.SYNCERS:
+#       - SYNCER: PMMSyncer
+#
+# TLS needs no extra work: FASTAPI_ENV defaults to "development", and
+# settings.yaml's `development:` block already sets PMM.VERIFY_SSL: false, so
+# PMM's self-signed cert is accepted.
+# ---------------------------------------------------------------------------
+
+volumes:
+  # Pinned to the bare name (no `openmanager-dev_` prefix) so this keeps using the
+  # volume created before this file moved to the workspace root, and adopts one
+  # from a hand-run `docker run --volume casdoor-data:...`. It also stays distinct
+  # from SEP/docker-compose.yml's `sep_casdoor-data`.
+  casdoor-data:
+    name: casdoor-data
+  # Only created when the `nomad` profile is used.
+  nomad-data:

@@ -1,0 +1,13 @@
+# Mirrors what SEP puts in NOMAD_META_CONFIG for a MongoDB Backups task.
+# Matches the omtest1 sandbox environment; edit freely when reproducing a bug.
+storage:
+  type: s3
+  s3:
+    region: us-east-1
+    bucket: mongo-backups
+    prefix: omtest1-cl01
+    endpointUrl: http://omtest1-minio:9000
+pitr:
+  enabled: false
+backup:
+  compression: s2
