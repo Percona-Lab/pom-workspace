@@ -7,3 +7,4 @@
 [submodule "mongo_terraform_ansible"]
 	path = mongo_terraform_ansible
 	url = https://github.com/plebioda/mongo_terraform_ansible
+	branch = feature/local-deploy-fixes
