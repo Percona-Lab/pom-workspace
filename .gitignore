@@ -16,6 +16,10 @@ nomad/secrets/
 *.pem
 *.key
 
+# Byte-cache for the tools/ scripts. sandbox.py is imported by its siblings, so
+# running any of them leaves a __pycache__ behind, one per interpreter version.
+__pycache__/
+
 # Working notes, kept local. docs/ is the committed documentation.
 notes/
 todo/
