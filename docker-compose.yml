@@ -106,6 +106,17 @@ services:
     # Sharing the host cgroup namespace plus a writable mount lets Nomad manage
     # its own /sys/fs/cgroup/nomad subtree instead of the container's busy root.
     cgroup: host
+    # Snippet/script execution is an *artifact* fetch: SEP hands Nomad a signed
+    # http://.../artifacts/download/<token> URL and the client curls it back from
+    # SEP before running the script. So this container has to be able to reach
+    # SEP on the host. It cannot by default — the image's embedded DNS resolves
+    # host.docker.internal to 127.0.0.1 (i.e. the container itself), so the fetch
+    # fails with a connection refused that surfaces only as a failed Nomad alloc.
+    # This entry pins it to the real host gateway; /etc/hosts wins over DNS.
+    # SEP's side of the same fix: settings.yaml (development) binds uvicorn on
+    # 0.0.0.0 and sets SNIPPETS.SNIPPETS_BASE_URL to this hostname.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${NOMAD_PORT:-4646}:4646"
     volumes:
