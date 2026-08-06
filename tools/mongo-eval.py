@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """Run a mongosh command against every MongoDB node of a sandbox environment.
 
-    ./tools/mongo-eval.py omtest1 'rs.status().myState'
-    ./tools/mongo-eval.py omtest1 'db.serverStatus().connections'
-    ./tools/mongo-eval.py omtest1 --role shard 'db.hello().isWritablePrimary'
-    ./tools/mongo-eval.py omtest1 --rs omtest1-cl01-shard00 'rs.status()'
+    ./tools/mongo-eval.py sharded-cluster 'rs.status().myState'
+    ./tools/mongo-eval.py replicaset-cluster 'db.serverStatus().connections'
+    ./tools/mongo-eval.py sharded-cluster --role shard 'db.hello().isWritablePrimary'
+    ./tools/mongo-eval.py sharded-cluster --rs sharded-cluster-shard00 'rs.status()'
     ./tools/mongo-eval.py omtest1 --file check.js
     echo 'db.version()' | ./tools/mongo-eval.py omtest1 -
+
+The environment is a compose profile name (``standalone``,
+``replicaset-single``, ``replicaset-cluster``, ``sharded-cluster``) or a
+Terraform sandbox prefix (``omtest1``) -- see ``tools/sandbox.py``.
 
 Commands run **inside** each container via ``docker exec … mongosh``, not from
 the host. That deliberately sidesteps the two things that make host-side access
 awkward: no mongosh needs to be installed locally, and no ``/etc/hosts`` entries
-or published-port lookups are involved, so this keeps working after a redeploy
-renumbers everything.
+or published ports are involved -- psmdb/compose.yaml publishes none at all, and
+this keeps working after a redeploy renumbers everything.
 
 Arbiters are skipped by default. They hold no user documents, so authenticating
 against one cannot succeed -- pass ``--arbiters`` to attempt them anyway.
 
 Exit status is 0 only if every node succeeded, so this is usable in a check:
 
-    ./tools/mongo-eval.py omtest1 'db.hello().ok' >/dev/null || echo "cluster sick"
+    ./tools/mongo-eval.py sharded-cluster 'db.hello().ok' >/dev/null || echo "cluster sick"
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ import json
 import subprocess
 import sys
 
-from sandbox import discover, role  # tools/sandbox.py, alongside this script
+from sandbox import credentials, discover, environments, role  # tools/sandbox.py
 
 C_RESET, C_BOLD, C_DIM = "\033[0m", "\033[1m", "\033[2m"
 C_RED, C_GREEN, C_CYAN = "\033[31m", "\033[32m", "\033[36m"
@@ -71,18 +75,21 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Runs inside the containers, so no local mongosh or /etc/hosts is needed.",
     )
-    ap.add_argument("env", help="environment prefix, e.g. omtest1")
+    ap.add_argument("env", help="environment prefix, e.g. sharded-cluster")
     ap.add_argument("command", nargs="?",
                     help="javascript to evaluate; '-' reads it from stdin")
     ap.add_argument("--file", metavar="PATH", help="read the javascript from a file")
-    ap.add_argument("--role", choices=("mongos", "config", "shard", "arbiter"),
-                    action="append", help="limit to a role (repeatable)")
+    ap.add_argument("--role", action="append",
+                    choices=("mongos", "config", "shard", "arbiter", "replica", "standalone"),
+                    help="limit to a role (repeatable)")
     ap.add_argument("--rs", metavar="NAME", help="limit to one replica set")
     ap.add_argument("--node", metavar="SUBSTR", help="limit to nodes whose name contains SUBSTR")
     ap.add_argument("--arbiters", action="store_true",
                     help="include arbiters (they cannot authenticate; off by default)")
-    ap.add_argument("--user", default="root")
-    ap.add_argument("--password", default="percona")
+    # Default to whatever the containers declare (MONGO_ROOT_USER/PASSWORD, which
+    # differs per sandbox), so neither pair has to be remembered per environment.
+    ap.add_argument("--user", help="override the user the containers declare")
+    ap.add_argument("--password", help="override the password the containers declare")
     ap.add_argument("--db", default="admin", help="database context (default: %(default)s)")
     ap.add_argument("--timeout", type=int, default=30, help="per-node seconds (default: %(default)s)")
     ap.add_argument("--jobs", type=int, default=8, help="parallel nodes (default: %(default)s)")
@@ -104,7 +111,10 @@ def main() -> int:
 
     nodes = discover(args.env)
     if not nodes:
-        sys.exit(f"no running mongo containers matching '{args.env}-' — is the environment up?")
+        sys.exit(f"no running mongo containers matching '{args.env}-' — is the environment up?\n"
+                 f"running environments: {', '.join(environments()) or 'none'}")
+    user, password = credentials(nodes)
+    user, password = args.user or user, args.password or password
 
     selected = [n for n in nodes if args.arbiters or not n["arbiter"]]
     if args.role:
@@ -118,7 +128,7 @@ def main() -> int:
 
     # Ordered results from unordered completion: submit in order, read in order.
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        futures = [pool.submit(run_one, n, js, args.user, args.password, args.db, args.timeout)
+        futures = [pool.submit(run_one, n, js, user, password, args.db, args.timeout)
                    for n in selected]
         results = [f.result() for f in futures]
 
