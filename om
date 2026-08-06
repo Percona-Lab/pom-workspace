@@ -303,7 +303,7 @@ cmd_doctor() {
 
   # Node/pnpm gate the SEP frontend only. PMM's UI builds inside its
   # devcontainer, which ships its own Node.
-  if node_ok; then
+  if ensure_node "$(node_version)"; then
     ok "node v$(node_version)"
   elif [[ -n "$(node_version)" ]]; then
     err "node v$(node_version) is too old — SEP's frontend requires >= $NODE_MIN (blocks sep-frontend only)"
@@ -382,6 +382,7 @@ om_setup_sep() {
   bootstrap_beat_schema || warn "continuing; sep-backend will not start until this succeeds"
 
   info "SEP: frontend dependencies"
+  ensure_node "$(node_version)" || true
   if node_ok && command -v pnpm >/dev/null 2>&1; then
     ( cd "$SEP_DIR/frontend" && pnpm install )
     ok "frontend node_modules ready"
@@ -483,19 +484,23 @@ stop_pmm() {
 }
 
 start_sep_backend() {
-  # SEP_CELERY=1 also runs the celery worker + beat in-process (SEP's
-  # --start-celery). Off by default: the schedule tables already exist after
-  # setup, and scheduled tasks are not needed for app development.
+  # The celery worker + beat run in-process (SEP's --start-celery) by default:
+  # without them nothing executes. Task execution is dispatched through celery
+  # (app/tasks/routes.py :: execute_task_queue.apply_async), running-task status
+  # comes from the 30s sync_running_tasks periodic, and the snippet catalog is
+  # populated by sync_snippets.delay() at startup — with no worker those all
+  # queue up in data/celery/broker/ and silently never run. SEP_CELERY=0 opts
+  # out for the rare uvicorn-only case.
   local celery_note="" make_args=()
-  if [[ "${SEP_CELERY:-0}" != "0" ]]; then
+  if [[ "${SEP_CELERY:-1}" != "0" ]]; then
     make_args=(START_CELERY=1); celery_note=" + celery worker/beat"
   fi
   info "sep-backend: uvicorn (native, reload on)${celery_note}"
   [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
-  if [[ "${SEP_CELERY:-0}" == "0" ]] && ! beat_schema_ready; then
+  if [[ "${SEP_CELERY:-1}" == "0" ]] && ! beat_schema_ready; then
     err "the Celery beat schedule tables are missing, so startup would fail with"
     err "  'no such table: main.celery_intervalschedule'"
-    die "run './om setup' (it bootstraps them), or start with SEP_CELERY=1"
+    die "run './om setup' (it bootstraps them), or drop SEP_CELERY=0"
   fi
   if port_busy "$SEP_BACKEND_PORT" && ! read_pid sep-backend >/dev/null; then
     die "port $SEP_BACKEND_PORT is already in use by something om did not start"
@@ -513,7 +518,7 @@ start_sep_backend() {
 
 start_sep_frontend() {
   info "sep-frontend: vite (native)"
-  if ! node_ok; then
+  if ! ensure_node "$(node_version)"; then
     local v; v="$(node_version)"
     err "node >= $NODE_MIN required (found ${v:-none})"
     [[ -s "$HOME/.nvm/nvm.sh" ]] && dim "nvm install 22 && nvm alias default 22"
