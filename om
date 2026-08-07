@@ -13,13 +13,38 @@
 #   ./om status             what is running, and on which ports
 #   ./om logs <comp> [-f]   show logs
 #   ./om build pmm          compile the PMM working tree into the running server
+#   ./om build ui           rebuild pmm/ui and deploy it into the running server
+#                           (./om start pmm does this automatically when the
+#                           container is serving the image's stale bundle)
 #   ./om psmdb-link <env>   point a PSMDB sandbox env's agents at the repo PMM
+#   ./om poc [sub] [run]    inspect the PSMDB PoC app (see below)
+#   ./om urls [comp...]     every URI a component serves (vmui, Swagger, ...)
 #   ./om ports              report port collisions across all four stacks
 #   ./om doctor             check prerequisites only
 #
-# Components: deps, pmm, nomad, sep-backend, sep-frontend, sandbox
-# Groups:     sep (= sep-backend + sep-frontend), all (default; excludes
-#             sandbox and nomad, which are opt-in)
+# PSMDB PoC (SEP/app/sep/apps/psmdb_poc). Every subcommand defaults to the most
+# recent run; pass a run id (or its bare uuid) to pick another:
+#
+#   ./om poc                overview: status, counts, resolved services
+#   ./om poc runs           recent runs, newest first
+#   ./om poc nodes          the full service -> executor mapping, orphans included
+#   ./om poc probe [svc]    per-node probe JSON, raw command output trimmed
+#   ./om poc probe-raw      the same, untrimmed
+#   ./om poc tasks          dispatched Nomad runs and their status
+#   ./om poc task-log <id>  one dispatched run's captured output
+#   ./om poc metrics        what reached VictoriaMetrics (needs EMIT_METRICS)
+#   ./om poc run            trigger a run, then show it
+#   ./om poc sync           refresh inventory from PMM (do this after a rebuild)
+#
+# Components: deps, pmm, nomad, sep-backend, sep-frontend, sandbox,
+#             and the PSMDB clusters: standalone, replicaset-single,
+#             replicaset-cluster, sharded-cluster (psmdb/compose.yaml; each needs pmm running first)
+# Groups:     sep (= sep-backend + sep-frontend), clusters (= all four PSMDB
+#             topologies, also spelled psmdb), all (default; excludes sandbox,
+#             nomad and the clusters, which are opt-in)
+#
+#   ./om start pmm sep replicaset-cluster   a full stack with a 3-node replica set
+#   ./om stop replicaset-cluster            containers down, data volumes kept
 
 set -euo pipefail
 
@@ -37,6 +62,15 @@ PMM_HTTPS_PORT=8443
 PMM_CONTAINER=pmm-server
 # Where pmm/docker-compose.dev.yml mounts the repo inside the container.
 PMM_WORKDIR=/root/go/src/github.com/percona/pmm
+# nginx serves /pmm-ui from this directory (build/ansible/.../pmm.conf), and the
+# dev image bakes in a bundle built from whatever `main` was at image build time.
+# That prebuilt bundle predates the SEP-in-PMM work, so the two SEP apps are
+# absent until the working tree is built over it — see ensure_pmm_ui.
+PMM_UI_DIR=/usr/share/pmm-ui
+# A string that only the working tree's router emits (lib/constants.ts ::
+# SEP_MYSQL_BACKUPS_PATH). Its presence in the deployed bundle is the cheap
+# "is this our UI, with the SEP apps?" probe.
+PMM_UI_SEP_MARKER='sep/mysql-backups'
 
 SEP_BACKEND_PORT=8000
 SEP_FRONTEND_PORT=5174
@@ -59,6 +93,17 @@ SANDBOX_NETWORK_SUFFIX=mongo-terraform
 # environment's network to reach services PMM registered by container hostname.
 NOMAD_CONTAINER=om-nomad
 NOMAD_PORT="${OM_NOMAD_PORT:-4646}"
+
+# PSMDB clusters (psmdb/compose.yaml). Four topologies as compose profiles, each
+# node one container running mongod/mongos + pbm-agent + pmm-agent — and
+# pmm-agent >= 3.2.0 carries a Nomad *client*, so every node is a SEP execution
+# host. They join pmm_default rather than defining a network, so PMM has to be up
+# first; start_psmdb enforces that rather than letting compose fail obscurely.
+# Not to be confused with `sandbox`, which is the Terraform-driven UI on :5001.
+PSMDB_DIR="$ROOT/psmdb"
+PSMDB_PROFILES=(standalone replicaset-single replicaset-cluster sharded-cluster)
+PSMDB_IMAGE="openmanager/psmdb-node:7.0"
+PSMDB_NETWORK=pmm_default
 
 NODE_MIN="22.22.0"
 PNPM_PIN="11.1.3"
@@ -462,6 +507,63 @@ stop_deps() {
   ok "deps stopped (volumes kept)"
 }
 
+# 0 when the bundle nginx serves is our working tree's (i.e. carries the SEP apps).
+pmm_ui_has_sep() {
+  docker exec -i --user root "$PMM_CONTAINER" \
+    grep -rqs "$PMM_UI_SEP_MARKER" "$PMM_UI_DIR" 2>/dev/null
+}
+
+# The devcontainer image has node but neither pnpm nor corepack, and `ui`'s own
+# `make setup` assumes corepack. Install the version pinned by ui/package.json's
+# `packageManager` so the lockfile is honoured, rather than whatever is latest.
+ensure_container_pnpm() {
+  docker exec -i --user root "$PMM_CONTAINER" sh -c 'command -v pnpm' >/dev/null 2>&1 && return 0
+  local pinned
+  pinned="$(sed -n 's/.*"packageManager": *"\(pnpm@[0-9.]*\).*/\1/p' "$PMM_DIR/ui/package.json" | head -1)"
+  [[ -n "$pinned" ]] || pinned=pnpm
+  dim "installing $pinned in the container (no pnpm/corepack in the dev image)"
+  docker exec -i --user root "$PMM_CONTAINER" npm i -g "$pinned" >/dev/null 2>&1 \
+    || { err "could not install $pinned in $PMM_CONTAINER"; return 1; }
+}
+
+# Build the working tree's UI over the image's prebuilt bundle. Without this the
+# two SEP apps (Collect Diagnostic Data, MySQL Backups) are simply not in the
+# JS nginx serves, so they appear nowhere in PMM no matter how the backend is
+# configured. `build-ui` deploys a static bundle rather than running Vite, so it
+# survives for the container's lifetime with no process to keep alive — but a
+# container recreate resets it to the image's copy, which is why this runs on
+# every start. Pass force=1 (or `./om build ui`) to rebuild after UI edits.
+ensure_pmm_ui() {
+  local force="${1:-0}"
+  if [[ "${OM_PMM_UI:-1}" == "0" ]]; then
+    dim "pmm-ui: skipped (OM_PMM_UI=0) — SEP apps will be missing from the UI"
+    return 0
+  fi
+  if [[ "$force" != "1" ]] && pmm_ui_has_sep; then
+    ok "pmm-ui: working tree bundle already deployed (SEP apps present)"
+    return 0
+  fi
+  ensure_container_pnpm || { warn "pmm-ui: left at the image's bundle — SEP apps missing"; return 0; }
+  info "pmm-ui: building ui/ and deploying over the image's bundle (minutes on a cold cache)"
+  local log; log="$(log_file pmm-ui)"
+  mkdir -p "$LOG_DIR"
+  # No -t: there is no TTY here. build-ui restarts grafana at the end so the
+  # pmm-compat plugin is reloaded alongside the new bundle.
+  if docker exec -i --user root --workdir="$PMM_WORKDIR" "$PMM_CONTAINER" make build-ui >"$log" 2>&1; then
+    if pmm_ui_has_sep; then
+      ok "pmm-ui: deployed — /pmm-ui/sep/atw and /pmm-ui/sep/mysql-backups are live"
+    else
+      # A clean build whose output lacks the marker means the checked-out branch
+      # does not carry the SEP routes, not that the deploy failed.
+      warn "pmm-ui: built, but no SEP routes in it — is this branch missing PMM-15216?"
+    fi
+  else
+    warn "pmm-ui: build failed — UI left at the image's bundle (SEP apps missing)"
+    dim "log: $log"
+    tail -n 15 "$log" >&2 || true
+  fi
+}
+
 start_pmm() {
   info "pmm: devcontainer (from repo)"
   [[ -f "$PMM_DIR/.env" ]] || die "pmm/.env missing — run ./om setup first"
@@ -475,6 +577,7 @@ start_pmm() {
   make -C "$PMM_DIR" env-up
   ok "pmm-server up — https://localhost:$PMM_HTTPS_PORT (admin/admin)"
   dim "running the image's binaries; './om build pmm' compiles your working tree"
+  ensure_pmm_ui
 }
 
 stop_pmm() {
@@ -598,6 +701,80 @@ stop_nomad() {
   info "nomad: stopping"
   ( cd "$ROOT" && docker compose --profile nomad stop nomad >/dev/null 2>&1 ) || true
   ok "nomad stopped (container kept; data volume intact)"
+}
+
+# ---------------------------------------------------------------------------
+# PSMDB clusters
+# ---------------------------------------------------------------------------
+
+psmdb_compose() { ( cd "$PSMDB_DIR" && docker compose "$@" ); }
+
+# Containers currently up for a profile. Every service is named
+# <profile>-<role><n> — standalone-node00, replicaset-cluster-node01,
+# sharded-cluster-shard00svr0 — so the profile name *is* the prefix and no
+# lookup table can drift out of sync with compose.yaml.
+#
+# One ordering trap this creates: "replicaset-single" is not a prefix of
+# "replicaset-cluster" and vice versa, so the counts stay disjoint. Keep it that
+# way if you add a topology.
+psmdb_running() {
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^$1-" || true
+}
+
+# The node image is ~1.6 GB and takes a few minutes: build it once, on demand,
+# rather than making every user remember a separate step.
+ensure_psmdb_image() {
+  docker image inspect "$PSMDB_IMAGE" >/dev/null 2>&1 && return 0
+  info "psmdb: building $PSMDB_IMAGE (first time only, a few minutes)"
+  ( cd "$PSMDB_DIR" && docker build -t "$PSMDB_IMAGE" . ) \
+    || die "failed to build $PSMDB_IMAGE"
+  ok "image built"
+}
+
+start_psmdb() {
+  local profile="$1"
+  [[ -d "$PSMDB_DIR" ]] || die "psmdb/ not found at $PSMDB_DIR"
+
+  # These nodes join the network PMM's compose creates. Without it, `docker
+  # compose up` fails with an "external network not found" that reads like a
+  # config bug rather than "start PMM first".
+  docker network inspect "$PSMDB_NETWORK" >/dev/null 2>&1 \
+    || die "network $PSMDB_NETWORK missing — run './om start pmm' first"
+
+  ensure_psmdb_image
+  [[ -f "$PSMDB_DIR/secrets/keyfile" ]] || ( cd "$PSMDB_DIR" && ./bootstrap.sh >/dev/null )
+
+  info "$profile: docker compose (profile '$profile')"
+  psmdb_compose --profile "$profile" up -d
+
+  # Registration is the useful readiness signal, not "container started": a node
+  # is only usable once its pmm-agent has connected and register.sh has written
+  # the credentials file the SEP payloads read.
+  local prefix nodes i ready
+  prefix="$profile-"
+  nodes="$(docker ps --format '{{.Names}}' | grep -c "^$prefix" || true)"
+  for i in $(seq 1 60); do
+    ready=0
+    local n
+    while IFS= read -r n; do
+      [[ -n "$n" ]] || continue
+      docker exec "$n" test -f /root/.mongodb_uri >/dev/null 2>&1 && ready=$((ready + 1))
+    done < <(docker ps --format '{{.Names}}' | grep "^$prefix" || true)
+    if [[ "$ready" -ge "$nodes" ]] && [[ "$nodes" -gt 0 ]]; then
+      ok "$profile: $nodes/$nodes node(s) bootstrapped and registered"
+      return 0
+    fi
+    sleep 5
+  done
+  warn "$profile: only $ready/$nodes node(s) finished bootstrap — ./om logs $profile"
+}
+
+stop_psmdb() {
+  local profile="$1"
+  info "$profile: stopping"
+  psmdb_compose --profile "$profile" stop >/dev/null 2>&1 || true
+  ok "$profile stopped (containers kept; data volumes intact)"
+  dim "wipe its data with: cd psmdb && docker compose --profile $profile down -v"
 }
 
 start_sandbox() {
@@ -805,9 +982,18 @@ cmd_ports() {
 
 cmd_build() {
   local what="${1:-pmm}"
-  [[ "$what" == "pmm" ]] || die "only 'pmm' can be built; got '$what'"
+  case "$what" in
+    pmm|ui) ;;
+    *) die "only 'pmm' (Go services) or 'ui' (frontend) can be built; got '$what'" ;;
+  esac
   docker inspect "$PMM_CONTAINER" >/dev/null 2>&1 \
     || die "$PMM_CONTAINER is not running — ./om start pmm first"
+  if [[ "$what" == "ui" ]]; then
+    # Forced: `./om start pmm` only rebuilds when the deployed bundle has no SEP
+    # routes at all, so this is how UI edits reach the browser without Vite.
+    ensure_pmm_ui 1
+    return 0
+  fi
   info "pmm: compiling working tree (run-all) — this takes a few minutes"
   # `run-all` chains the *-ci targets, which rebuild each Go service and restart
   # it under supervisorctl WITHOUT tailing logs. The bare `run-managed` target
@@ -817,14 +1003,115 @@ cmd_build() {
 }
 
 # ---------------------------------------------------------------------------
+# uris — the HTTP surface each component exposes beyond its landing page
+# ---------------------------------------------------------------------------
+#
+# One table, two consumers: `./om status` prints a component's entries beneath
+# it while it is up, `./om urls` prints the lot whatever is running. The PMM
+# paths are the ones its nginx actually serves — see
+# pmm/build/ansible/roles/nginx/files/conf.d/pmm.conf; VictoriaMetrics runs with
+# --http.pathPrefix=/prometheus (managed/services/supervisord/supervisord.go),
+# which is why vmui hangs off /prometheus and not /victoriametrics.
+#
+# Deliberately absent: the ClickHouse (8123/9000) and VictoriaMetrics (9090)
+# host ports from pmm/docker-compose.dev.yml. They are published, but both
+# daemons bind 127.0.0.1 *inside* the container, so connecting to them from the
+# host just gets a reset — reach them with `docker exec pmm-server` instead.
+component_uris() { # comp -> "label<TAB>uri" lines
+  local pmm="https://localhost:$PMM_HTTPS_PORT"
+  local sep="http://localhost:$SEP_BACKEND_PORT"
+  case "$1" in
+    pmm)
+      printf '%s\t%s\n' \
+        "Grafana"         "$pmm/graph/" \
+        "PMM UI"          "$pmm/pmm-ui/" \
+        "Query Analytics" "$pmm/graph/d/pmm-qan/" \
+        "vmui"            "$pmm/prometheus/vmui/" \
+        "VM targets"      "$pmm/prometheus/targets" \
+        "VMAlert rules"   "$pmm/prometheus/rules" \
+        "VMAlert alerts"  "$pmm/prometheus/alerts" \
+        "Swagger UI"      "$pmm/swagger/" \
+        "Nomad (proxied)" "$pmm/nomad/ui/" \
+        "PostgreSQL"      "postgres://$POC_DB_USER@$POC_DB_HOST:$POC_DB_PORT/$POC_DB_NAME" \
+        "Delve (headless)" "127.0.0.1:2345"
+      ;;
+    sep-backend)
+      # /docs and /redoc are 404 by design (SEP/app/main.py): the top-level app
+      # disables them so the unified /api/docs is the one Swagger UI to use.
+      printf '%s\t%s\n' \
+        "API root"      "$sep/" \
+        "Swagger UI"    "$sep/api/docs" \
+        "OpenAPI JSON"  "$sep/api/openapi.json" \
+        "Inventory API" "$sep/api/inventory/docs" \
+        "Tasks API"     "$sep/api/tasks/docs"
+      ;;
+    sep-frontend)
+      printf '%s\t%s\n' "Dev server" "http://localhost:$SEP_FRONTEND_PORT/"
+      ;;
+    casdoor)
+      printf '%s\t%s\n' "Casdoor" "http://localhost:$CASDOOR_PORT/"
+      ;;
+    nomad)
+      printf '%s\t%s\n' \
+        "Nomad UI"    "http://localhost:$NOMAD_PORT/ui/" \
+        "Client nodes" "http://127.0.0.1:$NOMAD_PORT/v1/nodes"
+      ;;
+    sandbox)
+      printf '%s\t%s\n' "Sandbox UI" "http://127.0.0.1:$SANDBOX_PORT/"
+      ;;
+  esac
+}
+
+print_uris() { # comp — indented under whatever status line just went out
+  local label uri
+  while IFS=$'\t' read -r label uri; do
+    [[ -n "$label" ]] || continue
+    printf '    %s%-16s%s %s\n' "$C_DIM" "$label" "$C_RESET" "$uri"
+  done < <(component_uris "$1")
+}
+
+comp_up() { # comp -> 0 when it is running
+  case "$1" in
+    casdoor)
+      local cid; cid="$(cd "$ROOT" && docker compose ps -q casdoor 2>/dev/null || true)"
+      [[ -n "$cid" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" == "true" ]] ;;
+    pmm)   [[ "$(docker inspect -f '{{.State.Running}}' "$PMM_CONTAINER" 2>/dev/null)" == "true" ]] ;;
+    nomad) [[ "$(docker inspect -f '{{.State.Running}}' "$NOMAD_CONTAINER" 2>/dev/null)" == "true" ]] ;;
+    sep-backend)  port_busy "$SEP_BACKEND_PORT" ;;
+    sep-frontend) port_busy "$SEP_FRONTEND_PORT" ;;
+    sandbox)      port_busy "$SANDBOX_PORT" ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_urls() {
+  local only=("$@")
+  [[ ${#only[@]} -gt 0 ]] || only=(pmm sep-backend sep-frontend casdoor nomad sandbox)
+  local comp
+  for comp in "${only[@]}"; do
+    case "$comp" in
+      pmm|sep-backend|sep-frontend|casdoor|nomad|sandbox) ;;
+      deps)     comp=casdoor ;;
+      backend)  comp=sep-backend ;;
+      frontend) comp=sep-frontend ;;
+      *) die "no URIs known for '$comp' (pmm|sep-backend|sep-frontend|casdoor|nomad|sandbox)" ;;
+    esac
+    if comp_up "$comp"; then info "$comp"; else info "$comp $C_DIM(stopped)$C_RESET"; fi
+    print_uris "$comp"
+  done
+  echo
+  dim "PMM and Grafana: admin/admin — the same credentials cover vmui and Swagger"
+}
+
+# ---------------------------------------------------------------------------
 # status / logs
 # ---------------------------------------------------------------------------
 
 status_line() { # label, up(0/1), detail
   if [[ "$2" == "0" ]]; then
-    printf '  %s●%s %-14s %s\n' "$C_GREEN" "$C_RESET" "$1" "$3"
+    printf '  %s●%s %-20s %s\n' "$C_GREEN" "$C_RESET" "$1" "$3"
   else
-    printf '  %s○%s %-14s %s%s%s\n' "$C_DIM" "$C_RESET" "$1" "$C_DIM" "$3" "$C_RESET"
+    printf '  %s○%s %-20s %s%s%s\n' "$C_DIM" "$C_RESET" "$1" "$C_DIM" "$3" "$C_RESET"
   fi
 }
 
@@ -840,7 +1127,11 @@ cmd_status() {
   fi
 
   if [[ "$(docker inspect -f '{{.State.Running}}' "$PMM_CONTAINER" 2>/dev/null)" == "true" ]]; then
+    local ui_note="image bundle — no SEP apps, run './om build ui'"
+    pmm_ui_has_sep && ui_note="working tree UI, SEP apps included"
     status_line pmm 0 "https://localhost:$PMM_HTTPS_PORT (container $PMM_CONTAINER)"
+    dim "ui: $ui_note"
+    print_uris pmm
   else
     status_line pmm 1 "stopped"
   fi
@@ -850,6 +1141,7 @@ cmd_status() {
     ready="$(curl -s --max-time 4 "http://127.0.0.1:$NOMAD_PORT/v1/nodes" 2>/dev/null \
              | grep -c '"Status":"ready"' || true)"
     status_line nomad 0 "http://localhost:$NOMAD_PORT — ${ready:-0} ready client node(s)"
+    print_uris nomad
   else
     status_line nomad 1 "stopped"
   fi
@@ -865,14 +1157,40 @@ cmd_status() {
       local listen="not listening yet"
       port_busy "$port" && listen="http://localhost:$port"
       status_line "$comp" 0 "pid $pid — $listen"
+      # Only sep-backend has a surface worth expanding here; the other two serve
+      # one page, already spelled out on the status line above.
+      # `|| true`: under set -e a false tail command in an if-branch exits the script.
+      [[ "$comp" == sep-backend ]] && port_busy "$port" && print_uris "$comp" || true
     elif port_busy "$port"; then
       # Something owns the port that om did not start — e.g. the sandbox UI run by
       # hand with `go run .`. Reporting "stopped" here would be misleading.
       status_line "$comp" 0 "http://localhost:$port (not started by om)"
+      [[ "$comp" == sep-backend ]] && print_uris "$comp" || true
     else
       status_line "$comp" 1 "stopped"
     fi
   done
+
+  # PSMDB clusters from psmdb/compose.yaml. Reported only when the directory
+  # exists, so a checkout without it looks unchanged.
+  if [[ -d "$PSMDB_DIR" ]]; then
+    echo
+    info "PSMDB clusters (psmdb/compose.yaml)"
+    local p up expected
+    for p in "${PSMDB_PROFILES[@]}"; do
+      case "$p" in
+        standalone|replicaset-single) expected=1 ;;
+        replicaset-cluster)   expected=3 ;;
+        sharded-cluster)      expected=11 ;;
+      esac
+      up="$(psmdb_running "$p")"
+      if [[ "${up:-0}" -gt 0 ]]; then
+        status_line "$p" 0 "${up}/${expected} container(s) up"
+      else
+        status_line "$p" 1 "stopped"
+      fi
+    done
+  fi
 
   # PSMDB environments the sandbox has deployed, inferred from its docker networks.
   local envs
@@ -898,7 +1216,8 @@ cmd_status() {
   fi
 
   echo
-  dim "logs: ./om logs <deps|pmm|nomad|sep-backend|sep-frontend|sandbox> [-f]"
+  dim "logs: ./om logs <deps|pmm|nomad|sep-backend|sep-frontend|sandbox|<cluster>> [-f]"
+  dim "urls: ./om urls [comp...] — the same list for stopped components too"
 }
 
 cmd_logs() {
@@ -918,12 +1237,350 @@ cmd_logs() {
       docker inspect "$NOMAD_CONTAINER" >/dev/null 2>&1 || die "$NOMAD_CONTAINER does not exist — ./om start nomad first"
       if [[ -n "$follow" ]]; then docker logs -f --tail=200 "$NOMAD_CONTAINER"
       else docker logs --tail=200 "$NOMAD_CONTAINER"; fi ;;
+    standalone|replicaset-single|replicaset-cluster|sharded-cluster)
+      # No om-managed log file: these are compose services, so defer to compose.
+      if [[ -n "$follow" ]]; then psmdb_compose --profile "$comp" logs -f --tail=200
+      else psmdb_compose --profile "$comp" logs --tail=200; fi ;;
     sep-backend|sep-frontend|sandbox)
       local f; f="$(log_file "$comp")"
       [[ -f "$f" ]] || die "no log yet for $comp"
       if [[ -n "$follow" ]]; then tail -f "$f"; else tail -n 200 "$f"; fi ;;
-    "") die "usage: ./om logs <deps|pmm|nomad|sep-backend|sep-frontend|sandbox> [-f]" ;;
+    "") die "usage: ./om logs <deps|pmm|nomad|sep-backend|sep-frontend|sandbox|replicaset-cluster|replicaset-single|standalone|sharded-cluster> [-f]" ;;
     *)  die "unknown component '$comp'" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# poc (PSMDB PoC: inspect a run across Postgres, VictoriaMetrics and Tasks)
+# ---------------------------------------------------------------------------
+
+# SEP's three databases all point at PMM's embedded PostgreSQL, so this is the
+# one connection for inventory, tasks and the PoC's own tables alike.
+POC_DB_HOST=127.0.0.1
+POC_DB_PORT=5432
+POC_DB_NAME=sep
+POC_DB_USER=sep
+
+# Reads the SEP database password from SEP/.env. `head -1`: several *__DATABASE__
+# PASSWORD keys are set (SEP__, INVENTORY__, TASKS__) and they share one value.
+poc_db_password() {
+  [[ -f "$SEP_DIR/.env" ]] || die "SEP/.env missing — run ./om setup first"
+  grep -oP '(?<=DATABASE__PASSWORD=).*' "$SEP_DIR/.env" | head -1
+}
+
+# Reads the PMM API key from SEP/.env. `tail -1`, NOT head: .env carries more than
+# one PMM__API_KEY line and python-dotenv takes the last one. Taking the first (or
+# worse, grepping without picking one) yields a key SEP is not using, and every
+# VictoriaMetrics query silently returns nothing.
+poc_pmm_key() {
+  [[ -f "$SEP_DIR/.env" ]] || die "SEP/.env missing — run ./om setup first"
+  grep -oP '(?<=PMM__API_KEY=).*' "$SEP_DIR/.env" | tail -1
+}
+
+poc_psql() {
+  command -v psql >/dev/null 2>&1 || die "psql not found — install postgresql-client"
+  PGPASSWORD="$(poc_db_password)" psql -h "$POC_DB_HOST" -p "$POC_DB_PORT" \
+    -U "$POC_DB_USER" -d "$POC_DB_NAME" "$@"
+}
+
+# Instant-queries VictoriaMetrics through pmm-server's authenticated surface.
+# Every expression is wrapped in last_over_time(): the PoC writes one-shot samples
+# rather than a scraped series, so a bare selector returns nothing once the sample
+# is older than the 5-minute instant-query lookbehind.
+poc_vm_query() {
+  curl -sk -m 15 --get "https://127.0.0.1:${PMM_HTTPS_PORT}/prometheus/api/v1/query" \
+    --data-urlencode "query=last_over_time($1[${2:-24h}])" \
+    -H "Authorization: Bearer $(poc_pmm_key)"
+}
+
+# Resolves the run to inspect: an explicit id, else the most recent one.
+poc_run_id() {
+  local given="${1:-}"
+  if [[ -n "$given" ]]; then
+    local found
+    found="$(poc_psql -tAc "select id from psmdb_poc_run where id::text = '$given'")" \
+      || die "cannot reach the SEP database at $POC_DB_HOST:$POC_DB_PORT"
+    [[ -n "$found" ]] || die "no PoC run with id '$given' (try ./om poc runs)"
+    printf '%s' "$found"
+    return
+  fi
+  local last
+  last="$(poc_psql -tAc "select id from psmdb_poc_run order by started_at desc limit 1")" \
+    || die "cannot reach the SEP database at $POC_DB_HOST:$POC_DB_PORT"
+  [[ -n "$last" ]] || die "no PoC runs recorded yet — trigger one with ./om poc run"
+  printf '%s' "$last"
+}
+
+poc_cmd_runs() {
+  info "PSMDB PoC runs (most recent first)"
+  poc_psql -c "
+    select left(id::text, 8) as run, status,
+           services_total  as total,
+           services_resolved as resolved,
+           services_orphaned as orphaned,
+           probes_ok       as probed,
+           to_char(started_at, 'MM-DD HH24:MI:SS') as started,
+           coalesce((finished_at - started_at)::text, '-') as duration,
+           left(coalesce(error, ''), 40) as error
+    from psmdb_poc_run order by started_at desc limit ${1:-15}"
+}
+
+poc_cmd_nodes() {
+  local run; run="$(poc_run_id "${1:-}")"
+  info "Mapping for run $run"
+  poc_psql -c "
+    select service_name, node_name,
+           coalesce(executor_host, '-') as executor_host,
+           resolution, probe_status,
+           coalesce(task_history_id::text, '-') as task,
+           left(coalesce(error, ''), 45) as error
+    from psmdb_poc_node where run_id = '$run'
+    order by (resolution = 'ORPHANED'), service_name"
+}
+
+poc_cmd_probe() {
+  local run; run="$(poc_run_id "${1:-}")"
+  local service="${2:-}"
+  local filter=""
+  [[ -n "$service" ]] && filter="and service_name = '$service'"
+  info "Probe records for run $run${service:+ (service $service)}"
+  # `#- '{database,raw}'` drops the raw command output, which is ~90% of the
+  # record (6.4KB of 7.2KB measured). Pass a service name to see one node; use
+  # ./om poc probe-raw for the untrimmed document.
+  poc_psql -tAc "
+    select service_name || E'\n' || jsonb_pretty(probe #- '{database,raw}')
+    from psmdb_poc_node
+    where run_id = '$run' and jsonb_typeof(probe) = 'object' $filter
+    order by service_name"
+}
+
+poc_cmd_probe_raw() {
+  local run; run="$(poc_run_id "${1:-}")"
+  local service="${2:-}"
+  local filter=""
+  [[ -n "$service" ]] && filter="and service_name = '$service'"
+  info "Full probe records (raw included) for run $run"
+  poc_psql -tAc "
+    select service_name || E'\n' || jsonb_pretty(probe)
+    from psmdb_poc_node
+    where run_id = '$run' and jsonb_typeof(probe) = 'object' $filter
+    order by service_name"
+}
+
+poc_cmd_tasks() {
+  local run; run="$(poc_run_id "${1:-}")"
+  info "Dispatched probe tasks for run $run"
+  local rows
+  rows="$(poc_psql -tAc "
+    select count(distinct task_history_id) from psmdb_poc_node
+    where run_id = '$run' and task_history_id is not null")"
+  if [[ "$rows" == "0" ]]; then
+    warn "no probe task was dispatched for this run"
+    dim "every service was orphaned — see ./om poc nodes $run"
+    return
+  fi
+  poc_psql -c "
+    select n.task_history_id as task, th.status,
+           n.executor_host,
+           count(*) as services,
+           to_char(th.started_at, 'HH24:MI:SS') as started,
+           coalesce((th.finished_at - th.started_at)::text, '-') as duration
+    from psmdb_poc_node n
+    left join taskhistory th on th.id = n.task_history_id
+    where n.run_id = '$run' and n.task_history_id is not null
+    group by 1, 2, 3, 5, 6 order by 1"
+  # A run-python job that dies in its setup hook produces no log rows at all,
+  # which is the signature of the missing-mount-capability failure. Say so rather
+  # than leaving an empty section.
+  local logged
+  logged="$(poc_psql -tAc "
+    select count(*) from taskhistory_log l
+    where l.task_history_id in (
+      select distinct task_history_id from psmdb_poc_node
+      where run_id = '$run' and task_history_id is not null)")"
+  echo
+  if [[ "$logged" == "0" ]]; then
+    warn "those tasks produced no log output at all"
+    dim "usually means the Nomad client could not build its task directory:"
+    dim "  Task hook failed  task_dir: mount: operation not permitted"
+    dim "the container needs cap_add SYS_ADMIN + apparmor/seccomp unconfined"
+    dim "(psmdb/compose.yaml has it; containers created before that fix do not)"
+  else
+    ok "$logged log chunk(s) recorded — ./om poc task-log <task-id> to read one"
+  fi
+}
+
+poc_cmd_task_log() {
+  local task="${1:-}"
+  [[ -n "$task" ]] || die "usage: ./om poc task-log <task-history-id>"
+  [[ "$task" =~ ^[0-9]+$ ]] || die "task history id must be numeric; got '$task'"
+  [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
+  info "Log for task history $task"
+  # Read through the model, not psql: chunk content is stored as MaybeCompressedText
+  # (zlib behind a one-byte prefix), so `convert_from(content, 'UTF8')` dies with
+  # "invalid byte sequence for encoding UTF8" on any chunk that was compressed.
+  ( cd "$SEP_DIR" && OM_TASK_ID="$task" "$SEP_DIR/venv/bin/python" - <<'PY'
+import asyncio, logging, os, sys
+logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+logging.getLogger("alembic").setLevel(logging.WARNING)
+from sqlmodel import select
+from app.tasks.db import get_async_session_maker
+from app.tasks.models import TaskHistoryLog
+
+async def main() -> None:
+    task_id = int(os.environ["OM_TASK_ID"])
+    async with get_async_session_maker()() as session:
+        rows = (await session.exec(
+            select(TaskHistoryLog)
+            .where(TaskHistoryLog.task_history_id == task_id)
+            .order_by(TaskHistoryLog.source, TaskHistoryLog.start_offset)
+        )).all()
+    if not rows:
+        print("  (no log chunks recorded for this task)")
+        return
+    step = None
+    for row in rows:
+        if row.source != step:
+            step = row.source
+            print(f"\n  --- {step} ---")
+        text = row.content
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "replace")
+        for line in text.splitlines():
+            print(f"  [{row.stream}] {line}")
+
+asyncio.run(main())
+PY
+  ) || die "could not read the log — is the tasks database reachable?"
+}
+
+poc_cmd_metrics() {
+  local run; run="$(poc_run_id "${1:-}")"
+  command -v jq >/dev/null 2>&1 || die "jq not found — install jq"
+  info "VictoriaMetrics for run $run"
+
+  local ts
+  ts="$(poc_vm_query "psmdb_poc_run_ts{execution_id=\"$run\"}" \
+        | jq -r '.data.result[0].value[1] // empty')"
+  if [[ -z "$ts" ]]; then
+    warn "no metrics found for this run"
+    dim "EMIT_METRICS may be off (SEP.PSMDB_POC in SEP/settings.yaml, default false),"
+    dim "or the run is younger than VictoriaMetrics' ~30s search.latencyOffset"
+    return
+  fi
+  ok "run_ts $ts ($(date -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts"))"
+
+  echo
+  dim "psmdb_poc_node by resolution / probe_status"
+  poc_vm_query "psmdb_poc_node{execution_id=\"$run\"}" \
+    | jq -r '.data.result[].metric | "\(.resolution)/\(.probe_status)"' \
+    | sort | uniq -c | sort -rn | sed 's/^/    /'
+
+  echo
+  dim "probed nodes"
+  poc_vm_query "psmdb_poc_node{execution_id=\"$run\",probe_status=\"ok\"}" \
+    | jq -r '.data.result[].metric
+             | "    \(.service)  mongod=\(.mongod_version // "-")  set=\(.set_name // "-")  state=\(.state // "-")  os=\(.os // "-")"'
+
+  echo
+  dim "psmdb_poc_result (raw JSON, chunked)"
+  local raw
+  raw="$(poc_vm_query "psmdb_poc_result{execution_id=\"$run\"}" \
+        | jq -r '[.data.result[] | select(.metric.chunk)] | sort_by(.metric.chunk)
+                 | map(.metric.result_json) | join("")')"
+  if [[ -z "$raw" || "$raw" == "null" ]]; then
+    dim "    not emitted (EMIT_RAW_JSON off)"
+  else
+    printf '%s' "$raw" | jq . | sed 's/^/    /'
+  fi
+}
+
+poc_cmd_show() {
+  local run; run="$(poc_run_id "${1:-}")"
+  info "PSMDB PoC run $run"
+  poc_psql -c "
+    select status,
+           services_total as total, services_resolved as resolved,
+           services_orphaned as orphaned, probes_ok as probed,
+           to_char(started_at, 'YYYY-MM-DD HH24:MI:SS') as started,
+           coalesce((finished_at - started_at)::text, 'still running') as duration
+    from psmdb_poc_run where id = '$run'"
+  poc_psql -c "
+    select resolution, probe_status, count(*),
+           left(min(coalesce(error, '')), 50) as sample_error
+    from psmdb_poc_node where run_id = '$run'
+    group by 1, 2 order by 1, 2"
+  info "Resolved services"
+  poc_psql -c "
+    select service_name, executor_host, probe_status,
+           probe->>'binary_version'          as installed,
+           probe->'database'->>'db_version'  as running,
+           probe->'database'->>'set_name'    as repl_set,
+           probe->'database'->>'state'       as state,
+           probe->'system'->>'os_name'       as os
+    from psmdb_poc_node
+    where run_id = '$run' and resolution <> 'ORPHANED'
+    order by service_name"
+  dim "./om poc nodes    full mapping, orphans included"
+  dim "./om poc probe    per-node probe JSON"
+  dim "./om poc tasks    dispatched Nomad runs and their status"
+  dim "./om poc metrics  what reached VictoriaMetrics"
+}
+
+poc_cmd_run() {
+  [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
+  info "Triggering a PSMDB PoC run"
+  # Driven through the service function rather than the Celery task on purpose:
+  # a worker started before the app existed has no `run_psmdb_poc` registered,
+  # and this path reports failures straight to the terminal.
+  ( cd "$SEP_DIR" && "$SEP_DIR/venv/bin/python" - <<'PY'
+import asyncio, logging, sys
+logging.basicConfig(level=logging.INFO, format="  %(message)s", stream=sys.stdout)
+# Importing the app pulls in Alembic, whose plugin registration logs at INFO and
+# would otherwise bury the job's own progress lines.
+for noisy in ("inventory_api", "tasks_api", "aiosqlite", "asyncio", "alembic"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+from app.sep.apps.psmdb_poc.service import run_poc
+print(f"EXECUTION_ID={asyncio.run(run_poc())}")
+PY
+  ) || die "the run failed — see the traceback above"
+  echo
+  cmd_poc show
+}
+
+poc_cmd_sync() {
+  [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
+  info "Syncing inventory from PMM"
+  dim "run this after rebuilding the sandbox, or every service maps as orphaned"
+  ( cd "$SEP_DIR" && "$SEP_DIR/venv/bin/python" - <<'PY'
+import asyncio, logging, sys
+logging.basicConfig(level=logging.WARNING, stream=sys.stdout)
+from app.sep.apps.inventory.sync import run_scheduled_inventory_sync
+asyncio.run(run_scheduled_inventory_sync("app.sep.sync.syncers.pmm.PMMSyncer"))
+PY
+  ) || die "the sync failed — see the traceback above"
+  ok "inventory synced"
+  poc_psql -c "
+    select coalesce(cluster, '-') as cluster, count(*) as services
+    from service where type = 'MONGODB' group by 1 order by 1"
+}
+
+cmd_poc() {
+  local sub="${1:-show}"; shift || true
+  case "$sub" in
+    show)      poc_cmd_show "$@" ;;
+    runs)      poc_cmd_runs "$@" ;;
+    nodes)     poc_cmd_nodes "$@" ;;
+    probe)     poc_cmd_probe "$@" ;;
+    probe-raw) poc_cmd_probe_raw "$@" ;;
+    tasks)     poc_cmd_tasks "$@" ;;
+    task-log)  poc_cmd_task_log "$@" ;;
+    metrics)   poc_cmd_metrics "$@" ;;
+    run)       poc_cmd_run "$@" ;;
+    sync)      poc_cmd_sync "$@" ;;
+    # A bare run id is the common case: ./om poc <uuid> == ./om poc show <uuid>
+    *-*-*-*-*) poc_cmd_show "$sub" ;;
+    *) die "unknown poc subcommand '$sub' (show|runs|nodes|probe|probe-raw|tasks|task-log|metrics|run|sync)" ;;
   esac
 }
 
@@ -951,9 +1608,14 @@ expand_components() {
       pmm)          COMPONENTS+=(pmm) ;;
       sep-backend|backend)   COMPONENTS+=(sep-backend) ;;
       sep-frontend|frontend) COMPONENTS+=(sep-frontend) ;;
-      sandbox|psmdb)         COMPONENTS+=(sandbox) ;;
+      sandbox)               COMPONENTS+=(sandbox) ;;
       nomad|executor)        COMPONENTS+=(nomad) ;;
-      *) die "unknown component '$a' (deps|pmm|nomad|sep-backend|sep-frontend|sandbox|sep|all)" ;;
+      # `psmdb` used to be an alias for the sandbox UI. It now means the compose
+      # clusters in psmdb/, which is what the directory is called; the UI is
+      # reachable as `sandbox` only.
+      clusters|psmdb)        COMPONENTS+=("${PSMDB_PROFILES[@]}") ;;
+      standalone|replicaset-single|replicaset-cluster|sharded-cluster) COMPONENTS+=("$a") ;;
+      *) die "unknown component '$a' (deps|pmm|nomad|sep-backend|sep-frontend|sandbox|sep|all|clusters|standalone|replicaset-single|replicaset-cluster|sharded-cluster)" ;;
     esac
   done
 }
@@ -969,6 +1631,7 @@ cmd_start() {
       sep-frontend) start_sep_frontend ;;
       nomad)        start_nomad ;;
       sandbox)      start_sandbox ;;
+      standalone|replicaset-single|replicaset-cluster|sharded-cluster) start_psmdb "$c" ;;
     esac
   done
   echo
@@ -989,6 +1652,7 @@ cmd_stop() {
       sep-frontend) info "sep-frontend: stopping"; stop_native sep-frontend ;;
       nomad)        stop_nomad ;;
       sandbox)      info "sandbox: stopping";      stop_native sandbox ;;
+      standalone|replicaset-single|replicaset-cluster|sharded-cluster) stop_psmdb "$c" ;;
     esac
   done
 }
@@ -999,9 +1663,9 @@ cmd_restart() {
   cmd_start "$@"
 }
 
-# Prints the header comment block (lines 3..19) as the help text. Keep the range
-# in sync if that block grows.
-usage() { sed -n "3,21p" "${BASH_SOURCE[0]}" | sed "s/^# \{0,1\}//"; }
+# Prints the header comment block as the help text: from the first line of the
+# block to the blank line that ends it, so it stays right as the block grows.
+usage() { sed -n '3,/^$/p' "${BASH_SOURCE[0]}" | sed "s/^# \{0,1\}//"; }
 
 main() {
   local cmd="${1:-}"; shift || true
@@ -1014,7 +1678,9 @@ main() {
     logs)    cmd_logs "$@" ;;
     build)   cmd_build "$@" ;;
     psmdb-link) cmd_psmdb_link "$@" ;;
+    poc)     cmd_poc "$@" ;;
     ports)   cmd_ports ;;
+    urls|uris) cmd_urls "$@" ;;
     doctor)  cmd_doctor ;;
     ""|-h|--help|help) usage ;;
     *) err "unknown command '$cmd'"; echo; usage; exit 1 ;;
