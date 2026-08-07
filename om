@@ -17,24 +17,28 @@
 #                           (./om start pmm does this automatically when the
 #                           container is serving the image's stale bundle)
 #   ./om psmdb-link <env>   point a PSMDB sandbox env's agents at the repo PMM
-#   ./om poc [sub] [run]    inspect the PSMDB PoC app (see below)
+#   ./om pom [sub] [run]    inspect the POM app (see below)
+#   ./om inventory [view]   PMM's inventory as JSON on stdout, nodes/services/
+#                           agents joined into one document. Views: tree
+#                           (default), nodes, services, agents, raw
 #   ./om urls [comp...]     every URI a component serves (vmui, Swagger, ...)
 #   ./om ports              report port collisions across all four stacks
 #   ./om doctor             check prerequisites only
 #
-# PSMDB PoC (SEP/app/sep/apps/psmdb_poc). Every subcommand defaults to the most
+# POM (SEP/app/sep/apps/pom_worker). Every subcommand defaults to the most
 # recent run; pass a run id (or its bare uuid) to pick another:
 #
-#   ./om poc                overview: status, counts, resolved services
-#   ./om poc runs           recent runs, newest first
-#   ./om poc nodes          the full service -> executor mapping, orphans included
-#   ./om poc probe [svc]    per-node probe JSON, raw command output trimmed
-#   ./om poc probe-raw      the same, untrimmed
-#   ./om poc tasks          dispatched Nomad runs and their status
-#   ./om poc task-log <id>  one dispatched run's captured output
-#   ./om poc metrics        what reached VictoriaMetrics (needs EMIT_METRICS)
-#   ./om poc run            trigger a run, then show it
-#   ./om poc sync           refresh inventory from PMM (do this after a rebuild)
+#   ./om pom                overview: status, counts, resolved services
+#   ./om pom runs           recent runs, newest first
+#   ./om pom nodes          the full service -> executor mapping, orphans included
+#   ./om pom probe [svc]    per-node probe JSON, raw command output trimmed
+#   ./om pom probe-raw      the same, untrimmed
+#   ./om pom tasks          dispatched Nomad runs and their status
+#   ./om pom task-log <id>  one dispatched run's captured output
+#   ./om pom metrics        what reached VictoriaMetrics (needs EMIT_METRICS)
+#   ./om pom run            trigger a run, then show it
+#   ./om pom sync           refresh inventory from PMM (do this after a rebuild)
+#   ./om pom token          bearer token for /api/docs Authorize and for curl
 #
 # Components: deps, pmm, nomad, sep-backend, sep-frontend, sandbox,
 #             and the PSMDB clusters: standalone, replicaset-single,
@@ -1003,6 +1007,114 @@ cmd_build() {
 }
 
 # ---------------------------------------------------------------------------
+# inventory — PMM's inventory as JSON on stdout
+# ---------------------------------------------------------------------------
+#
+# pmm-managed splits the inventory over three endpoints, and each one answers
+# with a map keyed by type — {"generic": [...], "container": [...]} — not a flat
+# list, so the type of a record lives in the key rather than in the record. None
+# of the three joins to the others either: a service points at a node_id, an
+# exporter points at a service_id *and* a pmm_agent_id, and only the pmm_agent
+# itself knows which node it runs on. Doing that stitching here is the whole
+# point of the command — `./om inventory` emits one document you can jq in a
+# single pass instead of three curls and a manual join.
+#
+# Everything on stdout is JSON and nothing else, so this is safe to pipe.
+
+# The dev container's Grafana admin. Overridable because a PMM started outside
+# `./om start pmm` may have had its password changed on first login.
+PMM_USER="${OM_PMM_USER:-admin}"
+PMM_PASSWORD="${OM_PMM_PASSWORD:-admin}"
+
+# GETs a pmm-managed API path and prints the body. A service account token in
+# OM_PMM_API_KEY wins over basic auth — the same kind of token SEP/.env holds as
+# PMM__API_KEY, though this deliberately does not read SEP's .env: the inventory
+# is PMM's, and asking for it should not require SEP to be set up at all.
+pmm_api_get() { # path -> body on stdout
+  local url="https://localhost:$PMM_HTTPS_PORT$1" resp code
+  local -a auth=(-u "$PMM_USER:$PMM_PASSWORD")
+  [[ -n "${OM_PMM_API_KEY:-}" ]] && auth=(-H "Authorization: Bearer $OM_PMM_API_KEY")
+  # -w appends the status on its own line; curl's own failure (connection
+  # refused, timeout) is the non-zero exit.
+  resp="$(curl -sk -m 20 -w $'\n%{http_code}' "${auth[@]}" "$url")" \
+    || die "cannot reach PMM at https://localhost:$PMM_HTTPS_PORT — running? (./om start pmm)"
+  code="${resp##*$'\n'}"
+  resp="${resp%$'\n'*}"
+  case "$code" in
+    200) printf '%s' "$resp" ;;
+    401|403) die "PMM rejected the credentials for $1 (HTTP $code) — set OM_PMM_USER / OM_PMM_PASSWORD, or OM_PMM_API_KEY" ;;
+    *)   die "PMM returned HTTP $code for $1: $(printf '%s' "$resp" | head -c 200)" ;;
+  esac
+}
+
+# Folds the map key into each record as $key, turning PMM's type-keyed map into
+# the flat array the rest of the program (and any consumer) actually wants.
+JQ_FLATTEN='def flatten_by($key): [ to_entries[] | .key as $t | (.value // [])[] | . + {($key): $t} ];'
+
+# Nodes own services, services own their exporters/QAN agents, and whatever is
+# left attaches to the node itself (pmm_agent, node_exporter, nomad_agent).
+# `orphans` is not decoration: it makes the tree lossless, so a service whose
+# node PMM no longer lists still shows up instead of vanishing from the output.
+JQ_INVENTORY_TREE="$JQ_FLATTEN"'
+  ($nodes    | flatten_by("node_type"))    as $N |
+  ($services | flatten_by("service_type")) as $S |
+  ($agents   | flatten_by("agent_type"))   as $A |
+  # agent_id -> node_id, the mapping only pmm_agent records carry.
+  ([ $A[] | select(.agent_type == "pmm_agent") | {key: .agent_id, value: .runs_on_node_id} ]
+   | from_entries) as $node_of |
+  # Give every agent a node_id: its own if it is a pmm_agent, else its parents.
+  ([ $A[] | . + {node_id: (.runs_on_node_id // $node_of[.pmm_agent_id // ""] // null)} ]) as $A |
+  ([ $S[] | .service_id ]) as $service_ids |
+  ([ $N[] | .node_id ])    as $node_ids |
+  {
+    pmm_server: $pmm,
+    counts: {nodes: ($N | length), services: ($S | length), agents: ($A | length)},
+    nodes: [ $N[] | . as $n | $n + {
+      services: [ $S[] | select(.node_id == $n.node_id) | . as $s | $s + {
+        agents: [ $A[] | select(.service_id == $s.service_id) ]
+      } ],
+      agents: [ $A[] | select(.node_id == $n.node_id and (.service_id == null)) ]
+    } ],
+    orphans: {
+      services: [ $S[] | . as $s | select($node_ids | index($s.node_id) | not) ],
+      agents: [ $A[] | . as $a | select(
+        if $a.service_id != null then ($service_ids | index($a.service_id) | not)
+        else ($a.node_id == null or ($node_ids | index($a.node_id) | not)) end
+      ) ]
+    }
+  }'
+
+cmd_inventory() {
+  command -v jq >/dev/null 2>&1 || die "jq not found — install jq"
+  local what="${1:-tree}"
+  case "$what" in
+    tree|nodes|services|agents|raw) ;;
+    *) die "usage: ./om inventory [tree|nodes|services|agents|raw]" ;;
+  esac
+
+  # One endpoint is enough for the flat views; only the tree needs the join.
+  case "$what" in
+    nodes)    pmm_api_get /v1/inventory/nodes    | jq "$JQ_FLATTEN"'flatten_by("node_type")';    return ;;
+    services) pmm_api_get /v1/inventory/services | jq "$JQ_FLATTEN"'flatten_by("service_type")'; return ;;
+    agents)   pmm_api_get /v1/inventory/agents   | jq "$JQ_FLATTEN"'flatten_by("agent_type")';   return ;;
+  esac
+
+  local nodes services agents
+  nodes="$(pmm_api_get /v1/inventory/nodes)"
+  services="$(pmm_api_get /v1/inventory/services)"
+  agents="$(pmm_api_get /v1/inventory/agents)"
+
+  if [[ "$what" == "raw" ]]; then
+    jq -n --argjson nodes "$nodes" --argjson services "$services" --argjson agents "$agents" \
+      '{nodes: $nodes, services: $services, agents: $agents}'
+    return
+  fi
+  jq -n --arg pmm "https://localhost:$PMM_HTTPS_PORT" \
+        --argjson nodes "$nodes" --argjson services "$services" --argjson agents "$agents" \
+        "$JQ_INVENTORY_TREE"
+}
+
+# ---------------------------------------------------------------------------
 # uris — the HTTP surface each component exposes beyond its landing page
 # ---------------------------------------------------------------------------
 #
@@ -1032,7 +1144,7 @@ component_uris() { # comp -> "label<TAB>uri" lines
         "VMAlert alerts"  "$pmm/prometheus/alerts" \
         "Swagger UI"      "$pmm/swagger/" \
         "Nomad (proxied)" "$pmm/nomad/ui/" \
-        "PostgreSQL"      "postgres://$POC_DB_USER@$POC_DB_HOST:$POC_DB_PORT/$POC_DB_NAME" \
+        "PostgreSQL"      "postgres://$POM_DB_USER@$POM_DB_HOST:$POM_DB_PORT/$POM_DB_NAME" \
         "Delve (headless)" "127.0.0.1:2345"
       ;;
     sep-backend)
@@ -1101,6 +1213,7 @@ cmd_urls() {
   done
   echo
   dim "PMM and Grafana: admin/admin — the same credentials cover vmui and Swagger"
+  dim "SEP /api/docs: Authorize with \`./om pom token\` to run requests from the page"
 }
 
 # ---------------------------------------------------------------------------
@@ -1251,19 +1364,19 @@ cmd_logs() {
 }
 
 # ---------------------------------------------------------------------------
-# poc (PSMDB PoC: inspect a run across Postgres, VictoriaMetrics and Tasks)
+# pom (POM: inspect a run across Postgres, VictoriaMetrics and Tasks)
 # ---------------------------------------------------------------------------
 
 # SEP's three databases all point at PMM's embedded PostgreSQL, so this is the
-# one connection for inventory, tasks and the PoC's own tables alike.
-POC_DB_HOST=127.0.0.1
-POC_DB_PORT=5432
-POC_DB_NAME=sep
-POC_DB_USER=sep
+# one connection for inventory, tasks and POM's own tables alike.
+POM_DB_HOST=127.0.0.1
+POM_DB_PORT=5432
+POM_DB_NAME=sep
+POM_DB_USER=sep
 
 # Reads the SEP database password from SEP/.env. `head -1`: several *__DATABASE__
 # PASSWORD keys are set (SEP__, INVENTORY__, TASKS__) and they share one value.
-poc_db_password() {
+pom_db_password() {
   [[ -f "$SEP_DIR/.env" ]] || die "SEP/.env missing — run ./om setup first"
   grep -oP '(?<=DATABASE__PASSWORD=).*' "$SEP_DIR/.env" | head -1
 }
@@ -1272,48 +1385,48 @@ poc_db_password() {
 # one PMM__API_KEY line and python-dotenv takes the last one. Taking the first (or
 # worse, grepping without picking one) yields a key SEP is not using, and every
 # VictoriaMetrics query silently returns nothing.
-poc_pmm_key() {
+pom_pmm_key() {
   [[ -f "$SEP_DIR/.env" ]] || die "SEP/.env missing — run ./om setup first"
   grep -oP '(?<=PMM__API_KEY=).*' "$SEP_DIR/.env" | tail -1
 }
 
-poc_psql() {
+pom_psql() {
   command -v psql >/dev/null 2>&1 || die "psql not found — install postgresql-client"
-  PGPASSWORD="$(poc_db_password)" psql -h "$POC_DB_HOST" -p "$POC_DB_PORT" \
-    -U "$POC_DB_USER" -d "$POC_DB_NAME" "$@"
+  PGPASSWORD="$(pom_db_password)" psql -h "$POM_DB_HOST" -p "$POM_DB_PORT" \
+    -U "$POM_DB_USER" -d "$POM_DB_NAME" "$@"
 }
 
 # Instant-queries VictoriaMetrics through pmm-server's authenticated surface.
-# Every expression is wrapped in last_over_time(): the PoC writes one-shot samples
+# Every expression is wrapped in last_over_time(): POM writes one-shot samples
 # rather than a scraped series, so a bare selector returns nothing once the sample
 # is older than the 5-minute instant-query lookbehind.
-poc_vm_query() {
+pom_vm_query() {
   curl -sk -m 15 --get "https://127.0.0.1:${PMM_HTTPS_PORT}/prometheus/api/v1/query" \
     --data-urlencode "query=last_over_time($1[${2:-24h}])" \
-    -H "Authorization: Bearer $(poc_pmm_key)"
+    -H "Authorization: Bearer $(pom_pmm_key)"
 }
 
 # Resolves the run to inspect: an explicit id, else the most recent one.
-poc_run_id() {
+pom_run_id() {
   local given="${1:-}"
   if [[ -n "$given" ]]; then
     local found
-    found="$(poc_psql -tAc "select id from psmdb_poc_run where id::text = '$given'")" \
-      || die "cannot reach the SEP database at $POC_DB_HOST:$POC_DB_PORT"
-    [[ -n "$found" ]] || die "no PoC run with id '$given' (try ./om poc runs)"
+    found="$(pom_psql -tAc "select id from pom_run where id::text = '$given'")" \
+      || die "cannot reach the SEP database at $POM_DB_HOST:$POM_DB_PORT"
+    [[ -n "$found" ]] || die "no POM run with id '$given' (try ./om pom runs)"
     printf '%s' "$found"
     return
   fi
   local last
-  last="$(poc_psql -tAc "select id from psmdb_poc_run order by started_at desc limit 1")" \
-    || die "cannot reach the SEP database at $POC_DB_HOST:$POC_DB_PORT"
-  [[ -n "$last" ]] || die "no PoC runs recorded yet — trigger one with ./om poc run"
+  last="$(pom_psql -tAc "select id from pom_run order by started_at desc limit 1")" \
+    || die "cannot reach the SEP database at $POM_DB_HOST:$POM_DB_PORT"
+  [[ -n "$last" ]] || die "no POM runs recorded yet — trigger one with ./om pom run"
   printf '%s' "$last"
 }
 
-poc_cmd_runs() {
-  info "PSMDB PoC runs (most recent first)"
-  poc_psql -c "
+pom_cmd_runs() {
+  info "POM runs (most recent first)"
+  pom_psql -c "
     select left(id::text, 8) as run, status,
            services_total  as total,
            services_resolved as resolved,
@@ -1322,70 +1435,70 @@ poc_cmd_runs() {
            to_char(started_at, 'MM-DD HH24:MI:SS') as started,
            coalesce((finished_at - started_at)::text, '-') as duration,
            left(coalesce(error, ''), 40) as error
-    from psmdb_poc_run order by started_at desc limit ${1:-15}"
+    from pom_run order by started_at desc limit ${1:-15}"
 }
 
-poc_cmd_nodes() {
-  local run; run="$(poc_run_id "${1:-}")"
+pom_cmd_nodes() {
+  local run; run="$(pom_run_id "${1:-}")"
   info "Mapping for run $run"
-  poc_psql -c "
+  pom_psql -c "
     select service_name, node_name,
            coalesce(executor_host, '-') as executor_host,
            resolution, probe_status,
            coalesce(task_history_id::text, '-') as task,
            left(coalesce(error, ''), 45) as error
-    from psmdb_poc_node where run_id = '$run'
+    from pom_node where run_id = '$run'
     order by (resolution = 'ORPHANED'), service_name"
 }
 
-poc_cmd_probe() {
-  local run; run="$(poc_run_id "${1:-}")"
+pom_cmd_probe() {
+  local run; run="$(pom_run_id "${1:-}")"
   local service="${2:-}"
   local filter=""
   [[ -n "$service" ]] && filter="and service_name = '$service'"
   info "Probe records for run $run${service:+ (service $service)}"
   # `#- '{database,raw}'` drops the raw command output, which is ~90% of the
   # record (6.4KB of 7.2KB measured). Pass a service name to see one node; use
-  # ./om poc probe-raw for the untrimmed document.
-  poc_psql -tAc "
+  # ./om pom probe-raw for the untrimmed document.
+  pom_psql -tAc "
     select service_name || E'\n' || jsonb_pretty(probe #- '{database,raw}')
-    from psmdb_poc_node
+    from pom_node
     where run_id = '$run' and jsonb_typeof(probe) = 'object' $filter
     order by service_name"
 }
 
-poc_cmd_probe_raw() {
-  local run; run="$(poc_run_id "${1:-}")"
+pom_cmd_probe_raw() {
+  local run; run="$(pom_run_id "${1:-}")"
   local service="${2:-}"
   local filter=""
   [[ -n "$service" ]] && filter="and service_name = '$service'"
   info "Full probe records (raw included) for run $run"
-  poc_psql -tAc "
+  pom_psql -tAc "
     select service_name || E'\n' || jsonb_pretty(probe)
-    from psmdb_poc_node
+    from pom_node
     where run_id = '$run' and jsonb_typeof(probe) = 'object' $filter
     order by service_name"
 }
 
-poc_cmd_tasks() {
-  local run; run="$(poc_run_id "${1:-}")"
+pom_cmd_tasks() {
+  local run; run="$(pom_run_id "${1:-}")"
   info "Dispatched probe tasks for run $run"
   local rows
-  rows="$(poc_psql -tAc "
-    select count(distinct task_history_id) from psmdb_poc_node
+  rows="$(pom_psql -tAc "
+    select count(distinct task_history_id) from pom_node
     where run_id = '$run' and task_history_id is not null")"
   if [[ "$rows" == "0" ]]; then
     warn "no probe task was dispatched for this run"
-    dim "every service was orphaned — see ./om poc nodes $run"
+    dim "every service was orphaned — see ./om pom nodes $run"
     return
   fi
-  poc_psql -c "
+  pom_psql -c "
     select n.task_history_id as task, th.status,
            n.executor_host,
            count(*) as services,
            to_char(th.started_at, 'HH24:MI:SS') as started,
            coalesce((th.finished_at - th.started_at)::text, '-') as duration
-    from psmdb_poc_node n
+    from pom_node n
     left join taskhistory th on th.id = n.task_history_id
     where n.run_id = '$run' and n.task_history_id is not null
     group by 1, 2, 3, 5, 6 order by 1"
@@ -1393,10 +1506,10 @@ poc_cmd_tasks() {
   # which is the signature of the missing-mount-capability failure. Say so rather
   # than leaving an empty section.
   local logged
-  logged="$(poc_psql -tAc "
+  logged="$(pom_psql -tAc "
     select count(*) from taskhistory_log l
     where l.task_history_id in (
-      select distinct task_history_id from psmdb_poc_node
+      select distinct task_history_id from pom_node
       where run_id = '$run' and task_history_id is not null)")"
   echo
   if [[ "$logged" == "0" ]]; then
@@ -1406,13 +1519,13 @@ poc_cmd_tasks() {
     dim "the container needs cap_add SYS_ADMIN + apparmor/seccomp unconfined"
     dim "(psmdb/compose.yaml has it; containers created before that fix do not)"
   else
-    ok "$logged log chunk(s) recorded — ./om poc task-log <task-id> to read one"
+    ok "$logged log chunk(s) recorded — ./om pom task-log <task-id> to read one"
   fi
 }
 
-poc_cmd_task_log() {
+pom_cmd_task_log() {
   local task="${1:-}"
-  [[ -n "$task" ]] || die "usage: ./om poc task-log <task-history-id>"
+  [[ -n "$task" ]] || die "usage: ./om pom task-log <task-history-id>"
   [[ "$task" =~ ^[0-9]+$ ]] || die "task history id must be numeric; got '$task'"
   [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
   info "Log for task history $task"
@@ -1454,38 +1567,38 @@ PY
   ) || die "could not read the log — is the tasks database reachable?"
 }
 
-poc_cmd_metrics() {
-  local run; run="$(poc_run_id "${1:-}")"
+pom_cmd_metrics() {
+  local run; run="$(pom_run_id "${1:-}")"
   command -v jq >/dev/null 2>&1 || die "jq not found — install jq"
   info "VictoriaMetrics for run $run"
 
   local ts
-  ts="$(poc_vm_query "psmdb_poc_run_ts{execution_id=\"$run\"}" \
+  ts="$(pom_vm_query "pom_run_ts{execution_id=\"$run\"}" \
         | jq -r '.data.result[0].value[1] // empty')"
   if [[ -z "$ts" ]]; then
     warn "no metrics found for this run"
-    dim "EMIT_METRICS may be off (SEP.PSMDB_POC in SEP/settings.yaml, default false),"
+    dim "EMIT_METRICS may be off (SEP.POM_WORKER in SEP/settings.yaml, default false),"
     dim "or the run is younger than VictoriaMetrics' ~30s search.latencyOffset"
     return
   fi
   ok "run_ts $ts ($(date -d "@$ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts"))"
 
   echo
-  dim "psmdb_poc_node by resolution / probe_status"
-  poc_vm_query "psmdb_poc_node{execution_id=\"$run\"}" \
+  dim "pom_node by resolution / probe_status"
+  pom_vm_query "pom_node{execution_id=\"$run\"}" \
     | jq -r '.data.result[].metric | "\(.resolution)/\(.probe_status)"' \
     | sort | uniq -c | sort -rn | sed 's/^/    /'
 
   echo
   dim "probed nodes"
-  poc_vm_query "psmdb_poc_node{execution_id=\"$run\",probe_status=\"ok\"}" \
+  pom_vm_query "pom_node{execution_id=\"$run\",probe_status=\"ok\"}" \
     | jq -r '.data.result[].metric
              | "    \(.service)  mongod=\(.mongod_version // "-")  set=\(.set_name // "-")  state=\(.state // "-")  os=\(.os // "-")"'
 
   echo
-  dim "psmdb_poc_result (raw JSON, chunked)"
+  dim "pom_result (raw JSON, chunked)"
   local raw
-  raw="$(poc_vm_query "psmdb_poc_result{execution_id=\"$run\"}" \
+  raw="$(pom_vm_query "pom_result{execution_id=\"$run\"}" \
         | jq -r '[.data.result[] | select(.metric.chunk)] | sort_by(.metric.chunk)
                  | map(.metric.result_json) | join("")')"
   if [[ -z "$raw" || "$raw" == "null" ]]; then
@@ -1495,43 +1608,43 @@ poc_cmd_metrics() {
   fi
 }
 
-poc_cmd_show() {
-  local run; run="$(poc_run_id "${1:-}")"
-  info "PSMDB PoC run $run"
-  poc_psql -c "
+pom_cmd_show() {
+  local run; run="$(pom_run_id "${1:-}")"
+  info "POM run $run"
+  pom_psql -c "
     select status,
            services_total as total, services_resolved as resolved,
            services_orphaned as orphaned, probes_ok as probed,
            to_char(started_at, 'YYYY-MM-DD HH24:MI:SS') as started,
            coalesce((finished_at - started_at)::text, 'still running') as duration
-    from psmdb_poc_run where id = '$run'"
-  poc_psql -c "
+    from pom_run where id = '$run'"
+  pom_psql -c "
     select resolution, probe_status, count(*),
            left(min(coalesce(error, '')), 50) as sample_error
-    from psmdb_poc_node where run_id = '$run'
+    from pom_node where run_id = '$run'
     group by 1, 2 order by 1, 2"
   info "Resolved services"
-  poc_psql -c "
+  pom_psql -c "
     select service_name, executor_host, probe_status,
            probe->>'binary_version'          as installed,
            probe->'database'->>'db_version'  as running,
            probe->'database'->>'set_name'    as repl_set,
            probe->'database'->>'state'       as state,
            probe->'system'->>'os_name'       as os
-    from psmdb_poc_node
+    from pom_node
     where run_id = '$run' and resolution <> 'ORPHANED'
     order by service_name"
-  dim "./om poc nodes    full mapping, orphans included"
-  dim "./om poc probe    per-node probe JSON"
-  dim "./om poc tasks    dispatched Nomad runs and their status"
-  dim "./om poc metrics  what reached VictoriaMetrics"
+  dim "./om pom nodes    full mapping, orphans included"
+  dim "./om pom probe    per-node probe JSON"
+  dim "./om pom tasks    dispatched Nomad runs and their status"
+  dim "./om pom metrics  what reached VictoriaMetrics"
 }
 
-poc_cmd_run() {
+pom_cmd_run() {
   [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
-  info "Triggering a PSMDB PoC run"
+  info "Triggering a POM run"
   # Driven through the service function rather than the Celery task on purpose:
-  # a worker started before the app existed has no `run_psmdb_poc` registered,
+  # a worker started before the app existed has no `run_pom_worker` registered,
   # and this path reports failures straight to the terminal.
   ( cd "$SEP_DIR" && "$SEP_DIR/venv/bin/python" - <<'PY'
 import asyncio, logging, sys
@@ -1540,15 +1653,24 @@ logging.basicConfig(level=logging.INFO, format="  %(message)s", stream=sys.stdou
 # would otherwise bury the job's own progress lines.
 for noisy in ("inventory_api", "tasks_api", "aiosqlite", "asyncio", "alembic"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
-from app.sep.apps.psmdb_poc.service import run_poc
-print(f"EXECUTION_ID={asyncio.run(run_poc())}")
+from app.sep.apps.pom_worker.service import run_discovery
+print(f"EXECUTION_ID={asyncio.run(run_discovery())}")
 PY
   ) || die "the run failed — see the traceback above"
   echo
-  cmd_poc show
+  cmd_pom show
 }
 
-poc_cmd_sync() {
+pom_cmd_token() {
+  [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
+  # SEP derives this from SECRET_KEY when SEP_INTERNAL_TOKEN is unset, so it is
+  # always available and always matches what the running backend accepts.
+  ( cd "$SEP_DIR" && "$SEP_DIR/venv/bin/python" -c \
+      'from app.core.security import get_internal_token; print(get_internal_token() or "")' \
+  ) 2>/dev/null || die "could not derive the internal token"
+}
+
+pom_cmd_sync() {
   [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
   info "Syncing inventory from PMM"
   dim "run this after rebuilding the sandbox, or every service maps as orphaned"
@@ -1560,27 +1682,28 @@ asyncio.run(run_scheduled_inventory_sync("app.sep.sync.syncers.pmm.PMMSyncer"))
 PY
   ) || die "the sync failed — see the traceback above"
   ok "inventory synced"
-  poc_psql -c "
+  pom_psql -c "
     select coalesce(cluster, '-') as cluster, count(*) as services
     from service where type = 'MONGODB' group by 1 order by 1"
 }
 
-cmd_poc() {
+cmd_pom() {
   local sub="${1:-show}"; shift || true
   case "$sub" in
-    show)      poc_cmd_show "$@" ;;
-    runs)      poc_cmd_runs "$@" ;;
-    nodes)     poc_cmd_nodes "$@" ;;
-    probe)     poc_cmd_probe "$@" ;;
-    probe-raw) poc_cmd_probe_raw "$@" ;;
-    tasks)     poc_cmd_tasks "$@" ;;
-    task-log)  poc_cmd_task_log "$@" ;;
-    metrics)   poc_cmd_metrics "$@" ;;
-    run)       poc_cmd_run "$@" ;;
-    sync)      poc_cmd_sync "$@" ;;
-    # A bare run id is the common case: ./om poc <uuid> == ./om poc show <uuid>
-    *-*-*-*-*) poc_cmd_show "$sub" ;;
-    *) die "unknown poc subcommand '$sub' (show|runs|nodes|probe|probe-raw|tasks|task-log|metrics|run|sync)" ;;
+    show)      pom_cmd_show "$@" ;;
+    runs)      pom_cmd_runs "$@" ;;
+    nodes)     pom_cmd_nodes "$@" ;;
+    probe)     pom_cmd_probe "$@" ;;
+    probe-raw) pom_cmd_probe_raw "$@" ;;
+    tasks)     pom_cmd_tasks "$@" ;;
+    task-log)  pom_cmd_task_log "$@" ;;
+    metrics)   pom_cmd_metrics "$@" ;;
+    run)       pom_cmd_run "$@" ;;
+    sync)      pom_cmd_sync "$@" ;;
+    token)     pom_cmd_token "$@" ;;
+    # A bare run id is the common case: ./om pom <uuid> == ./om pom show <uuid>
+    *-*-*-*-*) pom_cmd_show "$sub" ;;
+    *) die "unknown pom subcommand '$sub' (show|runs|nodes|probe|probe-raw|tasks|task-log|metrics|run|sync|token)" ;;
   esac
 }
 
@@ -1678,9 +1801,10 @@ main() {
     logs)    cmd_logs "$@" ;;
     build)   cmd_build "$@" ;;
     psmdb-link) cmd_psmdb_link "$@" ;;
-    poc)     cmd_poc "$@" ;;
+    pom)     cmd_pom "$@" ;;
     ports)   cmd_ports ;;
     urls|uris) cmd_urls "$@" ;;
+    inventory) cmd_inventory "$@" ;;
     doctor)  cmd_doctor ;;
     ""|-h|--help|help) usage ;;
     *) err "unknown command '$cmd'"; echo; usage; exit 1 ;;
