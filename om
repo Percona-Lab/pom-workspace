@@ -35,6 +35,8 @@
 #   ./om pom probe-raw      the same, untrimmed
 #   ./om pom tasks          dispatched Nomad runs and their status
 #   ./om pom task-log <id>  one dispatched run's captured output
+#   ./om pom topology       the run's topology document, flattened
+#   ./om pom topology-raw   the same document as stored JSON
 #   ./om pom metrics        what reached VictoriaMetrics (needs EMIT_METRICS)
 #   ./om pom run            trigger a run, then show it
 #   ./om pom sync           refresh inventory from PMM (do this after a rebuild)
@@ -1497,6 +1499,45 @@ pom_cmd_nodes() {
     order by (resolution = 'ORPHANED'), service_name"
 }
 
+pom_cmd_topology() {
+  local run; run="$(pom_run_id "${1:-}")"
+  info "Topology document for run $run"
+  # The document is the run's whole deliverable: environments -> clusters -> services.
+  # Flattened here because a terminal renders a table better than a tree; ./om pom
+  # topology-raw prints the JSON as stored.
+  pom_psql -c "
+    select coalesce(e->>'env_name', '-')   as env,
+           coalesce(c->>'name', '-')       as cluster,
+           s->>'service_name'              as service,
+           s->>'process_role'              as role,
+           s->>'status'                    as status,
+           coalesce(s->>'state', '-')      as state,
+           s->>'version'                   as version,
+           round((s->>'cpu_usage_percent')::numeric, 1)      as cpu_pct,
+           round((s->>'connections_free_percent')::numeric, 1) as conn_free_pct,
+           coalesce(s->>'replication_lag_seconds', '-')      as lag_s,
+           coalesce(s->>'oplog_window_seconds', '-')         as oplog_s
+    from pom_snapshot p,
+         jsonb_array_elements(p.document->'environments') e,
+         jsonb_array_elements(e->'clusters') c,
+         jsonb_array_elements(c->'services') s
+    where p.run_id = '$run'
+    order by env, cluster, service"
+  echo
+  pom_psql -c "
+    select document->'summary' ->> 'services_total' as services,
+           document->'summary' ->> 'services_up'    as up,
+           document->'summary' ->> 'services_down'  as down,
+           document->'summary' ->> 'clusters'       as clusters,
+           document->>'origin_node'                 as origin_node
+    from pom_snapshot where run_id = '$run'"
+}
+
+pom_cmd_topology_raw() {
+  local run; run="$(pom_run_id "${1:-}")"
+  pom_psql -tAc "select jsonb_pretty(document) from pom_snapshot where run_id = '$run'"
+}
+
 pom_cmd_probe() {
   local run; run="$(pom_run_id "${1:-}")"
   local service="${2:-}"
@@ -1683,6 +1724,7 @@ pom_cmd_show() {
   dim "./om pom nodes    full mapping, orphans included"
   dim "./om pom probe    per-node probe JSON"
   dim "./om pom tasks    dispatched Nomad runs and their status"
+  dim "./om pom topology  the run's topology document"
   dim "./om pom metrics  what reached VictoriaMetrics"
 }
 
@@ -1743,13 +1785,15 @@ cmd_pom() {
     probe-raw) pom_cmd_probe_raw "$@" ;;
     tasks)     pom_cmd_tasks "$@" ;;
     task-log)  pom_cmd_task_log "$@" ;;
+    topology)     pom_cmd_topology "$@" ;;
+    topology-raw) pom_cmd_topology_raw "$@" ;;
     metrics)   pom_cmd_metrics "$@" ;;
     run)       pom_cmd_run "$@" ;;
     sync)      pom_cmd_sync "$@" ;;
     token)     pom_cmd_token "$@" ;;
     # A bare run id is the common case: ./om pom <uuid> == ./om pom show <uuid>
     *-*-*-*-*) pom_cmd_show "$sub" ;;
-    *) die "unknown pom subcommand '$sub' (show|runs|nodes|probe|probe-raw|tasks|task-log|metrics|run|sync|token)" ;;
+    *) die "unknown pom subcommand '$sub' (show|runs|nodes|topology|topology-raw|probe|probe-raw|tasks|task-log|metrics|run|sync|token)" ;;
   esac
 }
 

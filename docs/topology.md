@@ -4,7 +4,7 @@
 **Derived from:** `pmm/` @ `sep-combined-local` (`v3.8.1-185-g5adae2f50` = PMM-15216 +
 PMM-15293 + PMM-15238; `docker-compose.dev.yml`, `.env`,
 `build/ansible/roles/{supervisord,nginx}/files/*`, `managed/services/supervisord/*`,
-`ui/apps/pmm/*`), `SEP/` @ `psmdb-openmanager` (`23f62751`) (`app/main.py`,
+`ui/apps/pmm/*`), `SEP/` @ `psmdb-openmanager` (`6f89d1a3`) (`app/main.py`,
 `settings.yaml`, `app/tasks/execution/**`, `app/sep/sync/syncers/pmm.py`,
 `app/sep/apps/{pom_worker,pom_api}/**`), the new [`psmdb/`](../psmdb/) sandbox
 (`compose.yaml`, `Dockerfile`, `scripts/*`), plus the workspace's own
@@ -549,25 +549,42 @@ whole pipeline is worth stating:
 3. dispatch the probe payload **once per executor host** (carrying every service that host
    serves) via the pre-seeded system `run-python` task, and collect NDJSON back over the
    task-log chunk store rather than the 16 KB result file;
-4. **read the same estate back out of VictoriaMetrics** — versions, vendor, edition and
-   replica-set state, declared as a catalog of signals rather than hardcoded queries. This
-   is the source with real coverage: the probe reaches only services whose Nomad
-   `raw_exec` executor is healthy, where this reaches every service PMM monitors;
+4. **read the same estate back out of VictoriaMetrics** — identity, versions, vendor and
+   edition, replica-set state and endpoint, reachability, CPU and free connections,
+   replication lag and the oplog window, all declared as a catalog of signals rather than
+   hardcoded queries. This is the source with real coverage: the probe reaches only
+   services whose Nomad `raw_exec` executor is healthy, where this reaches every service
+   PMM monitors;
 5. merge all three sources by declared per-field precedence, keeping the source and
-   observation time on every field, and persist mapping, probe records and merged facts
-   to PostgreSQL;
-6. optionally emit a VictoriaMetrics summary — `EMIT_METRICS`, plus `EMIT_RAW_JSON` for
+   observation time on every field;
+6. fold the result into **one topology document** — `environments -> clusters ->
+   services` — and store it whole in `pom_snapshot`, alongside the per-service mapping
+   and probe rows in `pom_node`;
+7. optionally emit a VictoriaMetrics summary — `EMIT_METRICS`, plus `EMIT_RAW_JSON` for
    eyeballing a run in vmui.
 
 `pom_worker` reads its `credentials_path` from the `/root/.mongodb_uri` that
 `register.sh` writes, the same file `backup_mongo` uses.
 
-**`pom_api`** — the read side, `custom_ui=True`, serving that snapshot under
-`/api/apps/pom_api` for a bespoke PMM page. It declares `requires_apps=("pom_worker",)`,
-so disabling the worker gates the API rather than leaving it serving an ageing snapshot
+The document is the deliverable, and two of its conventions are load-bearing rather
+than cosmetic. `cpu_usage_percent` and `connections_free_percent` are **-1 when not
+measured** — never null, never 0, because zero CPU is a real reading. `state`,
+`replication_lag_seconds` and `oplog_window_seconds` are **null when they do not apply**:
+a router and a standalone have no replica set and no oplog at all, which is a different
+statement from "we could not measure it".
+
+`process_role` (`mongod` / `mongos` / `configsvr` / `shardsvr`) is *derived*, not guessed:
+`mongodb_mongos_sharding_shards_total` is emitted only by a router, and the exporter's
+`cl_role` names config and shard servers. An earlier version inferred it from the port
+number.
+
+**`pom_api`** — the read side, `custom_ui=True`, serving that document whole at
+`GET /api/apps/pom_api/topology` for a bespoke PMM page, plus the discovery run history
+and trigger under `/discovery/runs`. It declares `requires_apps=("pom_worker",)`, so
+disabling the worker gates the API rather than leaving it serving an ageing snapshot
 behind a trigger nothing will run.
 
-Step 6 carries three measured constraints worth knowing before you copy it: a metric value
+Step 7 carries three measured constraints worth knowing before you copy it: a metric value
 is a float64 so the result JSON can only be a *label*; a label value is capped at **4096
 bytes and exceeding it is silent** (the push returns 204 and drops the sample), which is
 why the full result lives in Postgres; and a pushed sample is invisible for ~30s
