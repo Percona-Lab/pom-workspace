@@ -735,6 +735,44 @@ ensure_psmdb_image() {
   ok "image built"
 }
 
+# True when any of this profile's existing containers is pinned to a pmm_default
+# that no longer exists.
+#
+# compose.yaml joins pmm_default as an *external* network, so compose matches it
+# by name and never notices that the network behind the name changed. Docker,
+# though, records the network's *id* on a container when it is created: restart
+# PMM's compose stack and pmm_default is destroyed and recreated with a fresh id,
+# stranding every cluster container that predates the restart. `up -d` then
+# starts them unchanged and the daemon refuses:
+#
+#   Error response from daemon: failed to set up container networking:
+#   network 9578f6b1... not found
+#
+# Only recreating the container clears it, and compose will not do that on its
+# own — from its side nothing changed. So detect the divergence and ask for it.
+# The service list comes from compose rather than from the <profile>-* name
+# prefix, which also covers the profile-less services (minio) that come up
+# alongside every topology and go stale the same way.
+psmdb_stale_network() {
+  local profile="$1" want svcs cid nid
+  want="$(docker network inspect -f '{{.Id}}' "$PSMDB_NETWORK" 2>/dev/null)" || return 1
+  [[ -n "$want" ]] || return 1
+
+  mapfile -t svcs < <(psmdb_compose --profile "$profile" config --services 2>/dev/null || true)
+  [[ "${#svcs[@]}" -gt 0 ]] || return 1
+
+  while IFS= read -r cid; do
+    [[ -n "$cid" ]] || continue
+    # Empty for a container that was created but never attached; nothing to fix.
+    nid="$(docker inspect \
+      -f "{{index .NetworkSettings.Networks \"$PSMDB_NETWORK\" \"NetworkID\"}}" \
+      "$cid" 2>/dev/null || true)"
+    [[ -n "$nid" && "$nid" != "$want" ]] && return 0
+  done < <(psmdb_compose ps -aq "${svcs[@]}" 2>/dev/null || true)
+
+  return 1
+}
+
 start_psmdb() {
   local profile="$1"
   [[ -d "$PSMDB_DIR" ]] || die "psmdb/ not found at $PSMDB_DIR"
@@ -748,8 +786,16 @@ start_psmdb() {
   ensure_psmdb_image
   [[ -f "$PSMDB_DIR/secrets/keyfile" ]] || ( cd "$PSMDB_DIR" && ./bootstrap.sh >/dev/null )
 
+  local recreate=()
+  if psmdb_stale_network "$profile"; then
+    warn "$profile: containers are pinned to a $PSMDB_NETWORK that no longer exists"
+    dim "PMM's compose stack was restarted since they were created; recreating them"
+    dim "(named volumes are kept, so the data survives)"
+    recreate=(--force-recreate)
+  fi
+
   info "$profile: docker compose (profile '$profile')"
-  psmdb_compose --profile "$profile" up -d
+  psmdb_compose --profile "$profile" up -d "${recreate[@]}"
 
   # Registration is the useful readiness signal, not "container started": a node
   # is only usable once its pmm-agent has connected and register.sh has written
