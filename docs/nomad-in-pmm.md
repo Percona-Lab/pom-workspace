@@ -17,6 +17,18 @@ PMM already does for you, and the three things that block it today.
 **Status: this is a design exploration, not a plan.** Nothing here is implemented.
 `pmm/.env` on this machine has `PMM_ENABLE_NOMAD=0`.
 
+> **Superseded in part, as of 2026-08-06.** This *is* how the local stack now works:
+> `pmm/.env` sets `PMM_ENABLE_NOMAD=1`, SEP's `TASKS.NOMAD.ENDPOINT` points at
+> `https://admin:admin@127.0.0.1:8443/nomad`, and the `psmdb/` sandbox nodes each register
+> a Nomad client with `raw_exec` healthy. Two of the three blockers below turned out to be
+> narrower than stated: the missing `python3`/`pbm` was a property of the **stock
+> pmm-client image**, not of the design — `psmdb/Dockerfile` installs them alongside
+> pmm-client in the same container — and the cgroups "hard stop" is contradicted by
+> measurement: the clients start and register given `cgroup: host` plus a writable
+> `/sys/fs/cgroup` (see `psmdb/scripts/run-pmm-agent.sh`). Read
+> [`topology.md`](topology.md) Parts 3 and 7 for the current shape; the reasoning below is
+> still the best account of *how* PMM distributes the client and its certificates.
+
 ---
 
 ## 1. The short answer

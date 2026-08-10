@@ -3,7 +3,7 @@
 Every proper noun and piece of jargon that shows up in this workspace, in plain words.
 Ordered so that reading top to bottom builds up — not alphabetically.
 
-**As of:** 2026-08-03
+**As of:** 2026-08-06
 
 ---
 
@@ -131,8 +131,13 @@ the executor). If the source is empty, the form renders but cannot be submitted.
 
 **SQLModel / SQLAlchemy.** The libraries SEP uses to talk to its databases from Python.
 
-**Casdoor.** An open-source login server. SEP has no user accounts of its own, so it
-hands authentication to Casdoor. Runs as a container on port 9999 here.
+**Casdoor.** An open-source login server. Standalone SEP has no user accounts of its own,
+so it hands authentication to Casdoor, on port 9999 here. Not in the path when SEP runs
+inside PMM — see *session exchange*.
+
+**session exchange.** `POST /api/oauth/session/exchange`: the embedded SEP UI trades the
+browser's existing `pmm_session` cookie for a short-lived SEP bearer. SEP validates the
+session against Grafana and maps the org role, so no separate SEP login exists.
 
 **OAuth2 password grant.** The simplest OAuth flow: send username and password, get
 tokens back. SEP performs it *server-side*, so there is no browser redirect and no
@@ -149,8 +154,13 @@ so a script on the page cannot steal it.
 and runs it. Two halves: a **server** that decides, and a **client** that executes.
 
 **`raw_exec` driver.** The Nomad driver that runs a command *directly on the client
-machine*, with no container around it. SEP uses this — which means the Nomad client image
-must itself contain every tool the jobs call (python3, pbm, …).
+machine*, with no container around it. SEP uses this — which means the Nomad client's own
+filesystem must contain every tool the jobs call (python3, pbm, …).
+
+**nomad-agent.** The Nomad client `pmm-managed` creates for every connecting `pmm-agent`
+≥ 3.2.0, pushing its config and mTLS material down the stream the agent already opened.
+This is what makes a monitored database host a SEP execution host with no certificate
+handling of your own, and no inbound port.
 
 **parameterized job / dispatch.** A Nomad job registered once as a template, then
 "dispatched" many times with different inputs. SEP registers a template per task type and
@@ -176,8 +186,15 @@ selects it.
 it on the executor host.
 
 **PSMDB Sandbox.** A separate Go web UI (`mongo_terraform_ansible/ui-go`, port 5001)
-that drives Terraform to deploy real MongoDB clusters locally in Docker. The source of
-real databases to test against.
+that drives Terraform to deploy real MongoDB clusters locally in Docker, with `pmm-client`
+as a **sidecar** container per node. The older source of real databases to test against;
+`./om start sandbox`.
+
+**`psmdb/` clusters.** The newer source: four MongoDB topologies as Compose profiles in
+[`psmdb/`](../psmdb/), where each node is **one** container running mongod/mongos +
+pbm-agent + pmm-agent, so the Nomad client lives beside the database it manages. Started
+per profile — `./om start replicaset-cluster` — or all at once with `./om start clusters`.
+Since 2026-08-06 `psmdb` as an `om` argument means these, not the sandbox UI.
 
 **MinIO.** S3-compatible object storage, used locally as a backup target. Defaults to
 port 9000, which is why it collides with PMM's ClickHouse.
@@ -189,7 +206,7 @@ on your development machine.
 
 ## Workspace-specific
 
-**`om`.** The orchestrator script at the workspace root. Starts, stops and links all four
+**`om`.** The orchestrator script at the workspace root. Starts, stops and links all five
 local stacks. `./om setup`, `./om start`, `./om status`, `./om ports`.
 
 **devcontainer.** A container that has the build toolchain inside and your source tree
