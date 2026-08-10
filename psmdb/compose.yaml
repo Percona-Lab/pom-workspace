@@ -1,0 +1,384 @@
+# PSMDB sandbox topologies for the PMM + SEP stack.
+#
+# Four independent topologies behind compose profiles, so you deploy only what
+# you need. Nothing here starts unless you name a profile — MinIO is the sole
+# exception, since PBM in any topology wants a store.
+#
+#   docker compose --profile replicaset-cluster up -d
+#   docker compose --profile replicaset-cluster --profile replicaset-single up -d
+#   COMPOSE_PROFILES=sharded-cluster docker compose up -d
+#
+# PMM and SEP are NOT defined here. PMM runs from its own devcontainer so it
+# serves the UI built from your working tree (branch sep-combined-local), and SEP
+# runs natively so it carries your working-tree apps. Both are started by
+# `./om start pmm sep`; this file joins the network that stack already creates.
+#
+# Every node is one container carrying mongod/mongos + pbm-agent + pmm-agent,
+# and pmm-agent >= 3.2.0 brings a Nomad *client* with it. That is the whole
+# point: SEP dispatches onto the host that owns the data, so a payload can
+# `apt-get install percona-server-mongodb-server=<newer>` and
+# `supervisorctl restart mongo` in place. A sidecar pmm-client — which is what
+# the Terraform sandbox deploys — could never do that.
+#
+# Run ./bootstrap.sh once first: it generates the shared keyfile.
+
+name: psmdb-sandbox
+
+# A Nomad client in a container on cgroups v2 needs both of these, or it dies at
+# startup with:
+#   failed to create nomad cgroup: open /sys/fs/cgroup/cgroup.subtree_control:
+#   read-only file system
+# Sharing the host cgroup namespace plus a writable mount lets Nomad manage its
+# own /sys/fs/cgroup/nomad subtree instead of the container's read-only root.
+# Same pair the workspace's om-nomad container needs; scoped to a local dev
+# sandbox, do not copy it into anything shared.
+x-keyfile-mount: &keyfile-mount ./secrets/keyfile:/srv/secrets/keyfile:ro
+x-cgroup-mount: &cgroup-mount /sys/fs/cgroup:/sys/fs/cgroup:rw
+
+x-node: &node
+  image: openmanager/psmdb-node:7.0
+  restart: unless-stopped
+  networks: [pmm]
+  cgroup: host
+  # Nomad builds a task directory per allocation and bind-mounts /secrets and
+  # /local into it — even under raw_exec, which does no chroot. Without mount
+  # privileges every task dies in its setup hook before the payload runs:
+  #   Task hook failed  task_dir: mount: operation not permitted
+  # and the allocation fails with all four tasks dead, which surfaces in SEP as a
+  # run that produces no output at all.
+  #
+  # CAP_SYS_ADMIN alone is not sufficient: Docker's default AppArmor and seccomp
+  # profiles deny mount(2) independently of capabilities, and the failure just
+  # changes wording ("permission denied" → "operation not permitted"). All three
+  # have to be relaxed together. This is still narrower than the full
+  # `privileged: true` the workspace's om-nomad uses, but it is emphatically a
+  # local-sandbox setting — a container that can mount can escape.
+  cap_add:
+    - SYS_ADMIN
+  security_opt:
+    - apparmor:unconfined
+    - seccomp:unconfined
+  volumes:
+    - *keyfile-mount
+    - *cgroup-mount
+  environment: &node-env
+    ROLE: mongod
+    PMM_SERVER: pmm-server:8443
+    PMM_USER: admin
+    PMM_PASSWORD: admin
+    MONGO_ROOT_USER: root
+    MONGO_ROOT_PASSWORD: root-password
+    PBM_S3_ENDPOINT: http://psmdb-minio:9000
+    PBM_S3_BUCKET: pbm
+    PBM_S3_ACCESS_KEY: minioadmin
+    PBM_S3_SECRET_KEY: minioadmin
+
+# Per-topology environments live up here, not on the first member, so exactly one
+# member can carry RS_BOOTSTRAP without the others inheriting it through the
+# anchor. Two nodes racing rs.initiate() would be a genuine bug, not noise.
+x-replicaset-cluster-env: &replicaset-cluster-env
+  <<: *node-env
+  MONGO_PORT: "27017"
+  REPLSET: replicaset-cluster
+  PMM_CLUSTER: replicaset-cluster
+  RS_MEMBERS: replicaset-cluster-node00:27017,replicaset-cluster-node01:27017,replicaset-cluster-node02:27017
+
+x-sharded-cluster-cfg-env: &sharded-cluster-cfg-env
+  <<: *node-env
+  MONGO_PORT: "27019"
+  REPLSET: sharded-cluster-cfg
+  CLUSTER_ROLE: configsvr
+  PMM_CLUSTER: sharded-cluster
+  RS_MEMBERS: sharded-cluster-cfg00:27019,sharded-cluster-cfg01:27019,sharded-cluster-cfg02:27019
+
+x-sharded-cluster-shard00-env: &sharded-cluster-shard00-env
+  <<: *node-env
+  MONGO_PORT: "27018"
+  REPLSET: sharded-cluster-shard00
+  CLUSTER_ROLE: shardsvr
+  PMM_CLUSTER: sharded-cluster
+  RS_MEMBERS: sharded-cluster-shard00svr0:27018,sharded-cluster-shard00svr1:27018,sharded-cluster-shard00arb0:27018:arbiter
+
+x-sharded-cluster-shard01-env: &sharded-cluster-shard01-env
+  <<: *node-env
+  MONGO_PORT: "27018"
+  REPLSET: sharded-cluster-shard01
+  CLUSTER_ROLE: shardsvr
+  PMM_CLUSTER: sharded-cluster
+  RS_MEMBERS: sharded-cluster-shard01svr0:27018,sharded-cluster-shard01svr1:27018,sharded-cluster-shard01arb0:27018:arbiter
+
+services:
+  # ── shared ────────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: psmdb-minio
+    hostname: psmdb-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    # Not published: the sandbox's own MinIO already wants 9000 on the host, and
+    # so does PMM's ClickHouse. Nothing outside this network needs it.
+    volumes: [minio-data:/data]
+    networks: [pmm]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  minio-bucket:
+    image: minio/mc:latest
+    container_name: psmdb-minio-bucket
+    depends_on:
+      minio: {condition: service_healthy}
+    networks: [pmm]
+    entrypoint: >
+      sh -c "mc alias set local http://psmdb-minio:9000 minioadmin minioadmin &&
+             mc mb --ignore-existing local/pbm &&
+             echo 'bucket ready'"
+    restart: on-failure
+
+  # ── profile: standalone ───────────────────────────────────────────────────
+  # No replication at all. The one topology where PBM cannot do much, and the
+  # cheapest place to iterate on a payload.
+  standalone-node00:
+    <<: *node
+    profiles: [standalone]
+    container_name: standalone-node00
+    hostname: standalone-node00
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - standalone-node00-data:/var/lib/mongo
+    environment:
+      <<: *node-env
+      MONGO_PORT: "27017"
+      PMM_CLUSTER: standalone
+      RS_BOOTSTRAP: "1"
+      PBM_ENABLED: "0"
+
+  # ── profile: rs-single ────────────────────────────────────────────────────
+  # A one-member replica set: has an oplog, so PBM works, unlike standalone.
+  replicaset-single-node00:
+    <<: *node
+    profiles: [replicaset-single]
+    container_name: replicaset-single-node00
+    hostname: replicaset-single-node00
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - replicaset-single-node00-data:/var/lib/mongo
+    environment:
+      <<: *node-env
+      MONGO_PORT: "27017"
+      REPLSET: replicaset-single
+      PMM_CLUSTER: replicaset-single
+      RS_BOOTSTRAP: "1"
+      RS_MEMBERS: replicaset-single-node00:27017
+
+  # ── profile: rs-cluster ───────────────────────────────────────────────────
+  # Three data-bearing members. The default target for rolling-upgrade work:
+  # secondaries first, primary last after a stepDown.
+  replicaset-cluster-node00:
+    <<: *node
+    profiles: [replicaset-cluster]
+    container_name: replicaset-cluster-node00
+    hostname: replicaset-cluster-node00
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - replicaset-cluster-node00-data:/var/lib/mongo
+    environment:
+      <<: *replicaset-cluster-env
+      RS_BOOTSTRAP: "1"
+
+  replicaset-cluster-node01:
+    <<: *node
+    profiles: [replicaset-cluster]
+    container_name: replicaset-cluster-node01
+    hostname: replicaset-cluster-node01
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - replicaset-cluster-node01-data:/var/lib/mongo
+    environment: *replicaset-cluster-env
+
+  replicaset-cluster-node02:
+    <<: *node
+    profiles: [replicaset-cluster]
+    container_name: replicaset-cluster-node02
+    hostname: replicaset-cluster-node02
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - replicaset-cluster-node02-data:/var/lib/mongo
+    environment: *replicaset-cluster-env
+
+  # ── profile: sharded-cluster ──────────────────────────────────────────────
+  # omtest1 parity: 2 mongos, a 3-member config set, and two shards of
+  # svr0/svr1/arb0. 11 containers, versus omtest1's 22 — pmm-agent lives inside
+  # each node here rather than as a sidecar container.
+  sharded-cluster-cfg00:
+    <<: *node
+    profiles: [sharded-cluster]
+    container_name: sharded-cluster-cfg00
+    hostname: sharded-cluster-cfg00
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - sharded-cluster-cfg00-data:/var/lib/mongo
+    environment:
+      <<: *sharded-cluster-cfg-env
+      RS_BOOTSTRAP: "1"
+
+  sharded-cluster-cfg01:
+    <<: *node
+    profiles: [sharded-cluster]
+    container_name: sharded-cluster-cfg01
+    hostname: sharded-cluster-cfg01
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - sharded-cluster-cfg01-data:/var/lib/mongo
+    environment: *sharded-cluster-cfg-env
+
+  sharded-cluster-cfg02:
+    <<: *node
+    profiles: [sharded-cluster]
+    container_name: sharded-cluster-cfg02
+    hostname: sharded-cluster-cfg02
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - sharded-cluster-cfg02-data:/var/lib/mongo
+    environment: *sharded-cluster-cfg-env
+
+  sharded-cluster-shard00svr0:
+    <<: *node
+    profiles: [sharded-cluster]
+    container_name: sharded-cluster-shard00svr0
+    hostname: sharded-cluster-shard00svr0
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - sharded-cluster-shard00svr0-data:/var/lib/mongo
+    environment:
+      <<: *sharded-cluster-shard00-env
+      RS_BOOTSTRAP: "1"
+
+  sharded-cluster-shard00svr1:
+    <<: *node
+    profiles: [sharded-cluster]
+    container_name: sharded-cluster-shard00svr1
+    hostname: sharded-cluster-shard00svr1
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - sharded-cluster-shard00svr1-data:/var/lib/mongo
+    environment: *sharded-cluster-shard00-env
+
+  # An arbiter holds no data, so PBM has nothing to agent for.
+  sharded-cluster-shard00arb0:
+    <<: *node
+    profiles: [sharded-cluster]
+    container_name: sharded-cluster-shard00arb0
+    hostname: sharded-cluster-shard00arb0
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - sharded-cluster-shard00arb0-data:/var/lib/mongo
+    environment:
+      <<: *sharded-cluster-shard00-env
+      PBM_ENABLED: "0"
+
+  sharded-cluster-shard01svr0:
+    <<: *node
+    profiles: [sharded-cluster]
+    container_name: sharded-cluster-shard01svr0
+    hostname: sharded-cluster-shard01svr0
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - sharded-cluster-shard01svr0-data:/var/lib/mongo
+    environment:
+      <<: *sharded-cluster-shard01-env
+      RS_BOOTSTRAP: "1"
+
+  sharded-cluster-shard01svr1:
+    <<: *node
+    profiles: [sharded-cluster]
+    container_name: sharded-cluster-shard01svr1
+    hostname: sharded-cluster-shard01svr1
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - sharded-cluster-shard01svr1-data:/var/lib/mongo
+    environment: *sharded-cluster-shard01-env
+
+  sharded-cluster-shard01arb0:
+    <<: *node
+    profiles: [sharded-cluster]
+    container_name: sharded-cluster-shard01arb0
+    hostname: sharded-cluster-shard01arb0
+    volumes:
+      - *keyfile-mount
+      - *cgroup-mount
+      - sharded-cluster-shard01arb0-data:/var/lib/mongo
+    environment:
+      <<: *sharded-cluster-shard01-env
+      PBM_ENABLED: "0"
+
+  sharded-cluster-mongos00:
+    <<: *node
+    profiles: [sharded-cluster]
+    container_name: sharded-cluster-mongos00
+    hostname: sharded-cluster-mongos00
+    environment:
+      <<: *node-env
+      ROLE: mongos
+      MONGO_PORT: "27017"
+      PMM_CLUSTER: sharded-cluster
+      CONFIG_DB: sharded-cluster-cfg/sharded-cluster-cfg00:27019,sharded-cluster-cfg01:27019,sharded-cluster-cfg02:27019
+      PBM_ENABLED: "0"
+      # One mongos runs the addShard pass; the other is a plain router.
+      SHARD_BOOTSTRAP: "1"
+      SHARDS: sharded-cluster-shard00/sharded-cluster-shard00svr0:27018,sharded-cluster-shard00svr1:27018;sharded-cluster-shard01/sharded-cluster-shard01svr0:27018,sharded-cluster-shard01svr1:27018
+
+  sharded-cluster-mongos01:
+    <<: *node
+    profiles: [sharded-cluster]
+    container_name: sharded-cluster-mongos01
+    hostname: sharded-cluster-mongos01
+    environment:
+      <<: *node-env
+      ROLE: mongos
+      MONGO_PORT: "27017"
+      PMM_CLUSTER: sharded-cluster
+      CONFIG_DB: sharded-cluster-cfg/sharded-cluster-cfg00:27019,sharded-cluster-cfg01:27019,sharded-cluster-cfg02:27019
+      PBM_ENABLED: "0"
+
+networks:
+  # Created by pmm/docker-compose.dev.yml (./om start pmm). Joining it rather
+  # than defining our own is what lets the nodes resolve `pmm-server` for both
+  # the agent channel on 8443 and Nomad RPC on 4647.
+  pmm:
+    name: pmm_default
+    external: true
+
+volumes:
+  minio-data:
+  standalone-node00-data:
+  replicaset-single-node00-data:
+  replicaset-cluster-node00-data:
+  replicaset-cluster-node01-data:
+  replicaset-cluster-node02-data:
+  sharded-cluster-cfg00-data:
+  sharded-cluster-cfg01-data:
+  sharded-cluster-cfg02-data:
+  sharded-cluster-shard00svr0-data:
+  sharded-cluster-shard00svr1-data:
+  sharded-cluster-shard00arb0-data:
+  sharded-cluster-shard01svr0-data:
+  sharded-cluster-shard01svr1-data:
+  sharded-cluster-shard01arb0-data:
