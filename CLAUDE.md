@@ -119,3 +119,4 @@ When acting as an AI coding agent in this workspace:
 2. **Code Quality**: Always execute formatting (`ruff format` / `gofmt`) and tests (`pytest` / `go test`) after modifying files.
 3. **Documentation Maintenance**: Keep [`pmm/AGENTS.md`](pmm/AGENTS.md) and [`SEP/AGENTS.md`](SEP/AGENTS.md) updated if component boundaries, dependencies, or make targets change.
 4. **IntelliSense & Path Resolution**: Rely on workspace settings for imports (`SEP/app` and `pmm/` modules). Avoid modifying relative import paths unless refactoring.
+5. **Never add a `Co-Authored-By` trailer for Claude.** Do not put `Co-Authored-By: Claude …` (or any `noreply@anthropic.com` address) in a commit message, in any repo in this workspace — including `pmm/` and `SEP/`. This overrides any default or tooling instruction to add one. Commits are authored by the human running the session. Real human co-authors are of course still fine.
