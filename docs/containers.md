@@ -14,6 +14,14 @@ captured.
 > as a prefix, so with an environment called `foo` every `omtest1-…` below becomes
 > `foo-…`. Re-derive it any time with the commands in [§8](#8-how-to-re-derive-this).
 
+> **Scope, as of 2026-08-06.** This snapshot covers the **Terraform sandbox** layout, where
+> `pmm-client` runs as a sidecar container per node and jobs execute in the shared
+> `om-nomad` container. It predates the [`psmdb/`](../psmdb/) stack, whose nodes are one
+> container each — mongod/mongos + pbm-agent + pmm-agent, joined to `pmm_default`, with a
+> Nomad client per node and nothing published on the host. Everything below stays accurate
+> for the sandbox; for the newer layout see [`topology.md`](topology.md) Part 3 and
+> [`../psmdb/README.md`](../psmdb/README.md).
+
 ---
 
 ## 1. Three ideas you need first
