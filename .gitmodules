@@ -1,6 +1,8 @@
 [submodule "pmm"]
 	path = pmm
-	url = git@github.com:percona/pmm.git
+	url = git@github.com:plebioda/pmm.git
+	branch = psmdb-openmanager
 [submodule "SEP"]
 	path = SEP
-	url = git@github.com:percona/SEP.git
+	url = git@github.com:plebioda/SEP.git
+	branch = psmdb-openmanager
