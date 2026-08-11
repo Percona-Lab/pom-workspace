@@ -76,13 +76,29 @@ cd openmanager
 git submodule update --init
 ```
 
-The submodules are pinned to specific commits and check out **detached**. `pmm/` and
-`SEP/` track the unmerged integration work (`psmdb-openmanager` on both), so check the
-branch out explicitly if you intend to commit inside one:
+Both submodules point at the forks that carry the integration work, pinned to specific
+commits on their `psmdb-openmanager` branches:
+
+```
+pmm  → git@github.com:plebioda/pmm.git   @ psmdb-openmanager
+SEP  → git@github.com:plebioda/SEP.git   @ psmdb-openmanager
+```
+
+They check out **detached** at the pinned commit, which is what you want for a
+reproducible setup. Check the branch out explicitly only if you intend to commit inside
+one:
 
 ```bash
 (cd pmm && git checkout psmdb-openmanager)
 (cd SEP && git checkout psmdb-openmanager)
+```
+
+To move the workspace onto newer submodule commits, pull inside the submodule and commit
+the new pointer here:
+
+```bash
+(cd SEP && git pull)
+git add SEP && git commit -m "Bump SEP"
 ```
 
 ---
@@ -104,7 +120,8 @@ mounted working tree would not be buildable:
 cp pmm/.env.dev.example pmm/.env
 ```
 
-Then change these (the example's defaults are wrong for this workspace):
+Then set these. The first three are in the example with the wrong defaults; the last
+two are **not in the example at all** and have to be added:
 
 ```ini
 PMM_PORT_HTTPS=8443             # SEP pins PMM.ENDPOINT to https://127.0.0.1:8443
@@ -212,7 +229,7 @@ Name components to start a subset: `./om start pmm`, `./om start sep`, and so on
 ```
 
 Note that `./om start pmm` runs the **image's** Go binaries; it deploys your working
-tree's UI automatically but not your backend changes. See §7.
+tree's UI automatically but not your backend changes. See §8.
 
 ---
 
@@ -266,7 +283,62 @@ Full detail — the in-place upgrade loop, bootstrap ordering, and the rough edg
 
 ---
 
-## 7. Building your changes
+## 7. Use POM
+
+POM (PSMDB OpenManager) is what the rest of this setup exists to feed. It needs PMM up,
+SEP up and at least one cluster registered. Nothing here needs compiling — but the page
+is part of PMM's UI bundle, so if the sidebar has no SEP apps, run `./om build ui` once
+(§10 has the symptom).
+
+`pom_worker` (`SEP/app/sep/apps/pom_worker`) discovers the MongoDB estate from three
+sources — SEP's inventory, PMM's VictoriaMetrics, and a probe dispatched to each node —
+merges them by declared per-field precedence, and stores one
+`environments -> clusters -> services` topology document per run.
+
+```bash
+./om start pmm                  # 1. PMM first, always
+./om start clusters             # 2. all four topologies (or name one)
+./om start sep                  # 3. SEP backend
+./om pom sync                   # 4. pull PMM's inventory into SEP
+./om pom run                    # 5. run discovery, then show the result
+./om pom topology               # 6. the topology document, flattened
+```
+
+Step 4 matters and is easy to skip: SEP holds its own copy of PMM's inventory, and a
+cluster started after the last sync is invisible to discovery until you refresh it.
+Everything in a run would then come back orphaned.
+
+In the browser the same snapshot is at
+**https://localhost:8443/pmm-ui/sep/pom** — one table over the whole estate, with
+environment and cluster as the leading columns.
+
+Two conventions in the output are worth knowing before you read it as a fault:
+
+- **`cpu_usage_percent` and `connections_free_percent` are `-1` when not measured**, never
+  null and never `0` — zero CPU is a real reading, so the sentinel keeps "idle" and
+  "unknown" apart.
+- **`state`, `replication_lag_seconds` and `oplog_window_seconds` are null when they do
+  not apply.** A router and a standalone have no replica set and no oplog at all, which is
+  a different statement from "we could not measure it".
+
+The rest of the inspector, every subcommand defaulting to the most recent run:
+
+```bash
+./om pom                # overview: status, counts, resolved services
+./om pom topology-raw   # the document as stored JSON — pipe it to jq
+./om pom nodes          # the service -> executor mapping, orphans included
+./om pom probe          # per-node probe JSON
+./om pom tasks          # dispatched probe task runs and their status
+./om pom runs           # run history, newest first
+./om pom token          # bearer token for SEP's /api/docs Authorize button, and for curl
+```
+
+The API behind all of it is `GET /api/apps/pom_api/topology`, plus
+`/discovery/runs` for the history and the trigger.
+
+---
+
+## 8. Building your changes
 
 ```bash
 ./om build pmm      # compile the PMM working tree into the running container (minutes)
@@ -285,28 +357,7 @@ SEP needs no build step: the backend reloads and the frontend runs under Vite.
 
 After a rebuild that changes inventory, refresh SEP's copy with `./om pom sync`.
 
-### Inspecting the POM app
-
-`pom_worker` (`SEP/app/sep/apps/pom_worker`) discovers the MongoDB estate from three
-sources — SEP's inventory, VictoriaMetrics and a dispatched probe — and stores one
-`environments -> clusters -> services` topology document per run. It has a dedicated
-inspector that joins PostgreSQL, VictoriaMetrics and the tasks API. Every subcommand
-defaults to the most recent run:
-
-```bash
-./om pom                # overview: status, counts, resolved services
-./om pom run            # trigger a run, then show it
-./om pom topology       # the run's topology document, flattened into a table
-./om pom topology-raw   # the same document as stored JSON — pipe it to jq
-./om pom nodes          # the service -> executor mapping, orphans included
-./om pom probe          # per-node probe JSON
-./om pom tasks          # dispatched probe task runs and their status
-./om pom token          # bearer token for SEP's /api/docs Authorize button, and for curl
-```
-
----
-
-## 8. Ports
+## 9. Ports
 
 ```bash
 ./om ports      # the table below, plus what is actually listening
@@ -325,7 +376,7 @@ defaults to the most recent run:
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 **`make migrate` fails with a connection error during `./om setup`** — PMM is not running,
 or `PMM_ENABLE_SEP` / `PMM_SEP_POSTGRES_PASSWORD` are missing from `pmm/.env`, or the
@@ -373,7 +424,7 @@ shortcut.
 
 ---
 
-## 10. Editor setup
+## 11. Editor setup
 
 Open [`openmanager.code-workspace`](openmanager.code-workspace) in VS Code or Cursor — it
 configures the Go, Python and TypeScript language servers, formatters and linters for both
@@ -382,7 +433,7 @@ repositories. Recommended extensions and the format-on-save rules are in
 
 ---
 
-## 11. Where to read more
+## 12. Where to read more
 
 | Doc | What it covers |
 | --- | --- |
