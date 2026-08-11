@@ -54,8 +54,7 @@ cd /home/plebioda/openmanager
 
 `./om start` builds the node image and generates `secrets/keyfile` on first use,
 and waits for every node to finish bootstrap rather than just reporting
-"started". `clusters` (or `psmdb`) is the group for all four at once — note that
-`psmdb` used to mean the Terraform sandbox UI, which is now `sandbox` only.
+"started". `clusters` (or `psmdb`) is the group for all four at once.
 
 Compose directly works too, and is what `om` calls:
 
@@ -173,9 +172,9 @@ Everything is idempotent — containers get recreated onto existing data volumes
 
 - **`cgroup: host` plus a writable `/sys/fs/cgroup`** are required on every node,
   or the Nomad client dies with `failed to create nomad cgroup: open
-  /sys/fs/cgroup/cgroup.subtree_control: read-only file system`. Same pair
-  `om-nomad` needs. Interestingly the Nomad client *inside pmm-server* starts
-  without them; the difference is not explained.
+  /sys/fs/cgroup/cgroup.subtree_control: read-only file system`. Interestingly
+  the Nomad client *inside pmm-server* starts without them; the difference is
+  not explained.
 - **Arbiters force an explicit default write concern.** A shard of
   `svr0/svr1/arb0` has three voting members but only two writable ones, so
   `sh.addShard` refuses until `setDefaultRWConcern` is set. `cluster-init.sh`

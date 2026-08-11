@@ -9,10 +9,6 @@
 			"path": "SEP"
 		},
 		{
-			"name": "PSMDB Sandbox (mongo_terraform_ansible)",
-			"path": "mongo_terraform_ansible"
-		},
-		{
 			"name": "UI view",
 			"path": "ui-view"
 		}

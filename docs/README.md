@@ -8,14 +8,11 @@ someone who has not worked on PMM or SEP before.
 | Doc | What it answers |
 | --- | --- |
 | [topology.md](topology.md) | **Start here.** What the two products are, what runs on your machine, what talks to what, and how a job actually gets executed. Concepts and data flows. Plain-English first, detail after. |
-| [containers.md](containers.md) | The same system at **container level** — real container names, Docker networks and subnets, the fan-out of many `pmm-client` containers, every connection with the address it uses, and the network-alias trick that ties it together. Read after `topology.md` Part 2. **Predates the `psmdb/` stack**; still accurate for the Terraform sandbox. |
-| [nomad-in-pmm.md](nomad-in-pmm.md) | Written as **a design exploration** — what the topology would look like if SEP dispatched to PMM's *built-in* Nomad instead of the standalone `om-nomad` container. That is now how the local stack actually works, and two of the three blockers it names have answers: read it with `topology.md` Part 7 and its drift note 2. |
-| [`../psmdb/README.md`](../psmdb/README.md) | The **database nodes** — four MongoDB topologies as Compose profiles, one container per node, each carrying a Nomad client. The in-place upgrade loop, bootstrap ordering, and the rough edges. Lives next to the code rather than here because it documents one directory. |
-| [glossary.md](glossary.md) | Every proper noun and piece of jargon in one place — VictoriaMetrics, Nomad, Casdoor, `raw_exec`, syncers, and the rest. |
+| [`../psmdb/README.md`](../psmdb/README.md) | The **database nodes** — four MongoDB topologies as Compose profiles, one container per node, each carrying an executor client. The in-place upgrade loop, bootstrap ordering, and the rough edges. Lives next to the code rather than here because it documents one directory. |
+| [glossary.md](glossary.md) | Every proper noun and piece of jargon in one place — VictoriaMetrics, Nomad, `raw_exec`, syncers, and the rest. |
 
-`topology.md` tells you *what the pieces are*; `containers.md` tells you *what is running
-right now and how it is wired*. `containers.md` is a dated snapshot of one machine with
-one sandbox environment deployed, and it ends with the commands to re-derive it.
+`topology.md` tells you *what the pieces are*, and its Part 10 is the reference layer —
+host ports, what runs inside each container, and who talks to whom.
 
 ## How this differs from the other docs in the workspace
 
