@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Run a mongosh command against every MongoDB node of a sandbox environment.
+"""Run a mongosh command against every MongoDB node of a PSMDB cluster.
 
     ./tools/mongo-eval.py sharded-cluster 'rs.status().myState'
     ./tools/mongo-eval.py replicaset-cluster 'db.serverStatus().connections'
     ./tools/mongo-eval.py sharded-cluster --role shard 'db.hello().isWritablePrimary'
     ./tools/mongo-eval.py sharded-cluster --rs sharded-cluster-shard00 'rs.status()'
-    ./tools/mongo-eval.py omtest1 --file check.js
-    echo 'db.version()' | ./tools/mongo-eval.py omtest1 -
+    ./tools/mongo-eval.py replicaset-cluster --file check.js
+    echo 'db.version()' | ./tools/mongo-eval.py replicaset-cluster -
 
 The environment is a compose profile name (``standalone``,
-``replicaset-single``, ``replicaset-cluster``, ``sharded-cluster``) or a
-Terraform sandbox prefix (``omtest1``) -- see ``tools/sandbox.py``.
+``replicaset-single``, ``replicaset-cluster``, ``sharded-cluster``) -- see
+``tools/clusters.py``.
 
 Commands run **inside** each container via ``docker exec … mongosh``, not from
 the host. That deliberately sidesteps the two things that make host-side access
@@ -34,7 +34,7 @@ import json
 import subprocess
 import sys
 
-from sandbox import credentials, discover, environments, role  # tools/sandbox.py
+from clusters import credentials, discover, environments, role  # tools/clusters.py
 
 C_RESET, C_BOLD, C_DIM = "\033[0m", "\033[1m", "\033[2m"
 C_RED, C_GREEN, C_CYAN = "\033[31m", "\033[32m", "\033[36m"
@@ -71,7 +71,7 @@ def run_one(node: dict, js: str, user: str, password: str,
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Run a mongosh command on every node of a PSMDB sandbox environment.",
+        description="Run a mongosh command on every node of a PSMDB cluster.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Runs inside the containers, so no local mongosh or /etc/hosts is needed.",
     )
@@ -86,8 +86,8 @@ def main() -> int:
     ap.add_argument("--node", metavar="SUBSTR", help="limit to nodes whose name contains SUBSTR")
     ap.add_argument("--arbiters", action="store_true",
                     help="include arbiters (they cannot authenticate; off by default)")
-    # Default to whatever the containers declare (MONGO_ROOT_USER/PASSWORD, which
-    # differs per sandbox), so neither pair has to be remembered per environment.
+    # Default to whatever the containers declare (MONGO_ROOT_USER/PASSWORD), so
+    # neither pair has to be remembered per environment.
     ap.add_argument("--user", help="override the user the containers declare")
     ap.add_argument("--password", help="override the password the containers declare")
     ap.add_argument("--db", default="admin", help="database context (default: %(default)s)")

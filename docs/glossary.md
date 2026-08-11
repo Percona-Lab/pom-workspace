@@ -131,10 +131,6 @@ the executor). If the source is empty, the form renders but cannot be submitted.
 
 **SQLModel / SQLAlchemy.** The libraries SEP uses to talk to its databases from Python.
 
-**Casdoor.** An open-source login server. Standalone SEP has no user accounts of its own,
-so it hands authentication to Casdoor, on port 9999 here. Not in the path when SEP runs
-inside PMM — see *session exchange*.
-
 **session exchange.** `POST /api/oauth/session/exchange`: the embedded SEP UI trades the
 browser's existing `pmm_session` cookie for a short-lived SEP bearer. SEP validates the
 session against Grafana and maps the org role, so no separate SEP login exists.
@@ -185,19 +181,15 @@ selects it.
 **PBM.** Percona Backup for MongoDB. A command-line tool; SEP's Mongo backup app calls
 it on the executor host.
 
-**PSMDB Sandbox.** A separate Go web UI (`mongo_terraform_ansible/ui-go`, port 5001)
-that drives Terraform to deploy real MongoDB clusters locally in Docker, with `pmm-client`
-as a **sidecar** container per node. The older source of real databases to test against;
-`./om start sandbox`.
-
-**`psmdb/` clusters.** The newer source: four MongoDB topologies as Compose profiles in
-[`psmdb/`](../psmdb/), where each node is **one** container running mongod/mongos +
-pbm-agent + pmm-agent, so the Nomad client lives beside the database it manages. Started
-per profile — `./om start replicaset-cluster` — or all at once with `./om start clusters`.
-Since 2026-08-06 `psmdb` as an `om` argument means these, not the sandbox UI.
+**`psmdb/` clusters.** The local source of real databases: four MongoDB topologies as
+Compose profiles in [`psmdb/`](../psmdb/), where each node is **one** container running
+mongod/mongos + pbm-agent + pmm-agent, so the Nomad client lives beside the database it
+manages. Started per profile — `./om start replicaset-cluster` — or all at once with
+`./om start clusters`, for which `psmdb` is an alias.
 
 **MinIO.** S3-compatible object storage, used locally as a backup target. Defaults to
-port 9000, which is why it collides with PMM's ClickHouse.
+port 9000, the same default as PMM's ClickHouse — in `psmdb/` it publishes nothing, so
+the two do not contend.
 
 **Percona Toolkit.** Command-line database utilities. They run on the executor host, not
 on your development machine.
@@ -206,19 +198,15 @@ on your development machine.
 
 ## Workspace-specific
 
-**`om`.** The orchestrator script at the workspace root. Starts, stops and links all five
-local stacks. `./om setup`, `./om start`, `./om status`, `./om ports`.
+**`om`.** The orchestrator script at the workspace root. Starts and stops all three local
+stacks. `./om setup`, `./om start`, `./om status`, `./om ports`.
 
 **devcontainer.** A container that has the build toolchain inside and your source tree
 mounted in, so you can compile and run your working copy inside it. PMM runs this way
 here, which is what makes `./om build pmm` compile your Go changes.
 
-**compose profile.** A way to mark a Compose service opt-in. Nomad is behind the `nomad`
-profile, so a plain `docker compose up` skips it.
-
-**`psmdb-link`.** `./om psmdb-link <env>` attaches the repo PMM and the Nomad executor to
-a sandbox environment's Docker network, under the DNS name the sandbox's agents already
-expect. It is a network alias trick, not a config change.
+**compose profile.** A way to mark a Compose service opt-in. Each `psmdb/` topology is a
+profile, so a plain `docker compose up` starts none of them.
 
 **inotify.** The Linux mechanism that lets a program watch files for changes. Its
 per-user *instance* limit is low by default, and running out of them makes Vite die with

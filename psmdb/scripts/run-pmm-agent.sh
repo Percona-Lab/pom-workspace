@@ -9,8 +9,8 @@
 # is meant to reach it in production.
 #
 # Nomad's client wants to manage a cgroup subtree and /sys/fs/cgroup is read-only
-# in a container. Measured on this stack: it starts and registers anyway. The
-# workspace note claiming otherwise (docs/nomad-in-pmm.md) predates Nomad 2.x.
+# in a container. Measured on this stack: it starts and registers anyway, despite
+# older notes claiming otherwise — those predate Nomad 2.x.
 
 set -o errexit
 set -o nounset

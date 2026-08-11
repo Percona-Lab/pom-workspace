@@ -4,7 +4,7 @@
 #
 # Runs SEP from its repo (natively, so edits are live), PMM from its repo (in
 # PMM's own devcontainer, so `om build pmm` compiles your Go changes), and the
-# shared dependencies from the root docker-compose.yml.
+# PSMDB clusters from psmdb/compose.yaml.
 #
 #   ./om setup              one-time bootstrap (idempotent, safe to re-run)
 #   ./om start [comp...]    start components (default: all)
@@ -16,13 +16,12 @@
 #   ./om build ui           rebuild pmm/ui and deploy it into the running server
 #                           (./om start pmm does this automatically when the
 #                           container is serving the image's stale bundle)
-#   ./om psmdb-link <env>   point a PSMDB sandbox env's agents at the repo PMM
 #   ./om pom [sub] [run]    inspect the POM app (see below)
 #   ./om inventory [view]   PMM's inventory as JSON on stdout, nodes/services/
 #                           agents joined into one document. Views: tree
 #                           (default), nodes, services, agents, raw
 #   ./om urls [comp...]     every URI a component serves (vmui, Swagger, ...)
-#   ./om ports              report port collisions across all four stacks
+#   ./om ports              what each stack publishes onto the host
 #   ./om doctor             check prerequisites only
 #
 # POM (SEP/app/sep/apps/pom_worker). Every subcommand defaults to the most
@@ -33,7 +32,7 @@
 #   ./om pom nodes          the full service -> executor mapping, orphans included
 #   ./om pom probe [svc]    per-node probe JSON, raw command output trimmed
 #   ./om pom probe-raw      the same, untrimmed
-#   ./om pom tasks          dispatched Nomad runs and their status
+#   ./om pom tasks          dispatched probe task runs and their status
 #   ./om pom task-log <id>  one dispatched run's captured output
 #   ./om pom topology       the run's topology document, flattened
 #   ./om pom topology-raw   the same document as stored JSON
@@ -42,12 +41,12 @@
 #   ./om pom sync           refresh inventory from PMM (do this after a rebuild)
 #   ./om pom token          bearer token for /api/docs Authorize and for curl
 #
-# Components: deps, pmm, nomad, sep-backend, sep-frontend, sandbox,
-#             and the PSMDB clusters: standalone, replicaset-single,
-#             replicaset-cluster, sharded-cluster (psmdb/compose.yaml; each needs pmm running first)
+# Components: pmm, sep-backend, sep-frontend, and the PSMDB clusters:
+#             standalone, replicaset-single, replicaset-cluster, sharded-cluster
+#             (psmdb/compose.yaml; each needs pmm running first)
 # Groups:     sep (= sep-backend + sep-frontend), clusters (= all four PSMDB
-#             topologies, also spelled psmdb), all (default; excludes sandbox,
-#             nomad and the clusters, which are opt-in)
+#             topologies, also spelled psmdb), all (default; excludes the
+#             clusters, which are opt-in)
 #
 #   ./om start pmm sep replicaset-cluster   a full stack with a 3-node replica set
 #   ./om stop replicaset-cluster            containers down, data volumes kept
@@ -80,32 +79,12 @@ PMM_UI_SEP_MARKER='sep/mysql-backups'
 
 SEP_BACKEND_PORT=8000
 SEP_FRONTEND_PORT=5174
-CASDOOR_PORT=9999
-
-# PSMDB Sandbox (mongo_terraform_ansible/ui-go): a Go web UI that drives
-# Terraform to deploy PSMDB clusters. Vendored as a git submodule; the path stays
-# overridable for a checkout kept elsewhere. Its Docker platform needs only
-# docker + terraform (ansible is for the AWS/GCP/Azure/CHAOS platforms).
-SANDBOX_DIR="${OM_SANDBOX_DIR:-$ROOT/mongo_terraform_ansible/ui-go}"
-SANDBOX_PORT="${OM_SANDBOX_PORT:-5001}"
-# The sandbox prefixes every docker object with the environment name, so a cluster
-# with prefix "test1" gets network test1-mongo-terraform and its agents target
-# test1-pmm-server (terraform/docker/main.tf: pmm_host = "${name_prefix}${pmm_host}").
-SANDBOX_NETWORK_SUFFIX=mongo-terraform
-
-# Nomad executor (root docker-compose.yml, `nomad` profile). SEP needs an
-# executor for any task form to be usable at all — the Execution Host field is a
-# HostRef whose options come from the executor — and it must sit on the PSMDB
-# environment's network to reach services PMM registered by container hostname.
-NOMAD_CONTAINER=om-nomad
-NOMAD_PORT="${OM_NOMAD_PORT:-4646}"
 
 # PSMDB clusters (psmdb/compose.yaml). Four topologies as compose profiles, each
-# node one container running mongod/mongos + pbm-agent + pmm-agent — and
-# pmm-agent >= 3.2.0 carries a Nomad *client*, so every node is a SEP execution
-# host. They join pmm_default rather than defining a network, so PMM has to be up
-# first; start_psmdb enforces that rather than letting compose fail obscurely.
-# Not to be confused with `sandbox`, which is the Terraform-driven UI on :5001.
+# node one container running mongod/mongos + pbm-agent + pmm-agent, so every node
+# is a SEP execution host. They join pmm_default rather than defining a network,
+# so PMM has to be up first; start_psmdb enforces that rather than letting
+# compose fail obscurely.
 PSMDB_DIR="$ROOT/psmdb"
 PSMDB_PROFILES=(standalone replicaset-single replicaset-cluster sharded-cluster)
 PSMDB_IMAGE="openmanager/psmdb-node:7.0"
@@ -377,19 +356,6 @@ cmd_doctor() {
   [[ -d "$SEP_DIR" ]] && ok "SEP/ present" || { err "SEP/ not found at $SEP_DIR"; fail=1; }
   [[ -d "$PMM_DIR" ]] && ok "pmm/ present" || { err "pmm/ not found at $PMM_DIR"; fail=1; }
 
-  # Sandbox prerequisites gate the `sandbox` component only, so a miss here is a
-  # warning rather than a doctor failure. Its Docker platform needs docker +
-  # terraform; ansible is only for the AWS/GCP/Azure/CHAOS platforms.
-  if [[ -d "$SANDBOX_DIR" ]]; then
-    ok "PSMDB sandbox present ($SANDBOX_DIR)"
-    if command -v go >/dev/null 2>&1; then ok "go $(go version | awk '{print $3}')"
-    else warn "go not found — needed to run the sandbox UI"; fi
-    if command -v terraform >/dev/null 2>&1; then ok "terraform $(terraform version 2>/dev/null | head -1 | awk '{print $2}')"
-    else warn "terraform not found — the sandbox UI cannot deploy without it"; fi
-  else
-    dim "PSMDB sandbox not at $SANDBOX_DIR (set OM_SANDBOX_DIR to change)"
-  fi
-
   return $fail
 }
 
@@ -405,25 +371,16 @@ om_setup_sep() {
   make -C "$SEP_DIR" venv
   ok "venv ready ($("$SEP_DIR/venv/bin/python" -V 2>&1))"
 
-  info "SEP: Casdoor seed data"
-  # Re-running the generator ROTATES the client secret and would invalidate an
-  # existing SEP/.env, so this is strictly create-if-missing.
-  if [[ -f "$SEP_DIR/data/casdoor_init_data.json" ]]; then
-    dim "data/casdoor_init_data.json exists — left untouched (re-running rotates the client secret)"
-  else
-    ( cd "$SEP_DIR" && ./generate_casdoor_init_data.sh -p devpassword )
-    warn "note the printed passwords above — they are not stored anywhere else"
-  fi
-
   info "SEP: .env"
+  # Created empty rather than derived: SEP reads its overrides from here, and the
+  # values that matter are per-machine secrets nothing local can generate.
   if [[ -f "$SEP_DIR/.env" ]]; then
     dim ".env exists — left untouched"
-  elif [[ -f "$SEP_DIR/.env.docker" ]]; then
-    grep '^AUTH__PROVIDER__CASDOOR__CLIENT_' "$SEP_DIR/.env.docker" > "$SEP_DIR/.env"
-    ok ".env created from .env.docker (Casdoor client id + secret)"
-    dim "add PMM__API_KEY=<service account token> here once PMM is running"
   else
-    warn ".env.docker missing — cannot derive .env; re-run after seeding Casdoor"
+    : > "$SEP_DIR/.env"
+    ok ".env created (empty)"
+    dim "add PMM__API_KEY=<service account token> here once PMM is running,"
+    dim "plus the SEP__/INVENTORY__/TASKS__ DATABASE__PASSWORD values ./om pom reads"
   fi
 
   info "SEP: database migrations"
@@ -484,7 +441,7 @@ cmd_setup() {
   om_setup_pmm
   echo
   info "Setup complete"
-  dim "Next:  ./om start          (deps + pmm + sep)"
+  dim "Next:  ./om start          (pmm + sep)"
   dim "       ./om build pmm      compile the PMM working tree into the server"
   dim "       ./om status"
 }
@@ -492,26 +449,6 @@ cmd_setup() {
 # ---------------------------------------------------------------------------
 # start / stop per component
 # ---------------------------------------------------------------------------
-
-start_deps() {
-  info "deps: docker compose (Casdoor)"
-  [[ -f "$SEP_DIR/data/casdoor_init_data.json" ]] \
-    || die "SEP/data/casdoor_init_data.json missing — run ./om setup first"
-  ( cd "$ROOT" && docker compose up -d )
-  for _ in $(seq 1 40); do
-    if curl -s -o /dev/null --max-time 2 "http://localhost:$CASDOOR_PORT/" 2>/dev/null; then
-      ok "casdoor ready on http://localhost:$CASDOOR_PORT"; return 0
-    fi
-    sleep 2
-  done
-  warn "casdoor did not answer on :$CASDOOR_PORT yet — check 'docker compose logs casdoor'"
-}
-
-stop_deps() {
-  info "deps: docker compose down"
-  ( cd "$ROOT" && docker compose down )
-  ok "deps stopped (volumes kept)"
-}
 
 # 0 when the bundle nginx serves is our working tree's (i.e. carries the SEP apps).
 pmm_ui_has_sep() {
@@ -672,43 +609,6 @@ start_sep_frontend() {
   warn "not listening on :$SEP_FRONTEND_PORT yet — ./om logs sep-frontend"
 }
 
-# The compose service bind-mounts these two files, so they must exist before the
-# container starts (create_host_path: false makes a missing one a hard error rather
-# than a silently-created directory). Empty is fine — psmdb-link fills them in.
-ensure_nomad_secrets() {
-  local dir="$ROOT/nomad/secrets" f
-  mkdir -p "$dir"
-  chmod 700 "$dir"
-  for f in mongodb_uri aws-credentials; do
-    [[ -e "$dir/$f" ]] || : > "$dir/$f"
-    chmod 600 "$dir/$f"
-  done
-}
-
-start_nomad() {
-  info "nomad: executor (docker compose, 'nomad' profile)"
-  ensure_nomad_secrets
-  ( cd "$ROOT" && docker compose --profile nomad up -d nomad )
-  local i n
-  for i in $(seq 1 40); do
-    n="$(curl -s --max-time 4 "http://127.0.0.1:$NOMAD_PORT/v1/nodes" 2>/dev/null \
-         | grep -c '"Status":"ready"' || true)"
-    if [[ "${n:-0}" -ge 1 ]]; then
-      ok "client node ready on http://127.0.0.1:$NOMAD_PORT (SEP's default TASKS__NOMAD__ENDPOINT)"
-      return 0
-    fi
-    sleep 3
-  done
-  warn "no ready client node yet — ./om logs nomad"
-  dim "a client that never registers usually means a cgroup problem; see the compose comments"
-}
-
-stop_nomad() {
-  info "nomad: stopping"
-  ( cd "$ROOT" && docker compose --profile nomad stop nomad >/dev/null 2>&1 ) || true
-  ok "nomad stopped (container kept; data volume intact)"
-}
-
 # ---------------------------------------------------------------------------
 # PSMDB clusters
 # ---------------------------------------------------------------------------
@@ -829,201 +729,27 @@ stop_psmdb() {
   dim "wipe its data with: cd psmdb && docker compose --profile $profile down -v"
 }
 
-start_sandbox() {
-  info "sandbox: PSMDB Sandbox UI (native go run)"
-  [[ -d "$SANDBOX_DIR" ]] \
-    || die "sandbox not found at $SANDBOX_DIR (override with OM_SANDBOX_DIR=...)"
-  command -v go >/dev/null 2>&1 || die "go >= 1.22 required to run the sandbox UI"
-  command -v terraform >/dev/null 2>&1 \
-    || warn "terraform not found — the UI starts but cannot deploy anything"
-  if port_busy "$SANDBOX_PORT" && ! read_pid sandbox >/dev/null; then
-    die "port $SANDBOX_PORT is already in use by something om did not start"
-  fi
-  # The UI resolves ../terraform and ../ansible from its own directory
-  # (main.go: terraformDir = baseDir/../terraform, baseDir defaults to cwd), so it
-  # must run with cwd = ui-go. `go run .` execs a child binary; the setsid process
-  # group in start_native is what makes stopping it reap that child too.
-  PORT="$SANDBOX_PORT" UI_HOST=127.0.0.1 \
-    start_native sandbox "$SANDBOX_DIR" go run .
-  # First run compiles the module, so allow noticeably longer than a plain binary.
-  for _ in $(seq 1 90); do
-    port_busy "$SANDBOX_PORT" && { ok "UI at http://127.0.0.1:$SANDBOX_PORT"; return 0; }
-    read_pid sandbox >/dev/null || { err "sandbox exited during startup:"; tail -n 20 "$(log_file sandbox)" >&2; return 1; }
-    sleep 1
-  done
-  warn "not listening on :$SANDBOX_PORT yet — ./om logs sandbox"
-}
-
 # ---------------------------------------------------------------------------
-# psmdb-link — make a sandbox env's PMM clients report into the repo PMM
+# ports — what each stack publishes onto the host
 # ---------------------------------------------------------------------------
 #
-# Why this is needed at all:
-#   * Each cluster's pmm-agent registers against
-#     PMM_AGENT_SERVER_ADDRESS=${pmm_host}:${pmm_port}, and main.tf prefixes it:
-#     pmm_host = "${name_prefix}${pmm_host}" -> "<env>-pmm-server:8443".
-#   * The ui-go UI does NOT expose pmm_host (no such field in types.go/templates),
-#     so you cannot type an external PMM address into the UI.
-#   * But it does let you deploy zero PMM servers (tfvars.go writes
-#     `pmm_servers = {}`), and the repo PMM devcontainer is itself named
-#     `pmm-server` and listens on 8443 internally, with admin/admin.
-# So: attach the repo PMM to the env's network under the alias the agents already
-# look for. No sandbox code changes, no tfvars hand-editing.
-cmd_psmdb_link() {
-  local prefix="${1:-}"
-  [[ -n "$prefix" ]] || die "usage: ./om psmdb-link <env-prefix>   (e.g. ./om psmdb-link test1)"
-  local net="${prefix}-${SANDBOX_NETWORK_SUFFIX}"
-  local want_alias="${prefix}-pmm-server"
-
-  docker network inspect "$net" >/dev/null 2>&1 \
-    || die "docker network '$net' does not exist — deploy env '$prefix' in the sandbox UI first"
-  [[ "$(docker inspect -f '{{.State.Running}}' "$PMM_CONTAINER" 2>/dev/null)" == "true" ]] \
-    || die "$PMM_CONTAINER is not running — ./om start pmm first"
-
-  # The sandbox may have deployed its OWN PMM under exactly the name we want to
-  # claim as an alias. Two containers answering one DNS name on the same network
-  # would round-robin, so agents would land on either PMM at random. Refuse rather
-  # than stop their container silently — it holds their existing metrics.
-  if [[ "$(docker inspect -f '{{.State.Running}}' "$want_alias" 2>/dev/null)" == "true" ]]; then
-    err "container '$want_alias' is running — it is the sandbox's own PMM server,"
-    err "and it already answers the name the cluster agents resolve."
-    dim "Point this env at the repo PMM instead:"
-    dim "  docker stop $want_alias        # reversible: docker start $want_alias"
-    dim "  ./om psmdb-link $prefix"
-    dim "It also holds host port $PMM_HTTPS_PORT, which the repo PMM needs — see ./om ports."
-    die "refusing to create a duplicate alias"
-  fi
-
-  info "psmdb-link: $PMM_CONTAINER -> network $net as '$want_alias'"
-  if docker inspect "$PMM_CONTAINER" \
-       -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null \
-       | tr ' ' '\n' | grep -qx "$net"; then
-    dim "already attached to $net"
-  else
-    docker network connect --alias "$want_alias" "$net" "$PMM_CONTAINER"
-    ok "attached with alias $want_alias"
-  fi
-
-  # The Nomad executor needs the same network for a different reason: SEP stores
-  # each service by the address PMM registered (a *container* hostname such as
-  # omtest1-cl01-mongos00), and the cluster's host ports are randomised. Only a
-  # container on this network can resolve those names on the standard ports. No
-  # alias needed — nothing looks the executor up by name.
-  if [[ "$(docker inspect -f '{{.State.Running}}' "$NOMAD_CONTAINER" 2>/dev/null)" == "true" ]]; then
-    if docker inspect "$NOMAD_CONTAINER" \
-         -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null \
-         | tr ' ' '\n' | grep -qx "$net"; then
-      dim "$NOMAD_CONTAINER already attached to $net"
-    else
-      docker network connect "$net" "$NOMAD_CONTAINER"
-      ok "$NOMAD_CONTAINER attached to $net (can now resolve the cluster's hostnames)"
-    fi
-    # The backup_mongo payloads do:
-    #     os.environ['PBM_MONGODB_URI'] = pbm_creds(f"{HOME}/.mongodb_uri")
-    # so without this file every backup dies instantly with
-    # "Credentials file not found: /root/.mongodb_uri". The value is the same
-    # PBM_MONGODB_URI the cluster's own pbm containers use, so lift it from the
-    # env's pbm-cli container (which points at the config-server replica set —
-    # the right target for sharded-cluster CLI operations) rather than guessing.
-    local pbmcli uri
-    pbmcli="$(docker ps -a --format '{{.Names}}' | grep -E "^${prefix}-.*-pbm-cli$" | head -1 || true)"
-    if [[ -z "$pbmcli" ]]; then
-      warn "no ${prefix}-*-pbm-cli container found — cannot seed the PBM credentials file"
-      dim "backups will fail with 'Credentials file not found: /root/.mongodb_uri'"
-    else
-      uri="$(docker inspect "$pbmcli" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
-             | sed -n 's/^PBM_MONGODB_URI=//p' | head -1)"
-      if [[ -z "$uri" ]]; then
-        warn "$pbmcli has no PBM_MONGODB_URI to copy"
-      else
-        # Written host-side, in place. The compose service bind-mounts this file, so
-        # truncate-and-write keeps the same inode and the running container sees the
-        # new content immediately — and it survives recreating the container.
-        # Never replace it with mv/install: a new inode would break the bind mount.
-        ensure_nomad_secrets
-        printf '%s' "$uri" > "$ROOT/nomad/secrets/mongodb_uri"
-        chmod 600 "$ROOT/nomad/secrets/mongodb_uri"
-        ok "wrote nomad/secrets/mongodb_uri (from $pbmcli) — persists across recreation"
-      fi
-    fi
-
-    # The PBM CLI on the executor performs a "check read access" against the
-    # storage before a backup starts. SEP's MongoDB Backups form has no
-    # access-key/secret fields, and it rewrites the cluster-wide PBM config before
-    # every backup, so the credentials in that config are dropped and the AWS SDK
-    # falls back to EC2 IMDS ("no EC2 IMDS role found"). Writing the standard
-    # shared-credentials file keeps the CLI working whatever the config says.
-    # The pbm-agents need the same thing, but their HOME (/) is not writable, so
-    # they get it as AWS_* env vars from the sandbox's terraform instead.
-    local minio ak sk
-    minio="$(docker ps -a --format '{{.Names}}' | grep -E "^${prefix}-.*minio" | head -1 || true)"
-    if [[ -n "$minio" ]]; then
-      ak="$(docker inspect "$minio" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
-            | sed -n 's/^MINIO_ROOT_USER=//p' | head -1)"
-      sk="$(docker inspect "$minio" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
-            | sed -n 's/^MINIO_ROOT_PASSWORD=//p' | head -1)"
-      if [[ -n "$ak" && -n "$sk" ]]; then
-        ensure_nomad_secrets
-        printf '[default]\naws_access_key_id = %s\naws_secret_access_key = %s\n' "$ak" "$sk" \
-          > "$ROOT/nomad/secrets/aws-credentials"
-        chmod 600 "$ROOT/nomad/secrets/aws-credentials"
-        ok "wrote nomad/secrets/aws-credentials (from $minio) — persists across recreation"
-      else
-        dim "$minio exposed no MINIO_ROOT_USER/PASSWORD to copy"
-      fi
-    fi
-  else
-    warn "$NOMAD_CONTAINER is not running — tasks will have no executor on this network"
-    dim "./om start nomad, then re-run ./om psmdb-link $prefix"
-  fi
-
-  # Agents that started before the alias existed failed their registration prerun
-  # script. PMM_AGENT_SETUP_FORCE=1 is set on these containers, so restarting them
-  # re-runs setup against the now-resolvable PMM.
-  local clients
-  clients="$(docker ps -a --format '{{.Names}}' \
-             | grep -E "^${prefix}-.*-pmm-client$" || true)"
-  if [[ -z "$clients" ]]; then
-    dim "no ${prefix}-*-pmm-client containers found (enable_pmm=false, or not deployed yet)"
-  else
-    local n; n="$(printf '%s\n' "$clients" | wc -l)"
-    info "restarting $n pmm-client container(s) so registration re-runs"
-    printf '%s\n' "$clients" | xargs -r docker restart >/dev/null
-    ok "restarted"
-  fi
-  dim "check PMM inventory at https://localhost:$PMM_HTTPS_PORT, then let SEP's PMMSyncer pick it up"
-}
-
-# ---------------------------------------------------------------------------
-# ports — cross-stack collision report
-# ---------------------------------------------------------------------------
-#
-# Four stacks publish onto the same host, and two pairs genuinely collide:
-#   repo PMM ClickHouse 9000  vs  sandbox MinIO 9000
-#   repo PMM HTTPS      8443  vs  sandbox's own pmm_servers block (8443)
+# The PSMDB clusters publish nothing (psmdb/compose.yaml maps no host ports), so
+# only the SEP and PMM stacks are in play and nothing currently collides.
 cmd_ports() {
   info "Known host ports"
   printf '  %-6s %-22s %s\n' PORT OWNER NOTE
   printf '  %-6s %-22s %s\n' 8000  "SEP backend"        "om"
   printf '  %-6s %-22s %s\n' 5174  "SEP frontend"       "om"
-  printf '  %-6s %-22s %s\n' 9999  "Casdoor"            "om (docker-compose.yml)"
-  printf '  %-6s %-22s %s\n' 5001  "PSMDB Sandbox UI"   "om (sandbox)"
   printf '  %-6s %-22s %s\n' 8443  "repo PMM HTTPS"     "pmm/.env PMM_PORT_HTTPS"
   printf '  %-6s %-22s %s\n' 5432  "repo PMM Postgres"  "pmm/docker-compose.dev.yml"
   printf '  %-6s %-22s %s\n' 9090  "repo PMM VictoriaM" "pmm/docker-compose.dev.yml"
-  printf '  %-6s %-22s %s\n' 9000  "repo PMM ClickHouse" "COLLIDES with sandbox MinIO"
+  printf '  %-6s %-22s %s\n' 9000  "repo PMM ClickHouse" "pmm/docker-compose.dev.yml"
   printf '  %-6s %-22s %s\n' 8123  "repo PMM CH HTTP"   "pmm/docker-compose.dev.yml"
   printf '  %-6s %-22s %s\n' 5173  "repo PMM Vite HMR"  "distinct from SEP's 5174"
   echo
-  info "Collisions to avoid"
-  warn "sandbox MinIO defaults to host 9000/9001; repo PMM publishes ClickHouse on 9000"
-  dim  "fix: set PMM_PORT_CH_TCP=9900 in pmm/.env, or change minio_port in the sandbox UI"
-  warn "a sandbox 'pmm_servers' entry also binds 8443 — the repo PMM already owns it"
-  dim  "fix: deploy zero PMM servers in the UI, then ./om psmdb-link <env>"
-  echo
   info "Currently listening"
   local p
-  for p in 8000 5174 9999 5001 8443 5432 9090 9000 8123 5173; do
+  for p in 8000 5174 8443 5432 9090 9000 8123 5173; do
     port_busy "$p" && printf '  %s●%s %s\n' "$C_GREEN" "$C_RESET" "$p"
   done
 }
@@ -1100,7 +826,7 @@ pmm_api_get() { # path -> body on stdout
 JQ_FLATTEN='def flatten_by($key): [ to_entries[] | .key as $t | (.value // [])[] | . + {($key): $t} ];'
 
 # Nodes own services, services own their exporters/QAN agents, and whatever is
-# left attaches to the node itself (pmm_agent, node_exporter, nomad_agent).
+# left attaches to the node itself (pmm_agent, node_exporter, and friends).
 # `orphans` is not decoration: it makes the tree lossless, so a service whose
 # node PMM no longer lists still shows up instead of vanishing from the output.
 JQ_INVENTORY_TREE="$JQ_FLATTEN"'
@@ -1191,7 +917,6 @@ component_uris() { # comp -> "label<TAB>uri" lines
         "VMAlert rules"   "$pmm/prometheus/rules" \
         "VMAlert alerts"  "$pmm/prometheus/alerts" \
         "Swagger UI"      "$pmm/swagger/" \
-        "Nomad (proxied)" "$pmm/nomad/ui/" \
         "PostgreSQL"      "postgres://$POM_DB_USER@$POM_DB_HOST:$POM_DB_PORT/$POM_DB_NAME" \
         "Delve (headless)" "127.0.0.1:2345"
       ;;
@@ -1208,17 +933,6 @@ component_uris() { # comp -> "label<TAB>uri" lines
     sep-frontend)
       printf '%s\t%s\n' "Dev server" "http://localhost:$SEP_FRONTEND_PORT/"
       ;;
-    casdoor)
-      printf '%s\t%s\n' "Casdoor" "http://localhost:$CASDOOR_PORT/"
-      ;;
-    nomad)
-      printf '%s\t%s\n' \
-        "Nomad UI"    "http://localhost:$NOMAD_PORT/ui/" \
-        "Client nodes" "http://127.0.0.1:$NOMAD_PORT/v1/nodes"
-      ;;
-    sandbox)
-      printf '%s\t%s\n' "Sandbox UI" "http://127.0.0.1:$SANDBOX_PORT/"
-      ;;
   esac
 }
 
@@ -1232,29 +946,23 @@ print_uris() { # comp — indented under whatever status line just went out
 
 comp_up() { # comp -> 0 when it is running
   case "$1" in
-    casdoor)
-      local cid; cid="$(cd "$ROOT" && docker compose ps -q casdoor 2>/dev/null || true)"
-      [[ -n "$cid" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" == "true" ]] ;;
     pmm)   [[ "$(docker inspect -f '{{.State.Running}}' "$PMM_CONTAINER" 2>/dev/null)" == "true" ]] ;;
-    nomad) [[ "$(docker inspect -f '{{.State.Running}}' "$NOMAD_CONTAINER" 2>/dev/null)" == "true" ]] ;;
     sep-backend)  port_busy "$SEP_BACKEND_PORT" ;;
     sep-frontend) port_busy "$SEP_FRONTEND_PORT" ;;
-    sandbox)      port_busy "$SANDBOX_PORT" ;;
     *) return 1 ;;
   esac
 }
 
 cmd_urls() {
   local only=("$@")
-  [[ ${#only[@]} -gt 0 ]] || only=(pmm sep-backend sep-frontend casdoor nomad sandbox)
+  [[ ${#only[@]} -gt 0 ]] || only=(pmm sep-backend sep-frontend)
   local comp
   for comp in "${only[@]}"; do
     case "$comp" in
-      pmm|sep-backend|sep-frontend|casdoor|nomad|sandbox) ;;
-      deps)     comp=casdoor ;;
+      pmm|sep-backend|sep-frontend) ;;
       backend)  comp=sep-backend ;;
       frontend) comp=sep-frontend ;;
-      *) die "no URIs known for '$comp' (pmm|sep-backend|sep-frontend|casdoor|nomad|sandbox)" ;;
+      *) die "no URIs known for '$comp' (pmm|sep-backend|sep-frontend)" ;;
     esac
     if comp_up "$comp"; then info "$comp"; else info "$comp $C_DIM(stopped)$C_RESET"; fi
     print_uris "$comp"
@@ -1279,14 +987,6 @@ status_line() { # label, up(0/1), detail
 cmd_status() {
   info "Components"
 
-  local cid
-  cid="$(cd "$ROOT" && docker compose ps -q casdoor 2>/dev/null || true)"
-  if [[ -n "$cid" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" == "true" ]]; then
-    status_line casdoor 0 "http://localhost:$CASDOOR_PORT"
-  else
-    status_line casdoor 1 "stopped"
-  fi
-
   if [[ "$(docker inspect -f '{{.State.Running}}' "$PMM_CONTAINER" 2>/dev/null)" == "true" ]]; then
     local ui_note="image bundle — no SEP apps, run './om build ui'"
     pmm_ui_has_sep && ui_note="working tree UI, SEP apps included"
@@ -1297,34 +997,23 @@ cmd_status() {
     status_line pmm 1 "stopped"
   fi
 
-  if [[ "$(docker inspect -f '{{.State.Running}}' "$NOMAD_CONTAINER" 2>/dev/null)" == "true" ]]; then
-    local ready
-    ready="$(curl -s --max-time 4 "http://127.0.0.1:$NOMAD_PORT/v1/nodes" 2>/dev/null \
-             | grep -c '"Status":"ready"' || true)"
-    status_line nomad 0 "http://localhost:$NOMAD_PORT — ${ready:-0} ready client node(s)"
-    print_uris nomad
-  else
-    status_line nomad 1 "stopped"
-  fi
-
   local comp pid port
-  for comp in sep-backend sep-frontend sandbox; do
+  for comp in sep-backend sep-frontend; do
     case "$comp" in
       sep-backend)  port=$SEP_BACKEND_PORT ;;
       sep-frontend) port=$SEP_FRONTEND_PORT ;;
-      sandbox)      port=$SANDBOX_PORT ;;
     esac
     if pid="$(read_pid "$comp")"; then
       local listen="not listening yet"
       port_busy "$port" && listen="http://localhost:$port"
       status_line "$comp" 0 "pid $pid — $listen"
-      # Only sep-backend has a surface worth expanding here; the other two serve
+      # Only sep-backend has a surface worth expanding here; sep-frontend serves
       # one page, already spelled out on the status line above.
       # `|| true`: under set -e a false tail command in an if-branch exits the script.
       [[ "$comp" == sep-backend ]] && port_busy "$port" && print_uris "$comp" || true
     elif port_busy "$port"; then
-      # Something owns the port that om did not start — e.g. the sandbox UI run by
-      # hand with `go run .`. Reporting "stopped" here would be misleading.
+      # Something owns the port that om did not start — e.g. a backend launched by
+      # hand with `make dev-backend`. Reporting "stopped" here would be misleading.
       status_line "$comp" 0 "http://localhost:$port (not started by om)"
       [[ "$comp" == sep-backend ]] && print_uris "$comp" || true
     else
@@ -1353,31 +1042,8 @@ cmd_status() {
     done
   fi
 
-  # PSMDB environments the sandbox has deployed, inferred from its docker networks.
-  local envs
-  envs="$(docker network ls --format '{{.Name}}' 2>/dev/null \
-          | sed -n "s/-${SANDBOX_NETWORK_SUFFIX}\$//p" || true)"
-  if [[ -n "$envs" ]]; then
-    echo
-    info "PSMDB environments"
-    local e linked
-    while IFS= read -r e; do
-      [[ -n "$e" ]] || continue
-      linked="not linked to repo PMM"
-      if docker inspect "$PMM_CONTAINER" \
-           -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null \
-           | tr ' ' '\n' | grep -qx "${e}-${SANDBOX_NETWORK_SUFFIX}"; then
-        linked="linked to repo PMM"
-      fi
-      local running
-      running="$(docker ps --format '{{.Names}}' | grep -c "^${e}-" || true)"
-      printf '  %s•%s %-14s %s container(s) up — %s\n' "$C_BLUE" "$C_RESET" "$e" "$running" "$linked"
-      [[ "$linked" == "linked to repo PMM" ]] || dim "./om psmdb-link $e"
-    done <<< "$envs"
-  fi
-
   echo
-  dim "logs: ./om logs <deps|pmm|nomad|sep-backend|sep-frontend|sandbox|<cluster>> [-f]"
+  dim "logs: ./om logs <pmm|sep-backend|sep-frontend|<cluster>> [-f]"
   dim "urls: ./om urls [comp...] — the same list for stopped components too"
 }
 
@@ -1386,27 +1052,20 @@ cmd_logs() {
   local follow=""
   [[ "${1:-}" == "-f" || "${1:-}" == "--follow" ]] && follow=1
   case "$comp" in
-    deps|casdoor)
-      if [[ -n "$follow" ]]; then ( cd "$ROOT" && docker compose logs -f casdoor )
-      else ( cd "$ROOT" && docker compose logs --tail=200 casdoor ); fi ;;
     pmm)
       docker inspect "$PMM_CONTAINER" >/dev/null 2>&1 \
         || die "$PMM_CONTAINER does not exist — ./om start pmm first"
       if [[ -n "$follow" ]]; then docker logs -f --tail=200 "$PMM_CONTAINER"
       else docker logs --tail=200 "$PMM_CONTAINER"; fi ;;
-    nomad)
-      docker inspect "$NOMAD_CONTAINER" >/dev/null 2>&1 || die "$NOMAD_CONTAINER does not exist — ./om start nomad first"
-      if [[ -n "$follow" ]]; then docker logs -f --tail=200 "$NOMAD_CONTAINER"
-      else docker logs --tail=200 "$NOMAD_CONTAINER"; fi ;;
     standalone|replicaset-single|replicaset-cluster|sharded-cluster)
       # No om-managed log file: these are compose services, so defer to compose.
       if [[ -n "$follow" ]]; then psmdb_compose --profile "$comp" logs -f --tail=200
       else psmdb_compose --profile "$comp" logs --tail=200; fi ;;
-    sep-backend|sep-frontend|sandbox)
+    sep-backend|sep-frontend)
       local f; f="$(log_file "$comp")"
       [[ -f "$f" ]] || die "no log yet for $comp"
       if [[ -n "$follow" ]]; then tail -f "$f"; else tail -n 200 "$f"; fi ;;
-    "") die "usage: ./om logs <deps|pmm|nomad|sep-backend|sep-frontend|sandbox|replicaset-cluster|replicaset-single|standalone|sharded-cluster> [-f]" ;;
+    "") die "usage: ./om logs <pmm|sep-backend|sep-frontend|replicaset-cluster|replicaset-single|standalone|sharded-cluster> [-f]" ;;
     *)  die "unknown component '$comp'" ;;
   esac
 }
@@ -1601,7 +1260,7 @@ pom_cmd_tasks() {
   echo
   if [[ "$logged" == "0" ]]; then
     warn "those tasks produced no log output at all"
-    dim "usually means the Nomad client could not build its task directory:"
+    dim "usually means the task executor could not build its task directory:"
     dim "  Task hook failed  task_dir: mount: operation not permitted"
     dim "the container needs cap_add SYS_ADMIN + apparmor/seccomp unconfined"
     dim "(psmdb/compose.yaml has it; containers created before that fix do not)"
@@ -1723,7 +1382,7 @@ pom_cmd_show() {
     order by service_name"
   dim "./om pom nodes    full mapping, orphans included"
   dim "./om pom probe    per-node probe JSON"
-  dim "./om pom tasks    dispatched Nomad runs and their status"
+  dim "./om pom tasks    dispatched probe task runs and their status"
   dim "./om pom topology  the run's topology document"
   dim "./om pom metrics  what reached VictoriaMetrics"
 }
@@ -1761,7 +1420,7 @@ pom_cmd_token() {
 pom_cmd_sync() {
   [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
   info "Syncing inventory from PMM"
-  dim "run this after rebuilding the sandbox, or every service maps as orphaned"
+  dim "run this after rebuilding a cluster, or every service maps as orphaned"
   ( cd "$SEP_DIR" && "$SEP_DIR/venv/bin/python" - <<'PY'
 import asyncio, logging, sys
 logging.basicConfig(level=logging.WARNING, stream=sys.stdout)
@@ -1809,26 +1468,21 @@ COMPONENTS=()
 expand_components() {
   COMPONENTS=()
   if [[ $# -eq 0 ]]; then
-    COMPONENTS=(deps pmm sep-backend sep-frontend)
+    COMPONENTS=(pmm sep-backend sep-frontend)
     return 0
   fi
   local a
   for a in "$@"; do
     case "$a" in
-      all)          COMPONENTS+=(deps pmm sep-backend sep-frontend) ;;
+      all)          COMPONENTS+=(pmm sep-backend sep-frontend) ;;
       sep)          COMPONENTS+=(sep-backend sep-frontend) ;;
-      deps|casdoor) COMPONENTS+=(deps) ;;
       pmm)          COMPONENTS+=(pmm) ;;
       sep-backend|backend)   COMPONENTS+=(sep-backend) ;;
       sep-frontend|frontend) COMPONENTS+=(sep-frontend) ;;
-      sandbox)               COMPONENTS+=(sandbox) ;;
-      nomad|executor)        COMPONENTS+=(nomad) ;;
-      # `psmdb` used to be an alias for the sandbox UI. It now means the compose
-      # clusters in psmdb/, which is what the directory is called; the UI is
-      # reachable as `sandbox` only.
+      # `psmdb` is spelled both ways because it is what the directory is called.
       clusters|psmdb)        COMPONENTS+=("${PSMDB_PROFILES[@]}") ;;
       standalone|replicaset-single|replicaset-cluster|sharded-cluster) COMPONENTS+=("$a") ;;
-      *) die "unknown component '$a' (deps|pmm|nomad|sep-backend|sep-frontend|sandbox|sep|all|clusters|standalone|replicaset-single|replicaset-cluster|sharded-cluster)" ;;
+      *) die "unknown component '$a' (pmm|sep-backend|sep-frontend|sep|all|clusters|standalone|replicaset-single|replicaset-cluster|sharded-cluster)" ;;
     esac
   done
 }
@@ -1838,12 +1492,9 @@ cmd_start() {
   local c
   for c in "${COMPONENTS[@]}"; do
     case "$c" in
-      deps)         start_deps ;;
       pmm)          start_pmm ;;
       sep-backend)  start_sep_backend ;;
       sep-frontend) start_sep_frontend ;;
-      nomad)        start_nomad ;;
-      sandbox)      start_sandbox ;;
       standalone|replicaset-single|replicaset-cluster|sharded-cluster) start_psmdb "$c" ;;
     esac
   done
@@ -1859,12 +1510,9 @@ cmd_stop() {
   local c
   for c in "${comps[@]}"; do
     case "$c" in
-      deps)         stop_deps ;;
       pmm)          stop_pmm ;;
       sep-backend)  info "sep-backend: stopping";  stop_native sep-backend ;;
       sep-frontend) info "sep-frontend: stopping"; stop_native sep-frontend ;;
-      nomad)        stop_nomad ;;
-      sandbox)      info "sandbox: stopping";      stop_native sandbox ;;
       standalone|replicaset-single|replicaset-cluster|sharded-cluster) stop_psmdb "$c" ;;
     esac
   done
@@ -1890,7 +1538,6 @@ main() {
     status)  cmd_status ;;
     logs)    cmd_logs "$@" ;;
     build)   cmd_build "$@" ;;
-    psmdb-link) cmd_psmdb_link "$@" ;;
     pom)     cmd_pom "$@" ;;
     ports)   cmd_ports ;;
     urls|uris) cmd_urls "$@" ;;

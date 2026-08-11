@@ -1,28 +1,26 @@
 # Runtime state written by ./om — pids, logs, and whatever a component leaves
 # behind. Recreated on every `./om start`.
 .om/
-sandbox.log
 *.log
 
 # Secrets. None of these are templates or examples — they hold live values.
 #   passwd.txt          scratch credentials for the dev stack
-#   nomad/secrets/      PBM_MONGODB_URI and AWS credentials that ./om psmdb-link
-#                       lifts out of a deployed sandbox environment. `./om start
-#                       nomad` recreates both as empty 600 files when absent, so
-#                       ignoring the directory outright costs nothing.
 passwd.txt
-nomad/secrets/
 .env
 *.pem
 *.key
 
-# Byte-cache for the tools/ scripts. sandbox.py is imported by its siblings, so
+# Byte-cache for the tools/ scripts. clusters.py is imported by its siblings, so
 # running any of them leaves a __pycache__ behind, one per interpreter version.
 __pycache__/
 
 # Working notes, kept local. docs/ is the committed documentation.
 notes/
 todo/
+
+# A standalone checkout that used to be a submodule here. Kept on disk for
+# reference, but no longer part of this workspace.
+mongo_terraform_ansible/
 
 # Per-machine Claude Code permissions. .claude/settings.json IS committed.
 .claude/settings.local.json

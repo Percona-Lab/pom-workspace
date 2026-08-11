@@ -6,10 +6,10 @@ PMM-15293 + PMM-15238; `docker-compose.dev.yml`, `.env`,
 `build/ansible/roles/{supervisord,nginx}/files/*`, `managed/services/supervisord/*`,
 `ui/apps/pmm/*`), `SEP/` @ `psmdb-openmanager` (`6f89d1a3`) (`app/main.py`,
 `settings.yaml`, `app/tasks/execution/**`, `app/sep/sync/syncers/pmm.py`,
-`app/sep/apps/{pom_worker,pom_api}/**`), the new [`psmdb/`](../psmdb/) sandbox
-(`compose.yaml`, `Dockerfile`, `scripts/*`), plus the workspace's own
-[`docker-compose.yml`](../docker-compose.yml) and [`om`](../om). Live state cross-checked
-against a running stack (`./om status`, `docker ps`, `GET /nomad/v1/nodes`).
+`app/sep/apps/{pom_worker,pom_api}/**`), the [`psmdb/`](../psmdb/) cluster stack
+(`compose.yaml`, `Dockerfile`, `scripts/*`), plus the workspace's own [`om`](../om). Live
+state cross-checked against a running stack (`./om status`, `docker ps`,
+`GET /nomad/v1/nodes`).
 
 **How to read this:** Parts 1–2 are the plain-English version — read those first and you
 will know what is running and why. Parts 3 onward add detail, one layer at a time. Every
@@ -20,13 +20,14 @@ name in *italics* the first time it appears is explained in
 > all structural:
 > 1. There is a **new local database stack**, [`psmdb/`](../psmdb/): four MongoDB
 >    topologies as Compose profiles, one container per node, joining PMM's network.
-> 2. **The executor moved onto the database hosts.** PMM's *embedded* Nomad server is now
->    the one SEP talks to, and the Nomad client comes from `pmm-agent` on each node. The
->    standalone `om-nomad` container is now the fallback path for the Terraform sandbox.
+> 2. **The executor moved onto the database hosts.** PMM's *embedded* Nomad server is the
+>    one SEP talks to, and the Nomad client comes from `pmm-agent` on each node. There is
+>    no separate executor container any more.
 > 3. **SEP's UI is served by PMM** on `:8443`, and SEP's databases are PMM's embedded
 >    PostgreSQL. Locally, the integration described as "unmerged" in Part 9 is what you
 >    are actually running.
-> 4. **Casdoor is optional.** The browser mints a SEP token from its PMM session instead.
+> 4. **The login path is PMM's.** The browser mints a SEP token from its PMM session, so
+>    SEP needs no separate login screen locally.
 
 ---
 
@@ -48,15 +49,13 @@ databases itself — it asks PMM. PMM already has the list.
 
 One supporting piece exists only because SEP needs it:
 
-- **Nomad** — the arm that actually runs a command on a machine. This matters: **SEP
-  never connects to a database itself.** It decides *what* should run and *where*, then
-  hands that to Nomad, which runs it on the chosen host.
+- **Nomad** — the arm that actually runs a command on a machine, and a part of PMM rather
+  than of this workspace. This matters: **SEP never connects to a database itself.** It
+  decides *what* should run and *where*, then hands that to Nomad, which runs it on the
+  chosen host.
 
-And one that used to be mandatory and no longer is:
-
-- **Casdoor** — a login screen for standalone SEP. When SEP is running inside PMM (the
-  local default now), the browser already has a PMM session and trades it for a SEP
-  token, so Casdoor is not in the path at all. See Part 8.
+Logging in needs no separate piece: the browser already has a PMM session and trades it
+for a SEP token. See Part 8.
 
 The thing to internalise about Nomad: **its client lives on the database host, and
 `pmm-agent` is what puts it there.** From version 3.2.0 the agent carries a Nomad client
@@ -95,7 +94,7 @@ flowchart LR
 One sentence: **PMM knows what you have, SEP decides what to do about it, and a Nomad
 client that PMM already installed is what actually does it — on the host itself.**
 
-That last clause is the whole reason the new `psmdb/` sandbox exists (Part 3): a command
+That last clause is the whole reason the `psmdb/` stack exists (Part 3): a command
 that must restart or upgrade a `mongod` has to run *in the same container* as that
 `mongod`. Part 7 walks the action path in detail.
 
@@ -103,81 +102,63 @@ that must restart or upgrade a `mongod` has to run *in the same container* as th
 
 # Part 2 — What actually runs on your machine
 
-Locally this is **five independent stacks**. Nothing merges them; they share the same host,
+Locally this is **three independent stacks**. Nothing merges them; they share the same host,
 one Docker network, and `localhost` ports. `./om` is a script in this workspace that
 starts and stops them together.
 
 ```mermaid
 flowchart TB
-    subgraph S2["2 · SEP — plain processes, no container"]
+    subgraph S1["1 · SEP — plain processes, no container"]
         BE["uvicorn backend<br/>0.0.0.0:8000"]
         FE["vite frontend :5174<br/>standalone UI, optional"]
         FE -->|"proxies /api, /sep_app, …"| BE
     end
 
-    subgraph S3["3 · PMM — its own devcontainer, pmm/docker-compose.dev.yml"]
+    subgraph S2["2 · PMM — its own devcontainer, pmm/docker-compose.dev.yml"]
         PMMC["pmm-server<br/>https://localhost:8443<br/>serves the SEP UI too<br/>+ embedded Nomad server<br/>+ embedded PostgreSQL"]
     end
 
-    subgraph S4["4 · PSMDB clusters — psmdb/compose.yaml (opt-in)"]
+    subgraph S3["3 · PSMDB clusters — psmdb/compose.yaml (opt-in)"]
         N1["one container per node:<br/>mongod/mongos + pbm-agent<br/>+ pmm-agent (= Nomad client)"]
         MIO["psmdb-minio<br/>PBM store"]
     end
 
-    subgraph S1["1 · Dev dependencies — root docker-compose.yml (opt-in)"]
-        CAS["casdoor :9999<br/>standalone-SEP login only"]
-        NOM["om-nomad :4646<br/>executor for the sandbox"]
-    end
-
-    subgraph S5["5 · PSMDB Sandbox — mongo_terraform_ansible (opt-in)"]
-        SB["sandbox UI :5001<br/>Terraform-deployed clusters<br/>+ pmm-client sidecars"]
-    end
-
     PMMC -->|"proxies 5 prefixes to<br/>host.docker.internal:8000"| BE
     BE -->|"read inventory + metrics,<br/>dispatch via /nomad"| PMMC
-    BE --> CAS
     N1 -->|"agent stream :8443<br/>Nomad RPC :4647"| PMMC
     N1 --> MIO
-    NOM -->|"runs pbm/python against"| SB
-    SB -->|"its sidecar agents report to"| PMMC
 ```
 
 Why each one is shaped the way it is:
 
 | Stack | Where it is defined | Why it is separate |
 | --- | --- | --- |
-| Dev dependencies | [`docker-compose.yml`](../docker-compose.yml) at the workspace root | Only things SEP *may* depend on, both now behind opt-in use: Casdoor for standalone login, `om-nomad` as an executor for the Terraform sandbox. |
 | SEP | run natively via `make dev-backend` / `make dev-frontend` in `SEP/` | Runs straight from the working tree, so your edits are live with no image rebuild. PMM's nginx proxies to it over the host gateway. |
 | PMM | `pmm/docker-compose.dev.yml` | PMM ships its own devcontainer that mounts the repo, so `om build pmm` compiles *your* Go changes — and on `sep-combined-local` it also serves *your* SEP UI. A stock `percona/pmm-server:3` would run release binaries and fight over the name and port. |
-| PSMDB clusters | [`psmdb/compose.yaml`](../psmdb/compose.yaml) | Real MongoDB with a Nomad client *inside* each node — the only local stack where a payload can restart or upgrade the database it targets. Part 3. |
-| PSMDB Sandbox | `mongo_terraform_ansible/ui-go`, a git submodule | The older, Terraform-driven cluster deployer. Still useful for omtest1-shaped estates; its `pmm-client` sidecars cannot host an executor. |
+| PSMDB clusters | [`psmdb/compose.yaml`](../psmdb/compose.yaml) | Real MongoDB with an executor client *inside* each node — so a payload can restart or upgrade the database it targets. Part 3. |
 
 The commands:
 
 ```bash
 ./om setup                            # one-time bootstrap, safe to re-run
-./om start                            # deps + pmm + sep   (default group `all`)
+./om start                            # pmm + sep   (default group `all`)
 ./om start pmm sep replicaset-cluster # a full stack with a 3-node replica set
 ./om start clusters                   # all four PSMDB topologies
 ./om status                           # includes per-topology container counts
 ./om logs replicaset-cluster -f       # defers to docker compose for clusters
-./om ports                            # port collisions across the stacks
+./om ports                            # what each stack publishes onto the host
 ./om stop replicaset-cluster          # containers down, data volumes kept
 ```
 
-Two `om` details worth knowing before you type them:
-
-- **`psmdb` no longer means the sandbox UI.** It is now an alias for `clusters`, the group
-  of all four Compose topologies. The Terraform UI is `sandbox` only.
-- **The default `all` excludes** `sandbox`, `nomad` and the clusters. Everything
-  database-shaped is opt-in.
+One `om` detail worth knowing before you type them: **the default `all` excludes the
+clusters.** Everything database-shaped is opt-in, and `psmdb` is an alias for `clusters`,
+the group of all four Compose topologies.
 
 Full setup reasoning lives in [`../notes/sep-dev-quickstart.md`](../notes/sep-dev-quickstart.md).
 
-> **Want the concrete version of this diagram?** [`containers.md`](containers.md) has the
-> same picture with real container names, Docker networks and subnets, and every
-> connection with the exact address it uses. Note that it predates `psmdb/` — see
-> [Known drift](#known-drift).
+> **Want the concrete version of this diagram?** Part 10 has the same picture as reference
+> tables: host ports, what runs inside each container, and every connection with the exact
+> address it uses.
 
 ---
 
@@ -186,12 +167,11 @@ Full setup reasoning lives in [`../notes/sep-dev-quickstart.md`](../notes/sep-de
 Everything above is infrastructure. This is the part with actual databases in it, and it
 is new.
 
-**The problem it solves.** The Terraform sandbox deploys `pmm-client` as a **sidecar
-container** next to each `mongod`. That is fine for monitoring, and fine for anything that
-reaches the database over TCP. But a Nomad client in a sidecar can never restart,
-reconfigure or upgrade the `mongod` — it is in a different container, with a different
-filesystem and process table. Since driving an in-place upgrade is the point of the
-current work, that shape does not survive.
+**The problem it solves.** Deploying `pmm-client` as a **sidecar container** next to each
+`mongod` is fine for monitoring, and fine for anything that reaches the database over TCP.
+But a Nomad client in a sidecar can never restart, reconfigure or upgrade the `mongod` — it
+is in a different container, with a different filesystem and process table. Since driving
+an in-place upgrade is the point of the current work, that shape does not survive.
 
 So in `psmdb/`, **each node is one container** running four things under *supervisord*:
 
@@ -204,9 +184,8 @@ So in `psmdb/`, **each node is one container** running four things under *superv
 
 Plus `python3` and `venv` in the image, because SEP's `run-python` payloads build a venv
 and `pip install` into it at runtime. That combination — pmm-client's Nomad binary *and*
-`pbm` *and* `python3` in one filesystem — is exactly what
-[`nomad-in-pmm.md`](nomad-in-pmm.md) recorded as the blocker. The blocker was the stock
-`pmm-client` image, not the design.
+`pbm` *and* `python3` in one filesystem — is what the stock `pmm-client` image does not
+give you. The blocker was that image, not the design.
 
 ```mermaid
 flowchart TB
@@ -242,7 +221,7 @@ flowchart TB
 | `replicaset-cluster` | 3 data-bearing members | 3 | `replicaset-cluster` |
 | `sharded-cluster` | 2 `mongos`, 3 config, 2 shards of `svr0`/`svr1`/`arb0` | 11 | `sharded-cluster` |
 
-11 containers for the sharded cluster where the Terraform sandbox needs 22 — no sidecars.
+11 containers for the sharded cluster — one per node, no sidecars.
 
 **The `cluster` column is not cosmetic.** SEP's inventory has no cluster *entity*, only a
 cluster *string* per service, set by `pmm-admin add mongodb --cluster=`. `pom_worker`
@@ -255,8 +234,8 @@ topology must share it or the topology silently fragments.
   `pmm_default` as `external: true`, so `./om start pmm` must come first — `start_psmdb`
   checks for the network and says so, rather than letting Compose fail with "external
   network not found".
-- **Nothing is published to the host.** Deliberate: the Terraform sandbox and PMM already
-  contend for 9000 and 8443. Reach a node with `docker exec`.
+- **Nothing is published to the host.** Deliberate: PMM already contends for 9000 and
+  8443. Reach a node with `docker exec`.
 - **Readiness means registered, not started.** `./om start <profile>` waits until every
   node has `/root/.mongodb_uri` — the credentials file both `backup_mongo` and
   `pom_worker`'s probe payload read by default. A node whose `pmm-agent` has not connected is not yet a
@@ -269,7 +248,7 @@ topology must share it or the topology silently fragments.
   writable `/sys/fs/cgroup`, `CAP_SYS_ADMIN`, and `apparmor`/`seccomp` unconfined. Nomad
   bind-mounts `/secrets` and `/local` into a per-allocation task directory even under
   `raw_exec`, and without all four the task dies in its setup hook — surfacing in SEP as a
-  run that produces no output at all. Narrower than `om-nomad`'s `privileged: true`, but a
+  run that produces no output at all. Narrower than full `privileged: true`, but a
   container that can mount can escape. Do not copy it anywhere shared.
 
 ## The upgrade loop this exists for
@@ -383,7 +362,7 @@ add or reconfigure a process without rebuilding the image.
 | `PMM_ENABLE_NOMAD=1` | runs the embedded Nomad server and proxies `/nomad/`. SEP dispatches here. |
 | `PMM_ENABLE_SEP=1` | exposes the embedded PostgreSQL to attached Docker subnets and provisions a non-superuser `sep` role + `sep` database. SEP's three services and Celery beat all live in it. |
 | `PMM_ENABLE_ACCESS_CONTROL=1`, `PMM_ENABLE_INTERNAL_PG_QAN=1` | access control; QAN for PMM's own PostgreSQL |
-| `PMM_PORT_CH_TCP=9900`, `PMM_PORT_CH_HTTP=8923` | move ClickHouse off 9000/8123 — the sandbox's MinIO wants 9000 |
+| `PMM_PORT_CH_TCP`, `PMM_PORT_CH_HTTP` | move ClickHouse off its 9000/8123 defaults, should anything else on the host want them |
 
 > Note: there is **no Alertmanager** anywhere in this tree. PMM 2 had one; PMM 3 uses
 > Grafana's built-in alerting instead. The root [`CLAUDE.md`](../CLAUDE.md) still lists
@@ -637,7 +616,7 @@ sequenceDiagram
     P-->>S: nodes, services, agents
     S->>DB: upsert nodes + services
     F->>DB: what can I target?
-    DB-->>F: MongoDB service "replicaset-cluster-node00"<br/>cluster: replicaset-cluster · env: sandbox
+    DB-->>F: MongoDB service "replicaset-cluster-node00"<br/>cluster: replicaset-cluster
 ```
 
 Three things must be true for this to work:
@@ -722,24 +701,17 @@ SEP cannot dispatch to.
 `/root/.mongodb_uri` from the local filesystem — SEP never ships a credential with a job —
 and it can `supervisorctl restart mongo`, which a sidecar executor could never do.
 
-**`om-nomad` still exists, for the Terraform sandbox.** That sandbox's `pmm-client`
-sidecars carry neither `python3` nor `pbm`, so its clusters have no usable executor of
-their own; `om-nomad` is the stand-in, and it must be attached to the environment's Docker
-network to resolve service names PMM registered by container hostname
-(`omtest1-cl01-mongos00`) — that is what `./om psmdb-link <env>` does, along with copying
-the cluster's MongoDB URI and MinIO credentials into `nomad/secrets/`. If you are working
-in `psmdb/`, you do not need any of it.
-
-> [`nomad-in-pmm.md`](nomad-in-pmm.md) was written when this road looked closed. It is
-> now open, and two of its blockers have answers — see [Known drift](#known-drift).
+**There is no separate executor container.** PMM's embedded server plus the per-node client
+that `pmm-agent` starts is the whole executor story locally, which is why a `psmdb/` node
+needs no extra wiring to become an execution host.
 
 ---
 
 # Part 8 — Logging in
 
-There are two login paths now, and locally the interesting one has no Casdoor in it.
+Locally there is one login path, and it is PMM's own session.
 
-**Path A — SEP inside PMM (the local default).** The browser already holds a
+**SEP inside PMM (the local default).** The browser already holds a
 `pmm_session` cookie. The embedded SEP UI POSTs `/api/oauth/session/exchange`, which is
 same-origin through nginx and therefore carries that cookie; SEP validates it against
 Grafana, maps the org role, and mints its own short-lived bearer. Enabled by
@@ -764,16 +736,13 @@ Why the proxy deliberately injects **no** token: doing so would authenticate eve
 SEP's internal service principal, which hardcodes `is_admin = False` — exactly the 403s
 PMM-15293 exists to remove.
 
-**Path B — standalone SEP on `:5174`.** SEP has no user table of its own; Casdoor holds
-the accounts, and SEP does the OAuth exchange server-side, so the browser never touches
-Casdoor and no redirect-URL setup is needed. Two setup facts follow: Casdoor must be
-**seeded** from `SEP/data/casdoor_init_data.json` (the stock image's `app-built-in`
-application will not do — `settings.yaml` pins `application_name: sep-app`, and the
-generated app is what declares the `password` grant), and it must be published on **9999**
-because that is what `allowed_issuers` expects.
+**SEP has no user table of its own.** Upstream it delegates to an external identity
+provider, and `settings.yaml` nulls those entries out on this branch so Grafana is the one
+active provider. Setting any `AUTH__PROVIDER__*` env var in `SEP/.env` resurrects an entry
+it dropped, which is the usual reason a login stops using the PMM session.
 
-This is why `./om status` showing `casdoor  stopped` is not a problem while you work
-through PMM.
+The standalone frontend on `:5174` therefore has no login of its own locally — reach the
+SEP apps through PMM instead.
 
 ---
 
@@ -811,7 +780,7 @@ Three tracks, all present on that branch:
   own database. Nothing new is published on the host beyond the 5432 the devcontainer
   already publishes.
 - **Track C — session exchange** (`PMM-15293`): mint the SEP bearer from the PMM session,
-  Part 8 Path A. This is what replaced the earlier dev-only proxy shim that authenticated
+  Part 8. This is what replaced the earlier dev-only proxy shim that authenticated
   everything as a service principal.
 
 Each SEP frontend change still has to be hand-ported onto the branch. **Read
@@ -834,19 +803,14 @@ As configured by this workspace's `pmm/.env` and `om`:
 | 8443 | PMM HTTPS | the SEP UI, the SEP API proxy, and `/nomad` all live here too |
 | 5432 | PMM PostgreSQL | published by `pmm/docker-compose.dev.yml`; holds the `sep` database |
 | 9090 | PMM VictoriaMetrics | |
-| 9900 | PMM ClickHouse TCP | moved off 9000 (`PMM_PORT_CH_TCP`) — the sandbox's MinIO wants 9000 |
-| 8923 | PMM ClickHouse HTTP | moved off 8123 (`PMM_PORT_CH_HTTP`) |
+| 9000 | PMM ClickHouse TCP | `PMM_PORT_CH_TCP` moves it if something else wants 9000 |
+| 8123 | PMM ClickHouse HTTP | `PMM_PORT_CH_HTTP` likewise |
 | 5173 | PMM vite HMR | distinct from SEP's 5174 |
 | 2345 | PMM delve | debugger |
 | 35729–35730 | PMM livereload | |
-| 9999 | Casdoor | opt-in; must be 9999 — `allowed_issuers` |
-| 4646 | `om-nomad` | opt-in; only for the Terraform sandbox |
-| 5001 | PSMDB Sandbox UI | opt-in |
 | — | `psmdb/` clusters and MinIO | **nothing published**, by design |
 
-`./om ports` prints its own table plus what is actually listening; it still lists
-ClickHouse at the 9000/8123 defaults and names the collision as something to fix, which
-`pmm/.env` has already done.
+`./om ports` prints this table plus what is actually listening.
 
 ## Inside the PMM container
 
@@ -887,7 +851,6 @@ ClickHouse at the 9000/8123 defaults and names the collision as something to fix
 | SEP `pom_worker` | PMM `/prometheus/api/v1/import/prometheus` | Prometheus text exposition, PMM credentials |
 | SEP (all three services + beat) | PMM's embedded PostgreSQL `:5432` | database `sep`, role `sep` |
 | SEP core app | Grafana in pmm-server | validates a `pmm_session` cookie, maps the org role |
-| SEP backend | Casdoor | OAuth2 password grant, server-side — standalone path only |
 | PMM nginx | SEP `:8000` | proxies `/api`, `/sep_app`, `/files`, `/stream-logs`, `/execution-events` via `host.docker.internal` |
 | Nomad client | target database | `raw_exec`, commands run directly on the client — in `psmdb/`, in the same container as `mongod` |
 | pbm-agent | `psmdb-minio:9000` | PBM S3 store, network-internal |
@@ -896,13 +859,11 @@ ClickHouse at the 9000/8123 defaults and names the collision as something to fix
 
 | File | Defines |
 | --- | --- |
-| [`../om`](../om) | how all five stacks start, stop, and link |
+| [`../om`](../om) | how all three stacks start and stop |
 | [`../psmdb/compose.yaml`](../psmdb/compose.yaml) | the four topologies, MinIO, and the `pmm_default` join |
 | [`../psmdb/Dockerfile`](../psmdb/Dockerfile) | the node image, and why it is Ubuntu + apt |
-| [`../psmdb/README.md`](../psmdb/README.md) | the sandbox in depth: upgrade loop, bootstrap ordering, rough edges |
-| [`../docker-compose.yml`](../docker-compose.yml) | Casdoor + `om-nomad`, with the reasoning in comments |
-| [`../nomad/Dockerfile`](../nomad/Dockerfile), [`../nomad/nomad.hcl`](../nomad/nomad.hcl) | the standalone executor image and its client config |
-| `pmm/.env` | which PMM features this workspace turns on, and the moved ports |
+| [`../psmdb/README.md`](../psmdb/README.md) | the cluster stack in depth: upgrade loop, bootstrap ordering, rough edges |
+| `pmm/.env` | which PMM features this workspace turns on |
 | `pmm/docker-compose.dev.yml` | the PMM devcontainer, its published ports and host-gateway alias |
 | `pmm/build/ansible/roles/nginx/files/conf.d/pmm.conf` | PMM's URL routing, incl. the five SEP prefixes |
 | `pmm/build/ansible/roles/supervisord/files/pmm.ini` | PMM's build-time processes |
@@ -919,25 +880,13 @@ ClickHouse at the 9000/8123 defaults and names the collision as something to fix
 
 Recorded rather than silently fixed, because each needs its own change:
 
-1. **[`containers.md`](containers.md) predates `psmdb/`.** It documents the Terraform
-   sandbox's sidecar layout as *the* source of databases. Still accurate for that stack;
-   it has no node-per-container clusters and no per-node Nomad clients in it.
-2. **[`nomad-in-pmm.md`](nomad-in-pmm.md) describes this road as closed.** Two of its
-   blockers now have answers: the missing `python3`/`pbm` was a property of the stock
-   `pmm-client` image, not of the design (`psmdb/Dockerfile` installs both alongside it),
-   and its claim that a containerised Nomad client cannot manage cgroups is contradicted
-   by measurement — the clients here start and register, given `cgroup: host` and a
-   writable `/sys/fs/cgroup` (see the comment in `psmdb/scripts/run-pmm-agent.sh`).
-3. **`./om ports`** lists ClickHouse at 9000/8123 and offers the fix as advice; `pmm/.env`
-   already applies it (9900/8923). Its header comment also still says "four stacks".
-4. The root [`CLAUDE.md`](../CLAUDE.md) lists **Alertmanager** in PMM's backend stack.
-   There is no Alertmanager anywhere in `pmm/` — PMM 3 uses Grafana alerting. It also
-   describes the workspace as three submodules, with no mention of `psmdb/`.
-5. The root [`CLAUDE.md`](../CLAUDE.md) points `PMMSyncer` at
+1. The root [`CLAUDE.md`](../CLAUDE.md) lists **Alertmanager** in PMM's backend stack.
+   There is no Alertmanager anywhere in `pmm/` — PMM 3 uses Grafana alerting.
+2. The root [`CLAUDE.md`](../CLAUDE.md) points `PMMSyncer` at
    `SEP/app/sep/sync/syncers/pmm.py` — correct — but an older path
    (`SEP/app/inventory/syncers/pmm.py`) still circulates in other docs. Also tracked in
    [`../notes/sep-pmm-integration.md`](../notes/sep-pmm-integration.md) §7.
-6. SEP's own `README.md` carries several stale sections — PMM 2 instructions, a
+3. SEP's own `README.md` carries several stale sections — PMM 2 instructions, a
    superseded `PLUGINS:` block, a setting that exists nowhere in the code. The full list
    is in [`../notes/sep-dev-quickstart.md`](../notes/sep-dev-quickstart.md) §6.
 
@@ -946,8 +895,7 @@ Recorded rather than silently fixed, because each needs its own change:
 ## Where to go next
 
 - Want *real MongoDB to act on*? [`../psmdb/README.md`](../psmdb/README.md)
-- Want the *container-level* wiring of the Terraform sandbox? [`containers.md`](containers.md)
-- Wondering how SEP ended up on *PMM's own Nomad*? [`nomad-in-pmm.md`](nomad-in-pmm.md), read with drift note 2 above
+- Want the *container-level* wiring? Part 10 above
 - Want to *run* this? [`../notes/sep-dev-quickstart.md`](../notes/sep-dev-quickstart.md)
 - Want to *write a SEP app*? [`../notes/sep-apps-how-to-write-one.md`](../notes/sep-apps-how-to-write-one.md)
 - Want to work on the *merge*? [`../notes/sep-pmm-integration.md`](../notes/sep-pmm-integration.md)

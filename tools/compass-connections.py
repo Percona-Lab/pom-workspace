@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Manage MongoDB Compass connections for the workspace's PSMDB clusters.
 
-Both sandboxes make hand-saved Compass favourites go stale on every redeploy:
+Hand-saved Compass favourites go stale on every redeploy:
 ``psmdb/compose.yaml`` (``./om start sharded-cluster``) hands out fresh bridge
-addresses and publishes no host ports at all, and the Terraform sandbox
-randomises published ports on top of that. This regenerates the favourites from
-the running containers instead of maintaining them by hand.
+addresses and publishes no host ports at all. This regenerates the favourites
+from the running containers instead of maintaining them by hand.
 
     ./tools/compass-connections.py add                 every running environment
     ./tools/compass-connections.py add sharded-cluster  just one
@@ -14,15 +13,15 @@ the running containers instead of maintaining them by hand.
     ./tools/compass-connections.py remove sharded-cluster
     ./tools/compass-connections.py hosts --apply        /etc/hosts, in place
 
-An environment is named by the prefix its containers share: a compose profile
-(``standalone``, ``replicaset-single``, ``replicaset-cluster``,
-``sharded-cluster``) or a Terraform sandbox prefix (``omtest1``).
+An environment is named by the prefix its containers share, which is the compose
+profile (``standalone``, ``replicaset-single``, ``replicaset-cluster``,
+``sharded-cluster``).
 
 Two kinds of entry are written, because they fail in different ways:
 
 * ``(direct)``       one node, ``directConnection=true``, addressed the way that
                      needs no name resolution: ``127.0.0.1:<published port>``
-                     where the sandbox publishes one, the container's bridge
+                     where one is published, the container's bridge
                      address where it does not. Works with no ``/etc/hosts``:
                      nothing is rediscovered, so no container name is resolved.
 * ``(replica set)``  container hostnames plus ``replicaSet=``. **Requires** the
@@ -31,9 +30,9 @@ Two kinds of entry are written, because they fail in different ways:
                      advertise, so an address-only seed is not enough.
 
 Credentials come from the containers themselves (``MONGO_ROOT_USER`` /
-``MONGO_ROOT_PASSWORD``, which psmdb/compose.yaml sets on every node) and fall
-back to the Terraform sandbox's pair, which lives in Ansible where nothing
-host-side can read it. ``--user`` / ``--password`` override either.
+``MONGO_ROOT_PASSWORD``, which psmdb/compose.yaml sets on every node), with a
+built-in fallback pair for a node that declares neither. ``--user`` /
+``--password`` override either.
 
 Ownership is tracked without touching Compass's schema: a connection is "ours"
 only if its id equals ``uuid5(NAMESPACE, favourite-name)``. Hand-made connections
@@ -57,7 +56,7 @@ import sys
 import time
 import uuid
 
-from sandbox import credentials, discover, environments  # tools/sandbox.py
+from clusters import credentials, discover, environments  # tools/clusters.py
 
 #: Namespace for deterministic connection ids. Changing it orphans every
 #: previously written entry (``remove`` would no longer recognise them).
@@ -96,7 +95,7 @@ def resolve_envs(requested: list[str]) -> list[str]:
         return requested
     found = environments()
     if not found:
-        sys.exit("no sandbox environment is running — start one with ./om start <topology>")
+        sys.exit("no PSMDB cluster is running — start one with ./om start <topology>")
     return found
 
 
@@ -285,7 +284,7 @@ def cmd_list(args, directory: pathlib.Path) -> int:
 def cmd_envs(args, directory: pathlib.Path) -> int:
     found = environments()
     if not found:
-        print("no sandbox environment running")
+        print("no PSMDB cluster running")
         return 0
     for env in found:
         nodes = discover(env)
@@ -351,7 +350,7 @@ def cmd_hosts(args, directory: pathlib.Path) -> int:
         # Named explicitly, never defaulted: the whole point is an environment
         # that is *gone*, so discovery cannot supply the list.
         if not args.envs:
-            sys.exit("name the environments to remove, e.g. hosts --remove omtest1")
+            sys.exit("name the environments to remove, e.g. hosts --remove sharded-cluster")
         path: pathlib.Path = args.hosts_file
         before = path.read_text()
         after = strip_blocks(before, args.envs)
@@ -403,7 +402,7 @@ def main() -> int:
     p.add_argument("envs", nargs="*", help="limit to these environments")
     p.set_defaults(func=cmd_list)
 
-    p = sub.add_parser("envs", help="show the sandbox environments that are running")
+    p = sub.add_parser("envs", help="show the PSMDB clusters that are running")
     p.set_defaults(func=cmd_envs)
 
     p = sub.add_parser("hosts", help="print or apply the /etc/hosts block")

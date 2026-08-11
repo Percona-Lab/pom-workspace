@@ -3,43 +3,41 @@
 A cross-repository workspace for developing **PMM** and **SEP** together, against real
 MongoDB clusters running locally.
 
-Three git submodules, one orchestrator:
+Two git submodules plus an in-tree database stack, one orchestrator:
 
 | Directory | What it is | How it runs locally |
 | --- | --- | --- |
 | [`pmm/`](pmm/) | Percona Monitoring and Management — Go backend, React UI | in PMM's own **devcontainer**, with the working tree mounted so you can compile into it |
 | [`SEP/`](SEP/) | Services Enablement Platform — FastAPI backend, React frontend | **natively** (venv + pnpm), so edits are live |
 | [`psmdb/`](psmdb/) | Four MongoDB topologies as Compose profiles, one container per node | `docker compose`, joined to PMM's network |
-| [`mongo_terraform_ansible/`](mongo_terraform_ansible/) | The older Terraform-driven PSMDB sandbox + its Go web UI | optional, `go run` on :5001 |
 
 Everything is driven from the repo root by [`./om`](om). Run `./om` with no arguments for
 its full help.
 
 > **New to this system?** Read [`docs/topology.md`](docs/topology.md) first — what the two
-> products are, what runs on your machine, and what talks to what.
-> [`docs/containers.md`](docs/containers.md) is the same picture at container level, and
-> [`docs/glossary.md`](docs/glossary.md) defines every proper noun used below.
+> products are, what runs on your machine, and what talks to what. Its Part 10 is the
+> container-level reference, and [`docs/glossary.md`](docs/glossary.md) defines every
+> proper noun used below.
 
 ---
 
 ## 1. Which configuration you are setting up
 
-There are **two** ways to run SEP locally, and they need different setup. `settings.yaml`'s
-`development` block on the current SEP branch selects the first one.
+This workspace runs SEP **inside PMM**, which is what `settings.yaml`'s `development` block
+on the current SEP branch selects:
 
-| | **A — SEP inside PMM** (the local default) | **B — Standalone SEP** |
-| --- | --- | --- |
-| SEP UI | native PMM routes at `https://localhost:8443/pmm-ui/sep/...` | its own Vite dev server on `http://localhost:5174` |
-| Auth | the ambient PMM/Grafana session (`pmm_session` cookie exchanged for a SEP bearer) | Casdoor password grant |
-| Databases | **PMM's embedded PostgreSQL** — one `sep` database for all three services and Celery beat | four SQLite files |
-| Executor | PMM's **embedded Nomad**, proxied at `/nomad` | standalone `om-nomad` on :4646 |
-| Extra setup | `pmm/.env` and `SEP/.env` wiring, §4 | Casdoor seed data, which `./om setup` generates |
+| | **SEP inside PMM** (the local default) |
+| --- | --- |
+| SEP UI | native PMM routes at `https://localhost:8443/pmm-ui/sep/...` |
+| Auth | the ambient PMM/Grafana session (`pmm_session` cookie exchanged for a SEP bearer) |
+| Databases | **PMM's embedded PostgreSQL** — one `sep` database for all three services and Celery beat |
+| Executor | PMM's **embedded task executor**, proxied by pmm-server |
+| Extra setup | `pmm/.env` and `SEP/.env` wiring, §4 |
 
-Path A is what this workspace targets, and it is what §3–§4 below describe. Path B still
-works — `./om start sep-frontend` starts it, and everything not yet ported into PMM is
-only reachable there. See [`notes/sep-dev-quickstart.md`](notes/sep-dev-quickstart.md) if
-you want Path B on its own, and [`docs/topology.md`](docs/topology.md) Part 8 for how the
-two auth flows differ.
+That is what §3–§4 below describe. SEP's own Vite dev server still starts with `./om start
+sep-frontend`, and anything not yet ported into PMM is only reachable there — but it has no
+auth provider wired up locally, so treat it as a UI-only view. See
+[`docs/topology.md`](docs/topology.md) Part 8 for how the auth flow works.
 
 ---
 
@@ -52,7 +50,6 @@ two auth flows differ.
 | `python3` | 3.11.9+, `<3.14` (3.12 works) | SEP backend |
 | Node | **>= 22.22.0** | SEP frontend only |
 | `pnpm` | 11.1.3, via corepack | SEP frontend only |
-| `go`, `terraform` | 1.22+ / any | the Terraform sandbox only (§8) |
 
 Node's minimum is a full semver check, not just the major — 22.21.1 satisfies "22" but
 SEP's `engines` field wants `>= 22.22.0`. With nvm:
@@ -88,9 +85,6 @@ branch out explicitly if you intend to commit inside one:
 (cd SEP && git checkout psmdb-openmanager)
 ```
 
-`mongo_terraform_ansible` pins `feature/local-deploy-fixes` in `.gitmodules`, so
-`git submodule update --init --remote` follows it.
-
 ---
 
 ## 4. First-time setup
@@ -114,19 +108,16 @@ Then change these (the example's defaults are wrong for this workspace):
 
 ```ini
 PMM_PORT_HTTPS=8443             # SEP pins PMM.ENDPOINT to https://127.0.0.1:8443
-PMM_ENABLE_NOMAD=1              # the embedded Nomad server SEP dispatches to
-PMM_PUBLIC_ADDRESS=pmm-server   # Nomad advertises this; must resolve from every client
-                                # container, so the hostname — not "localhost"
+PMM_ENABLE_NOMAD=1              # PMM's own flag for the embedded task executor SEP
+                                # dispatches to — keep the spelling, it is PMM's
+PMM_PUBLIC_ADDRESS=pmm-server   # the executor advertises this; must resolve from every
+                                # client container, so the hostname — not "localhost"
 
 # Expose the embedded PostgreSQL to attached Docker subnets and provision a
 # non-superuser `sep` role owning a `sep` database. Consumed by the container's
 # entrypoint, not by pmm-managed. Pick any password; SEP/.env must match it.
 PMM_ENABLE_SEP=1
 PMM_SEP_POSTGRES_PASSWORD=<pick a password>
-
-# Only if you also use the Terraform sandbox: its MinIO wants 9000/8123.
-PMM_PORT_CH_TCP=9900
-PMM_PORT_CH_HTTP=8923
 ```
 
 `./om setup` will force `PMM_PORT_HTTPS=8443` for you if you forget, but not the rest.
@@ -163,11 +154,9 @@ AUTH__PROVIDER__GRAFANA__SERVICE_ACCOUNT_TOKEN=<glsa_...>
 PMM__API_KEY=<glsa_...>
 ```
 
-**Do not set the Casdoor variables** on this path. `settings.yaml` sets the `casdoor`
-provider to `null` so Grafana is the single active provider, and any
-`AUTH__PROVIDER__CASDOOR__*` env var resurrects the entry it dropped. `./om setup` writes
-those two lines when it creates `.env` from scratch — comment them out afterwards, or
-create `SEP/.env` yourself first (setup leaves an existing file untouched).
+Grafana is the single active auth provider here: `settings.yaml` nulls the others out, and
+setting their `AUTH__PROVIDER__*` env vars would resurrect the entries it dropped. `./om
+setup` only creates `SEP/.env` when it is absent, and leaves an existing file untouched.
 
 ### 4.5 `./om setup`
 
@@ -179,24 +168,19 @@ Idempotent and safe to re-run. In order:
 
 1. **`./om doctor`** — reports missing prerequisites, then continues with what it can.
 2. **SEP venv** — `make -C SEP venv`.
-3. **Casdoor seed data** — runs `SEP/generate_casdoor_init_data.sh -p devpassword` if
-   `SEP/data/casdoor_init_data.json` is absent. It **prints the `admin` and `sep`
-   passwords, stored nowhere else — write them down.** Existing seed data is left alone,
-   because re-running rotates the client secret. Only Path B uses this, but `./om start
-   deps` refuses to start without the file.
-4. **`SEP/.env`** — created from the generated `.env.docker` only if absent (see §4.4).
-5. **Migrations** — `make -C SEP migrate`. Three Alembic tracks (`sep`, `inventory`,
+3. **`SEP/.env`** — created empty only if absent, so you can fill in §4.4 yourself.
+4. **Migrations** — `make -C SEP migrate`. Three Alembic tracks (`sep`, `inventory`,
    `tasks`) run in one pass; on this branch they share the one `sep` PostgreSQL database
    and coexist through distinct version tables.
-6. **Celery beat schedule tables** — a known blocker on the SQLite path: Alembic does not
+5. **Celery beat schedule tables** — a known blocker on the SQLite path: Alembic does not
    create them, but SEP's startup writes into them, so a fresh checkout crashes with
    `no such table: main.celery_intervalschedule`. Setup starts the app once with Celery to
    let the beat scheduler create them. On the PostgreSQL path this step is skipped and the
    tables are created on the first real backend start instead (`./om` runs Celery by
    default).
-7. **SEP frontend deps** — `pnpm install` in `SEP/frontend`; skipped with a warning if
+6. **SEP frontend deps** — `pnpm install` in `SEP/frontend`; skipped with a warning if
    Node/pnpm are not ready. Only `sep-frontend` is blocked by that.
-8. **`pmm/.env`** — created from `.env.dev.example` if absent, and `PMM_PORT_HTTPS` forced
+7. **`pmm/.env`** — created from `.env.dev.example` if absent, and `PMM_PORT_HTTPS` forced
    to 8443.
 
 ---
@@ -204,17 +188,16 @@ Idempotent and safe to re-run. In order:
 ## 5. Start the stack
 
 ```bash
-./om start          # = deps + pmm + sep-backend + sep-frontend
+./om start          # = pmm + sep-backend + sep-frontend
 ```
 
 | Component | What starts | Where |
 | --- | --- | --- |
-| `deps` | Casdoor (root [`docker-compose.yml`](docker-compose.yml)) | http://localhost:9999 — Path B only |
 | `pmm` | the PMM devcontainer, via `make -C pmm env-up` | https://localhost:8443 — **admin / admin** |
 | `sep-backend` | uvicorn with reload, **plus** the Celery worker and beat | http://localhost:8000 |
-| `sep-frontend` | Vite — the standalone SEP UI (Path B) | http://localhost:5174 |
+| `sep-frontend` | Vite — SEP's own standalone UI | http://localhost:5174 |
 
-On Path A you use SEP through PMM: **https://localhost:8443/pmm-ui/sep/atw** ("Collect
+Normally you use SEP through PMM: **https://localhost:8443/pmm-ui/sep/atw** ("Collect
 Diagnostic Data") and **/pmm-ui/sep/mysql-backups**. You are already logged in — the PMM
 session is the identity. Apps that have not been ported into PMM are still reachable only
 on :5174.
@@ -223,7 +206,7 @@ Name components to start a subset: `./om start pmm`, `./om start sep`, and so on
 
 ```bash
 ./om status         # what is up, on which ports, and whether PMM is serving your UI
-./om urls           # every URI each component serves — Grafana, vmui, Swagger, Nomad UI
+./om urls           # every URI each component serves — Grafana, vmui, Swagger
 ./om logs sep-backend -f
 ./om stop           # or ./om restart
 ```
@@ -237,7 +220,7 @@ tree's UI automatically but not your backend changes. See §7.
 
 The clusters in [`psmdb/`](psmdb/) join the Docker network PMM's compose stack creates
 (`pmm_default`), so **PMM must be running first**. Each node is a single container running
-`mongod`/`mongos` + `pbm-agent` + `pmm-agent` — and pmm-agent >= 3.2.0 carries a Nomad
+`mongod`/`mongos` + `pbm-agent` + `pmm-agent` — and pmm-agent >= 3.2.0 carries an executor
 client, so every database node is automatically a SEP execution host. No separate executor
 and no certificate handling.
 
@@ -305,7 +288,7 @@ After a rebuild that changes inventory, refresh SEP's copy with `./om pom sync`.
 ### Inspecting the POM app
 
 `pom_worker` (`SEP/app/sep/apps/pom_worker`) discovers the MongoDB estate from three
-sources — SEP's inventory, VictoriaMetrics and a Nomad probe — and stores one
+sources — SEP's inventory, VictoriaMetrics and a dispatched probe — and stores one
 `environments -> clusters -> services` topology document per run. It has a dedicated
 inspector that joins PostgreSQL, VictoriaMetrics and the tasks API. Every subcommand
 defaults to the most recent run:
@@ -317,42 +300,13 @@ defaults to the most recent run:
 ./om pom topology-raw   # the same document as stored JSON — pipe it to jq
 ./om pom nodes          # the service -> executor mapping, orphans included
 ./om pom probe          # per-node probe JSON
-./om pom tasks          # dispatched Nomad runs and their status
+./om pom tasks          # dispatched probe task runs and their status
 ./om pom token          # bearer token for SEP's /api/docs Authorize button, and for curl
 ```
 
 ---
 
-## 8. The Terraform sandbox (optional, older path)
-
-`mongo_terraform_ansible/ui-go` is a Go web UI that drives Terraform to deploy PSMDB
-clusters. It predates `psmdb/` and deploys pmm-client as a **sidecar** container next to
-each mongod — fine for monitoring, but a sidecar Nomad client can never restart or upgrade
-the mongod, which is why `psmdb/` exists. Use it when you need what it deploys
-specifically; otherwise prefer §6.
-
-```bash
-./om start sandbox            # UI on http://127.0.0.1:5001 (needs go + terraform)
-./om start nomad              # the standalone om-nomad executor, on :4646
-```
-
-Deploy an environment in the UI with **zero PMM servers**, then point its agents at the
-repo PMM:
-
-```bash
-./om psmdb-link <env-prefix>       # e.g. ./om psmdb-link test1
-```
-
-That attaches the repo `pmm-server` container to the environment's network under the alias
-its agents already look for (`<prefix>-pmm-server`), attaches `om-nomad` to the same
-network so it can resolve the cluster's container hostnames, lifts the PBM and MinIO
-credentials into `nomad/secrets/`, and restarts the pmm-client containers so registration
-re-runs. It refuses if the sandbox deployed its own PMM under that name rather than
-creating a duplicate DNS alias.
-
----
-
-## 9. Ports
+## 8. Ports
 
 ```bash
 ./om ports      # the table below, plus what is actually listening
@@ -362,22 +316,16 @@ creating a duplicate DNS alias.
 | --- | --- |
 | 8000 | SEP backend — bound to `0.0.0.0`, because PMM's nginx reaches it over the host gateway |
 | 5174 | SEP frontend (Vite), standalone UI |
-| 8443 | PMM HTTPS — the PMM UI, the SEP UI and API proxy, and `/nomad` all live here |
+| 8443 | PMM HTTPS — the PMM UI and the SEP UI and API proxy all live here |
 | 5432 | PMM PostgreSQL — holds the `sep` database |
 | 9090 | PMM VictoriaMetrics |
-| 9900 / 8923 | PMM ClickHouse TCP / HTTP, moved off 9000 / 8123 |
+| 9000 / 8123 | PMM ClickHouse TCP / HTTP |
 | 5173 / 2345 | PMM Vite HMR / delve |
-| 9999 | Casdoor (opt-in) |
-| 4646 | `om-nomad` (opt-in, Terraform sandbox only) |
-| 5001 | PSMDB Sandbox UI (opt-in) |
 | — | `psmdb/` clusters and their MinIO — **nothing published**, by design |
-
-`./om ports` still lists ClickHouse at the 9000/8123 defaults and names the collision with
-the sandbox's MinIO as something to fix; §4.1 has already fixed it.
 
 ---
 
-## 10. Troubleshooting
+## 9. Troubleshooting
 
 **`make migrate` fails with a connection error during `./om setup`** — PMM is not running,
 or `PMM_ENABLE_SEP` / `PMM_SEP_POSTGRES_PASSWORD` are missing from `pmm/.env`, or the
@@ -387,9 +335,9 @@ password in `SEP/.env` does not match. See §4 — the ordering is the usual cau
 created. Re-run `./om setup`, or start the backend once with Celery
 (`make -C SEP dev-backend START_CELERY=1`).
 
-**Login redirects to Casdoor when you expected the PMM session** — an
-`AUTH__PROVIDER__CASDOOR__*` variable in `SEP/.env` has resurrected the provider
-`settings.yaml` set to `null`. Comment it out.
+**Login does not use the PMM session** — an `AUTH__PROVIDER__*` variable in `SEP/.env` has
+resurrected a provider `settings.yaml` set to `null`. Comment it out so Grafana is the only
+active one.
 
 **Vite dies with `ENOSPC` / `Emitted 'error' event on FSWatcher`** — this is the per-user
 inotify *instance* limit, not a full disk. `./om start sep-frontend` detects it and falls
@@ -416,16 +364,16 @@ routes are still absent, the checked-out PMM branch does not carry them.
 **`port 8000 is already in use by something om did not start`** — a previous backend
 survived. `./om` tracks PIDs in `.om/pids/`; if that is stale, find and kill it yourself.
 
-**A task sits at "running" with no output** — Nomad's client GC destroyed the allocation
-because the disk crossed its 80% threshold, taking the logs with it. `PMM_NOMAD_GC_DISK_USAGE_THRESHOLD`
-in `pmm/.env` raises it.
+**A task sits at "running" with no output** — the executor's client GC destroyed the
+allocation because the disk crossed its 80% threshold, taking the logs with it.
+`PMM_NOMAD_GC_DISK_USAGE_THRESHOLD` in `pmm/.env` (PMM's own spelling) raises it.
 
 Logs for every native component live in `.om/logs/`; `./om logs <comp> [-f]` is the
 shortcut.
 
 ---
 
-## 11. Editor setup
+## 10. Editor setup
 
 Open [`openmanager.code-workspace`](openmanager.code-workspace) in VS Code or Cursor — it
 configures the Go, Python and TypeScript language servers, formatters and linters for both
@@ -434,14 +382,12 @@ repositories. Recommended extensions and the format-on-save rules are in
 
 ---
 
-## 12. Where to read more
+## 11. Where to read more
 
 | Doc | What it covers |
 | --- | --- |
-| [`docs/topology.md`](docs/topology.md) | **Start here.** The whole system: both products, all local stacks, data flows, diagrams |
-| [`docs/containers.md`](docs/containers.md) | The same at container level — real names, networks, subnets, every connection |
-| [`docs/nomad-in-pmm.md`](docs/nomad-in-pmm.md) | Dispatching to PMM's built-in Nomad instead of a standalone executor |
-| [`docs/glossary.md`](docs/glossary.md) | VictoriaMetrics, Nomad, Casdoor, `raw_exec`, syncers, and the rest |
+| [`docs/topology.md`](docs/topology.md) | **Start here.** The whole system: both products, all local stacks, data flows, diagrams — and Part 10's container-level reference |
+| [`docs/glossary.md`](docs/glossary.md) | VictoriaMetrics, `raw_exec`, syncers, and the rest |
 | [`psmdb/README.md`](psmdb/README.md) | The database nodes, the upgrade loop, bootstrap ordering |
 | [`CLAUDE.md`](CLAUDE.md) | Conventions and command reference for AI agents in this workspace |
 | `pmm/AGENTS.md`, `SEP/AGENTS.md` | Per-repo guides, maintained upstream |

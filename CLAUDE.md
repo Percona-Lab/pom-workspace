@@ -1,11 +1,11 @@
 # OpenManager Cross-Repository Master Guide for Claude Agent
 
-Welcome to the **OpenManager** cross-repo workspace! This workspace brings together two core Percona platforms into a unified development setup, plus the sandbox that supplies databases to test them against:
+Welcome to the **OpenManager** cross-repo workspace! This workspace brings together two core Percona platforms into a unified development setup, plus the PSMDB stack that supplies databases to test them against:
 1. **PMM (`pmm/`)**: Percona Monitoring and Management (Go backend, React frontend)
 2. **SEP (`SEP/`)**: Services Enablement Platform (Python FastAPI backend, TypeScript frontend)
-3. **PSMDB Sandbox (`mongo_terraform_ansible/`)**: Terraform/Ansible + a Go web UI that deploys real MongoDB clusters locally
+3. **PSMDB clusters (`psmdb/`)**: four real MongoDB topologies as Docker Compose profiles, committed in-tree
 
-All three are **git submodules**. After cloning, run `git submodule update --init` before anything else; `./om` drives the whole stack from this root.
+`pmm/` and `SEP/` are **git submodules**. After cloning, run `git submodule update --init` before anything else; `./om` drives the whole stack from this root.
 
 ---
 
@@ -19,7 +19,7 @@ All three are **git submodules**. After cloning, run `git submodule update --ini
 
 ### **SEP (`SEP/`)**
 - **Architecture**: Orchestration and management platform that integrates directly with PMM instances.
-- **Backend Stack**: Python 3.11+, FastAPI, SQLModel / SQLAlchemy 2.0, Alembic, Celery, Nomad.
+- **Backend Stack**: Python 3.11+, FastAPI, SQLModel / SQLAlchemy 2.0, Alembic, Celery.
 - **Frontend Stack**: TypeScript, React, PNPM Workspaces, Oxlint, Prettier.
 - **Agent Documentation**: See [`SEP/AGENTS.md`](SEP/AGENTS.md).
 
@@ -32,11 +32,11 @@ All three are **git submodules**. After cloning, run `git submodule update --ini
 A SEP "app" is one package under `SEP/app/sep/apps/<name>/` exporting a single `TaskExecutionApp` object; the framework **derives** its whole HTTP surface from that object's knobs, and activation is a `MODULE_NAME` entry under `SEP.APPS` in `SEP/settings.yaml`. Scaffold new apps with `make startapp` — **never copy an existing app**, they all carry deprecated Jinja2 `routes.py` wiring. Authoritative reference: [`SEP/docs/development/app-developer-guide.md`](SEP/docs/development/app-developer-guide.md); start from [`notes/sep-apps-how-to-write-one.md`](notes/sep-apps-how-to-write-one.md).
 
 ### **Workspace Docs & Notes**
-For how the whole system fits together — both products, all four local stacks, the data
-flows, with diagrams — read [`docs/topology.md`](docs/topology.md);
-[`docs/containers.md`](docs/containers.md) has the same thing at container/network level
-(real names, addresses, the `psmdb-link` alias), and unfamiliar terms are in
-[`docs/glossary.md`](docs/glossary.md). Those explain *architecture*.
+For how the whole system fits together — both products, every local stack, the data
+flows, with diagrams — read [`docs/topology.md`](docs/topology.md); its Part 10 has the
+container/network level detail (real names, addresses, the shared `pmm_default` network),
+and unfamiliar terms are in [`docs/glossary.md`](docs/glossary.md). Those explain
+*architecture*.
 
 Cross-repo working notes that neither repo's own docs cover live in [`notes/`](notes/) — see [`notes/README.md`](notes/README.md) for the index. Consult them when a task spans both repos; update the relevant note (and its "As of" date) when you learn something that changes it.
 

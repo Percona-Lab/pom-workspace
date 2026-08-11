@@ -1,24 +1,17 @@
-"""Discover the MongoDB nodes of a PSMDB sandbox environment.
+"""Discover the MongoDB nodes of a PSMDB cluster.
 
 Shared by the ``tools/`` scripts that need to address every mongod/mongos of an
 environment. Kept separate so there is one definition of "what counts as a node"
-and one place to fix it when a sandbox changes its container naming.
+and one place to fix it when the stack changes its container naming.
 
-The workspace runs **two** sandboxes and this covers both, because they describe
-themselves in completely different ways:
+The clusters come from ``psmdb/compose.yaml`` — ``./om start sharded-cluster``.
+One container per node (mongod/mongos + pbm-agent + pmm-agent together), **no
+published ports**, and every fact declared as an environment variable: ``ROLE``,
+``MONGO_PORT``, ``REPLSET``, ``CLUSTER_ROLE``, ``RS_MEMBERS``.
 
-* ``psmdb/compose.yaml`` — ``./om start sharded-cluster``. One container per
-  node (mongod/mongos + pbm-agent + pmm-agent together), **no published ports**,
-  and every fact declared as an environment variable: ``ROLE``, ``MONGO_PORT``,
-  ``REPLSET``, ``CLUSTER_ROLE``, ``RS_MEMBERS``.
-* ``mongo_terraform_ansible`` — ``./om start sandbox``. Sidecar pmm-clients,
-  randomised published ports, and the replica set name in a ``replsetName``
-  container label. Nothing declares the role, so it is inferred from the label
-  and the port.
-
-An environment is addressed by the prefix all of its containers share: a compose
-profile name (``sharded-cluster``) for the former, the sandbox's ``name_prefix``
-(``omtest1``) for the latter. ``environments()`` lists what is running.
+An environment is addressed by the prefix all of its containers share, which is
+the compose profile name (``sharded-cluster``). ``environments()`` lists what is
+running.
 """
 
 from __future__ import annotations
@@ -31,9 +24,7 @@ import subprocess
 MONGO_PORTS = {"27017", "27018", "27019"}
 
 #: Sidecars and infrastructure deployed under the same environment prefix.
-NOT_MONGO = re.compile(
-    r"pmm-client|pbm-agent|pbm-cli|pmm-server|minio|ycsb|renderer|watchtower|ldap"
-)
+NOT_MONGO = re.compile(r"pbm-agent|pbm-cli|pmm-server|minio")
 
 #: Arbiter containers, named ``<cluster>-shard00arb0`` / ``<rs>-arb0``.
 ARBITER = re.compile(r"arb\d*$")
@@ -41,12 +32,7 @@ ARBITER = re.compile(r"arb\d*$")
 #: Compose project name of psmdb/compose.yaml (its ``name:`` key).
 PSMDB_PROJECT = "psmdb-sandbox"
 
-#: Network the Terraform sandbox creates per environment, ``<prefix>-<suffix>``.
-TERRAFORM_NETWORK = re.compile(r"^(.+)-mongo-terraform$")
-
-#: Credentials to assume when the containers do not declare their own. The
-#: Terraform sandbox bakes its root user into Ansible instead of the container
-#: environment, so there is nothing to read there.
+#: Credentials to assume when the containers do not declare their own.
 FALLBACK_CREDENTIALS = ("root", "percona")
 
 #: One line of compact JSON per container. Everything the discovery needs comes
@@ -121,7 +107,7 @@ def _arbiter(name: str, env: dict[str, str]) -> bool:
     """Whether this node is an arbiter.
 
     ``RS_MEMBERS`` marks them explicitly (``<host>:<port>:arbiter``); the name
-    pattern is the fallback for the Terraform sandbox, which declares nothing.
+    pattern is the fallback for a node that does not declare its members.
     """
     for member in (env.get("RS_MEMBERS") or "").split(","):
         if member.split(":")[0] == name:
@@ -129,35 +115,26 @@ def _arbiter(name: str, env: dict[str, str]) -> bool:
     return bool(ARBITER.search(name))
 
 
-def _role(env: dict[str, str], internal: str, rs: str, arbiter: bool) -> str:
+def _role(env: dict[str, str], rs: str, arbiter: bool) -> str:
     """Classify a node: mongos, arbiter, config, shard, replica or standalone."""
-    if env.get("ROLE"):
-        # psmdb/compose.yaml states all of this outright.
-        if env["ROLE"] == "mongos":
-            return "mongos"
-        if arbiter:
-            return "arbiter"
-        if env.get("CLUSTER_ROLE") == "configsvr":
-            return "config"
-        if env.get("CLUSTER_ROLE") == "shardsvr":
-            return "shard"
-        # A replica set member outside a sharded cluster, or no replication at
-        # all -- the two topologies the Terraform sandbox cannot produce.
-        return "replica" if rs else "standalone"
-    # Terraform sandbox: its mongos containers are the only ones without a
-    # replsetName label, and config servers are the ones on 27019.
-    if not rs:
+    # psmdb/compose.yaml states all of this outright.
+    if env.get("ROLE") == "mongos":
         return "mongos"
     if arbiter:
         return "arbiter"
-    return "config" if internal == "27019" else "shard"
+    if env.get("CLUSTER_ROLE") == "configsvr":
+        return "config"
+    if env.get("CLUSTER_ROLE") == "shardsvr":
+        return "shard"
+    # A replica set member outside a sharded cluster, or no replication at all.
+    return "replica" if rs else "standalone"
 
 
 def discover(prefix: str) -> list[dict]:
     """Return the running mongod/mongos containers of an environment.
 
     :param prefix: Environment prefix — a compose profile name such as
-        ``sharded-cluster``, or a Terraform sandbox prefix such as ``omtest1``.
+        ``sharded-cluster``.
     :return: One dict per node, sorted by container name, with keys:
         ``name``, ``internal`` (the port mongod/mongos listens on),
         ``host_port`` (published port, ``None`` when nothing is published),
@@ -187,7 +164,7 @@ def discover(prefix: str) -> list[dict]:
             "rs": rs,
             "ip": _address(rec),
             "arbiter": arbiter,
-            "role": _role(env, internal, rs, arbiter),
+            "role": _role(env, rs, arbiter),
             "env": env,
         })
     return nodes
@@ -209,7 +186,7 @@ def credentials(nodes: list[dict]) -> tuple[str, str]:
 
 
 def environments() -> list[str]:
-    """Return the prefixes of every sandbox environment currently running."""
+    """Return the prefixes of every PSMDB cluster currently running."""
     found = set()
 
     listing = docker("ps", "--filter", f"label=com.docker.compose.project={PSMDB_PROJECT}",
@@ -220,12 +197,5 @@ def environments() -> list[str]:
         # the trailing role component of the container name gives the same answer
         # and covers a node that predates the label.
         found.add(_environ(rec).get("PMM_CLUSTER") or name.rsplit("-", 1)[0])
-
-    for network in docker("network", "ls", "--format", "{{.Name}}").splitlines():
-        m = TERRAFORM_NETWORK.match(network)
-        # The network outlives a destroyed environment, so require members --
-        # otherwise every environment ever deployed is reported as running.
-        if m and docker("network", "inspect", network, "-f", "{{len .Containers}}") not in ("", "0"):
-            found.add(m.group(1))
 
     return sorted(found)
