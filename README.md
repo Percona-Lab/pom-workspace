@@ -463,7 +463,8 @@ repositories. Recommended extensions and the format-on-save rules are in
 | [`docs/glossary.md`](docs/glossary.md) | VictoriaMetrics, `raw_exec`, syncers, and the rest |
 | [`psmdb/README.md`](psmdb/README.md) | The database nodes, the upgrade loop, bootstrap ordering |
 | [`CLAUDE.md`](CLAUDE.md) | Conventions and command reference for AI agents in this workspace |
-| `pmm/AGENTS.md`, `SEP/AGENTS.md` | Per-repo guides, maintained upstream |
+| `pmm/AGENTS.md` | PMM's own agent guide, maintained upstream |
+| [`docs/sep-agents.md`](docs/sep-agents.md) | The SEP agent guide, kept here — SEP upstream has none |
 
 `notes/` and `todo/` are personal working state and are deliberately untracked — they are
 absent on a fresh clone, so the two links to `notes/` above will dangle there. `docs/` is

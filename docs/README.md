@@ -22,7 +22,8 @@ host ports, what runs inside each container, and who talks to whom.
 | `docs/` (here) | **Explanation.** How the system works and why it is shaped that way. Stable — changes when the architecture changes. |
 | [`../notes/`](../notes/) | **Working notes.** Task-shaped observations that span both repos: how to get a dev setup running, how to write a SEP app, the state of the unmerged integration branch. Dated, and expected to go stale. |
 | [`../CLAUDE.md`](../CLAUDE.md) | **Agent instructions.** Conventions and command reference for AI agents in this workspace. |
-| `pmm/AGENTS.md`, `SEP/AGENTS.md` | **Per-repo guides.** Authoritative for their own repository, maintained upstream. |
+| `pmm/AGENTS.md` | **PMM's own guide.** Authoritative for that repository, maintained upstream. |
+| `sep-agents.md` | **The SEP agent guide.** Kept here rather than in the submodule: SEP upstream has no such file, so in `SEP/` it was untracked and unshared. |
 
 Rule of thumb: if it is true regardless of what you are doing today, it belongs here. If
 it is "here is what I found while trying to get X working", it belongs in `notes/`.
