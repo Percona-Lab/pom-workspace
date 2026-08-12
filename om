@@ -7,8 +7,9 @@
 # PSMDB clusters from psmdb/compose.yaml.
 #
 #   ./om setup              one-time bootstrap (idempotent, safe to re-run)
-#   ./om start [comp...]    start components (default: all)
-#   ./om stop [comp...]     stop components
+#   ./om start [comp...]    start components (no args: all, plus the clusters
+#                           that were up when you last ran a bare ./om stop)
+#   ./om stop [comp...]     stop components (no args: all, clusters included)
 #   ./om restart [comp...]  stop then start
 #   ./om status             what is running, and on which ports
 #   ./om logs <comp> [-f]   show logs
@@ -57,9 +58,15 @@
 #             standalone, replicaset-single, replicaset-cluster, sharded-cluster
 #             (psmdb/compose.yaml; each needs pmm running first)
 # Groups:     sep (= sep-backend + sep-frontend), clusters (= all four PSMDB
-#             topologies, also spelled psmdb), all (default; excludes the
-#             clusters, which are opt-in)
+#             topologies, also spelled psmdb), all
 #
+# With NO components, start and stop act on the whole machine and remember each
+# other: `./om stop` notes which clusters were up and takes them down with the
+# rest, and the next `./om start` brings that same set back. Naming components
+# explicitly does exactly what it says and leaves the memory alone.
+#
+#   ./om stop                               everything down, clusters remembered
+#   ./om start                              everything back, same clusters
 #   ./om start pmm sep replicaset-cluster   a full stack with a 3-node replica set
 #   ./om stop replicaset-cluster            containers down, data volumes kept
 
@@ -101,6 +108,12 @@ SEP_FRONTEND_PORT=5174
 # compose fail obscurely.
 PSMDB_DIR="$ROOT/psmdb"
 PSMDB_PROFILES=(standalone replicaset-single replicaset-cluster sharded-cluster)
+
+# Remembers which cluster profiles were up when `./om stop` last ran with no
+# arguments, so the matching bare `./om start` brings the same set back. Lives in
+# .om/ beside logs/ and pids/, which is already gitignored: it is state about this
+# machine, not about the workspace.
+PSMDB_LAST_UP_FILE="$STATE_DIR/psmdb-last-up"
 PSMDB_IMAGE="openmanager/psmdb-node:7.0"
 PSMDB_NETWORK=pmm_default
 
@@ -700,6 +713,38 @@ psmdb_compose() { ( cd "$PSMDB_DIR" && docker compose "$@" ); }
 # way if you add a topology.
 psmdb_running() {
   docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^$1-" || true
+}
+
+# Every cluster profile with at least one container up, in PSMDB_PROFILES order.
+psmdb_up_profiles() {
+  local p
+  for p in "${PSMDB_PROFILES[@]}"; do
+    [[ "$(psmdb_running "$p")" -gt 0 ]] && printf '%s\n' "$p"
+  done
+  return 0
+}
+
+# Writes that set down, so a later bare `./om start` can restore it. Called only by
+# the argument-less `./om stop`: an explicit `./om stop sharded-cluster` is a
+# statement about one profile, not about what the machine should look like next
+# time, and must not overwrite the memory.
+psmdb_remember_up() {
+  mkdir -p "$(dirname "$PSMDB_LAST_UP_FILE")"
+  psmdb_up_profiles > "$PSMDB_LAST_UP_FILE"
+}
+
+# Reads it back, dropping anything that is no longer a known profile -- a stale
+# entry from a renamed topology should be ignored, not passed to Compose.
+psmdb_remembered() {
+  [[ -f "$PSMDB_LAST_UP_FILE" ]] || return 0
+  local line p
+  while read -r line; do
+    [[ -n "$line" ]] || continue
+    for p in "${PSMDB_PROFILES[@]}"; do
+      [[ "$line" == "$p" ]] && printf '%s\n' "$line" && break
+    done
+  done < "$PSMDB_LAST_UP_FILE"
+  return 0
 }
 
 # The node image is ~1.6 GB and takes a few minutes: build it once, on demand,
@@ -1541,7 +1586,18 @@ expand_components() {
   done
 }
 
+# `./om start` and `./om stop` with no arguments act on the whole machine, clusters
+# included, and the clusters they act on are the ones that were up last time. Naming
+# components explicitly bypasses all of that and means exactly what it says.
 cmd_start() {
+  if [[ $# -eq 0 ]]; then
+    local remembered=() line
+    while read -r line; do [[ -n "$line" ]] && remembered+=("$line"); done < <(psmdb_remembered)
+    if [[ ${#remembered[@]} -gt 0 ]]; then
+      dim "clusters from the last ./om stop: ${remembered[*]}"
+      set -- pmm sep-backend sep-frontend "${remembered[@]}"
+    fi
+  fi
   expand_components "$@"
   local c
   for c in "${COMPONENTS[@]}"; do
@@ -1557,6 +1613,14 @@ cmd_start() {
 }
 
 cmd_stop() {
+  if [[ $# -eq 0 ]]; then
+    # Record before stopping anything: afterwards there is nothing left to look at.
+    psmdb_remember_up
+    local running=() line
+    while read -r line; do [[ -n "$line" ]] && running+=("$line"); done < <(psmdb_remembered)
+    [[ ${#running[@]} -gt 0 ]] && dim "clusters to restore on the next ./om start: ${running[*]}"
+    set -- pmm sep-backend sep-frontend "${running[@]}"
+  fi
   expand_components "$@"
   # Reverse order so dependents go down before what they depend on.
   local comps=() i
