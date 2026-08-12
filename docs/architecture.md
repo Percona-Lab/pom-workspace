@@ -42,6 +42,7 @@ flowchart LR
     POM -->|"inventory"| PG
     POM -->|"PromQL"| VM
     POM -.->|"GET /facts<br/>pull, ~ms"| DISC
+    UI -.->|"/api/apps/pom_discovery/runs<br/>Discovery page only"| DISC
     DISC --> SPG
     DISC -->|"Nomad job per host"| NODES
     NODES -->|"exporters"| VM
@@ -54,7 +55,9 @@ metrics in VictoriaMetrics. Reading them from anywhere else meant reading a loss
 **SEP owns work on the host.** Anything needing a process on a database node: the facts
 no metric carries today, and the actions — upgrade, restart, config change — tomorrow.
 
-**They meet at one HTTP contract**, which PMM pulls.
+**They meet at one HTTP contract.** pmm-managed pulls the facts a sweep produced; the
+Discovery page calls the same app directly for the sweep history, because that history is
+SEP's and nothing proxies it.
 
 ## The collection
 
@@ -132,8 +135,8 @@ the only key the consumer can join on.
 | `GET /v1/pom/topology` | pmm-managed | the document |
 | `GET /v1/pom/discovery/runs[/{id}]` | pmm-managed | collection history |
 | `POST /v1/pom/discovery/runs` | pmm-managed | recollect now (409 if one is in flight) |
-| `GET /api/apps/pom_discovery/facts` | SEP | the last sweep's facts |
-| `GET/POST /api/apps/pom_discovery/runs` | SEP | sweep history / queue one |
+| `GET /api/apps/pom_discovery/facts` | SEP | the last sweep's facts — pulled by pmm-managed |
+| `GET/POST /api/apps/pom_discovery/runs` | SEP | sweep history / queue one (202; 409 if one is in flight) — called by the browser |
 
 `/v1/pom` is authorised by the Grafana session (`viewer`), via two entries in
 `grafana/auth_server.go` — `/v1/pom` for REST and `/pom.` for native gRPC.
@@ -143,13 +146,27 @@ consumer appends its own `/api/apps/<module>` path.
 
 ## The UI
 
-A PMM page at **`/pmm-ui/pom`** — *not* under `/sep`, and not wrapped in `SepPage`. That
-wrapper holds children behind a SEP token exchange and fails closed, which would blank a
-page whose every byte comes from pmm-managed. `PomPage` keeps the PMM-admin check and
-drops the gate; the old path redirects.
+A PMM page at **`/pmm-ui/pom`** — *not* under `/sep`; the old path redirects. Three
+routes, each answering a different question:
 
-The plugin (`ui/packages/plugins/pom/`) talks to `/v1/pom` with a plain same-origin
-`fetch` and has **no SEP dependency**.
+| Route | Reads | Shows |
+| --- | --- | --- |
+| `/pom` | `GET /v1/pom/topology` | a table per environment, a row per cluster, unfolding to its services |
+| `/pom/topology` | the same document | one row per service, every field the snapshot stores |
+| `/pom/runs` | `GET/POST /api/apps/pom_discovery/runs` | SEP's sweeps, and a button that queues one |
+
+The first two are wrapped in `PomPage`, *not* `SepPage`: that wrapper holds children
+behind a SEP token exchange and fails closed, which would blank pages whose every byte
+comes from pmm-managed. `PomPage` keeps the PMM-admin check and drops the gate. They
+talk to `/v1/pom` with a plain same-origin `fetch`.
+
+**Discovery is the exception**, and the only place the browser talks to SEP. The sweeps
+are SEP's — pmm-managed pulls their facts but does not proxy their history — so the page
+asks the app itself, through `@sep/api` with a minted bearer. It is therefore mounted on
+its own route inside `SepPage`, so the gate covers that page and nothing else: SEP being
+down costs Discovery and leaves the rest of POM working. `PomApp` deliberately does not
+declare `runs`; a static segment outranks its splat, and two mounts would leave an
+ungated copy on the same path.
 
 ## Reaching it
 
