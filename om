@@ -14,8 +14,9 @@
 #   ./om logs <comp> [-f]   show logs
 #   ./om build pmm          compile the PMM working tree into the running server
 #   ./om build ui           rebuild pmm/ui and deploy it into the running server
-#                           (./om start pmm does this automatically when the
-#                           container is serving the image's stale bundle)
+#                           (./om start pmm rebuilds both automatically when the
+#                           container is serving the image's stale binary/bundle,
+#                           which a container recreate always leaves it doing)
 #   ./om pom [sub]          POM in PMM: topology documents (see below)
 #   ./om discovery [sub]    POM discovery in SEP: on-host facts (see below)
 #   ./om sep-api <app> <p>  call any SEP app's API
@@ -83,6 +84,8 @@ PMM_WORKDIR=/root/go/src/github.com/percona/pmm
 # That prebuilt bundle predates the SEP-in-PMM work, so the two SEP apps are
 # absent until the working tree is built over it — see ensure_pmm_ui.
 PMM_UI_DIR=/usr/share/pmm-ui
+# Records which working-tree build the container is running; see ensure_pmm_managed.
+PMM_MANAGED_STAMP=/usr/sbin/.pmm-managed.om-stamp
 # A string that only the working tree's router emits (lib/constants.ts ::
 # SEP_MYSQL_BACKUPS_PATH). Its presence in the deployed bundle is the cheap
 # "is this our UI, with the SEP apps?" probe.
@@ -518,6 +521,66 @@ ensure_pmm_ui() {
   fi
 }
 
+# Fingerprints the Go sources pmm-managed is built from: HEAD, plus the content of
+# any uncommitted change under managed/ or api/. Content, not just filenames, so a
+# second edit to the same file is still noticed.
+pmm_tree_fingerprint() {
+  # In a subshell that has actually cd'd: `git -C` moves git's directory but not the
+  # shell's, so `cat` would look for the listed paths under the workspace root and
+  # quietly find nothing -- which silently drops every new file from the fingerprint.
+  (
+    cd "$PMM_DIR" 2>/dev/null || exit 0
+    git rev-parse HEAD 2>/dev/null || echo nohead
+    git diff HEAD -- managed api 2>/dev/null || true
+    git ls-files --others --exclude-standard -- managed api 2>/dev/null | xargs -r cat || true
+  ) | sha1sum | cut -c1-16
+}
+
+# Rebuilds pmm-managed from the working tree when the container is not already
+# running that build.
+#
+# This exists because a container recreate silently undoes `./om build pmm`. The
+# image ships its own /usr/sbin/pmm-managed, `make run-managed-ci` installs the
+# working tree's over it, and `make env-up` throws that away with the container --
+# taking every route the tree adds with it. The symptom is a healthy gateway
+# answering "endpoint not found" for an endpoint you know you wrote.
+#
+# The stamp sits next to the binary rather than in /srv on purpose: /srv is a volume
+# and survives the recreate, so a stamp there would claim a build that is gone.
+ensure_pmm_managed() {
+  local force="${1:-0}"
+  if [[ "${OM_PMM_MANAGED:-1}" == "0" ]]; then
+    dim "pmm-managed: skipped (OM_PMM_MANAGED=0) — running the image's binary"
+    return 0
+  fi
+
+  local want; want="$(pmm_tree_fingerprint)"
+  local have
+  have="$(docker exec -i --user root "$PMM_CONTAINER" cat "$PMM_MANAGED_STAMP" 2>/dev/null || true)"
+  if [[ "$force" != "1" && -n "$have" && "$have" == "$want" ]]; then
+    ok "pmm-managed: working tree build already deployed"
+    return 0
+  fi
+
+  info "pmm-managed: compiling the working tree over the image's binary (a minute or two)"
+  local log; log="$(log_file pmm-managed-build)"
+  mkdir -p "$LOG_DIR"
+  # As root: the module cache under /root/go is not writable by the default user, and
+  # go refuses to build a repo git calls "dubious ownership" without this exception.
+  docker exec -i --user root "$PMM_CONTAINER" \
+    git config --global --add safe.directory "$PMM_WORKDIR" >/dev/null 2>&1 || true
+  if docker exec -i --user root --workdir="$PMM_WORKDIR" "$PMM_CONTAINER" \
+       make run-managed-ci >"$log" 2>&1; then
+    docker exec -i --user root "$PMM_CONTAINER" \
+      sh -c "printf '%s' '$want' > '$PMM_MANAGED_STAMP'" >/dev/null 2>&1 || true
+    ok "pmm-managed: deployed from the working tree"
+  else
+    warn "pmm-managed: build failed — left at the image's binary, so routes your tree adds will 404"
+    dim "log: $log"
+    tail -n 15 "$log" >&2 || true
+  fi
+}
+
 start_pmm() {
   info "pmm: devcontainer (from repo)"
   [[ -f "$PMM_DIR/.env" ]] || die "pmm/.env missing — run ./om setup first"
@@ -531,6 +594,7 @@ start_pmm() {
   make -C "$PMM_DIR" env-up
   ok "pmm-server up — https://localhost:$PMM_HTTPS_PORT (admin/admin)"
   dim "running the image's binaries; './om build pmm' compiles your working tree"
+  ensure_pmm_managed
   ensure_pmm_ui
 }
 
@@ -787,7 +851,16 @@ cmd_build() {
   # `run-all` chains the *-ci targets, which rebuild each Go service and restart
   # it under supervisorctl WITHOUT tailing logs. The bare `run-managed` target
   # tails forever and would hang a script. No -t: there is no TTY here.
-  docker exec -i --workdir="$PMM_WORKDIR" "$PMM_CONTAINER" make run-all
+  #
+  # As root, for the same two reasons ensure_pmm_managed is: the module cache under
+  # /root/go is not writable by the default user, and git refuses the repo without
+  # the safe.directory exception.
+  docker exec -i --user root "$PMM_CONTAINER" \
+    git config --global --add safe.directory "$PMM_WORKDIR" >/dev/null 2>&1 || true
+  docker exec -i --user root --workdir="$PMM_WORKDIR" "$PMM_CONTAINER" make run-all
+  # Stamp it so `./om start pmm` does not immediately rebuild what was just built.
+  docker exec -i --user root "$PMM_CONTAINER" \
+    sh -c "printf '%s' '$(pmm_tree_fingerprint)' > '$PMM_MANAGED_STAMP'" >/dev/null 2>&1 || true
   ok "pmm-managed, pmm-agent, qan-api2 and vmproxy rebuilt from your tree"
 }
 
