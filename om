@@ -747,6 +747,43 @@ psmdb_remembered() {
   return 0
 }
 
+# The root credentials every node is bootstrapped with, read from compose.yaml so a
+# change there does not leave om printing a URI that cannot log in.
+psmdb_credentials() {
+  local user pass
+  user="$(sed -n 's/^ *MONGO_ROOT_USER: *//p' "$PSMDB_DIR/compose.yaml" | head -1)"
+  pass="$(sed -n 's/^ *MONGO_ROOT_PASSWORD: *//p' "$PSMDB_DIR/compose.yaml" | head -1)"
+  printf '%s:%s' "${user:-root}" "${pass:-root-password}"
+}
+
+# The MongoDB URI for one running profile.
+#
+# Seeds come from the running containers rather than a table, for the reason
+# psmdb_running gives: the profile name is the container-name prefix, so nothing can
+# drift out of sync with compose.yaml. A sharded cluster is addressed through its
+# routers, so only the mongos nodes are seeds -- the config servers (27019) and shard
+# members (27018) are not where a client connects.
+#
+# Both replica-set profiles name their set after the profile, so ?replicaSet= is the
+# profile name. A standalone and a mongos take no such parameter.
+psmdb_uri() {
+  local profile="$1" filter="^$1-" seeds
+  [[ "$profile" == sharded-cluster ]] && filter="^$1-mongos"
+  seeds="$(docker ps --format '{{.Names}}' 2>/dev/null | grep "$filter" | sort \
+           | sed 's/$/:27017/' | paste -sd, -)"
+  [[ -n "$seeds" ]] || return 1
+  local params="authSource=admin"
+  [[ "$profile" == replicaset-* ]] && params="replicaSet=$profile&$params"
+  printf 'mongodb://%s@%s/?%s' "$(psmdb_credentials)" "$seeds" "$params"
+}
+
+# The first running container of a profile, for the docker exec hint.
+psmdb_first_node() {
+  local filter="^$1-"
+  [[ "$1" == sharded-cluster ]] && filter="^$1-mongos"
+  docker ps --format '{{.Names}}' 2>/dev/null | grep "$filter" | sort | head -1
+}
+
 # The node image is ~1.6 GB and takes a few minutes: build it once, on demand,
 # rather than making every user remember a separate step.
 ensure_psmdb_image() {
@@ -1165,6 +1202,8 @@ cmd_status() {
       up="$(psmdb_running "$p")"
       if [[ "${up:-0}" -gt 0 ]]; then
         status_line "$p" 0 "${up}/${expected} container(s) up"
+        local uri
+        uri="$(psmdb_uri "$p")" && dim "$uri"
       else
         status_line "$p" 1 "stopped"
       fi
@@ -1174,6 +1213,13 @@ cmd_status() {
   echo
   dim "logs: ./om logs <pmm|sep-backend|sep-frontend|<cluster>> [-f]"
   dim "urls: ./om urls [comp...] — the same list for stopped components too"
+  if [[ -d "$PSMDB_DIR" ]] && [[ -n "$(psmdb_up_profiles)" ]]; then
+    # Said once rather than per cluster: the URIs above are for something already on
+    # PMM's network -- SEP, a payload, another container. The nodes publish nothing to
+    # the host, so from here it is docker exec, and each node carries its own URI.
+    dim "URIs resolve on PMM's docker network; nothing is published to the host"
+    dim "from here:  docker exec -it <node> sh -c 'mongosh \"\$(cat /root/.mongodb_uri)\"'"
+  fi
 }
 
 cmd_logs() {
