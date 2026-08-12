@@ -543,7 +543,9 @@ host. `pom_discovery` is that half:
    serves) via the pre-seeded system `run-python` task, and collect NDJSON back over the
    task-log chunk store rather than the 16 KB result file;
 4. store the facts, keyed by **PMM's service UUID** — the only key the consumer can join
-   on — as one JSONB array on the sweep's row in `pom_discovery_run`;
+   on — as a JSONB array on the sweep's row in `pom_discovery_run`, beside a second array
+   holding one record per mapped service: its executor host, how that host was matched,
+   whether it answered, and how long the host's dispatch took;
 5. serve them at `GET /api/apps/pom_discovery/facts`, which **never probes**: it answers
    from the last completed sweep and reports its age.
 

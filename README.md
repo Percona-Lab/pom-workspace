@@ -267,7 +267,7 @@ cd psmdb && docker compose --profile replicaset-cluster down -v   # wipe data to
 
 **Nothing is published to the host** — deliberately, since PMM already contends for 8443
 and 9000. Reach a node with `docker exec`; `/root/.mongodb_uri` inside each container holds
-its credentials, and is the same file SEP's `backup_mongo` and `pom_worker` payloads read:
+its credentials, and is the same file SEP's `backup_mongo` and `pom_discovery` payloads read:
 
 ```bash
 docker exec -it replicaset-cluster-node00 sh -c 'mongosh "$(cat /root/.mongodb_uri)"'
@@ -290,27 +290,39 @@ SEP up and at least one cluster registered. Nothing here needs compiling — but
 is part of PMM's UI bundle, so if the sidebar has no SEP apps, run `./om build ui` once
 (§10 has the symptom).
 
-`pom_worker` (`SEP/app/sep/apps/pom_worker`) discovers the MongoDB estate from three
-sources — SEP's inventory, PMM's VictoriaMetrics, and a probe dispatched to each node —
-merges them by declared per-field precedence, and stores one
-`environments -> clusters -> services` topology document per run.
+POM is split across both products. **pmm-managed** derives the topology document —
+`environments -> clusters -> services` — from PMM's own inventory and VictoriaMetrics, in
+about a tenth of a second. **SEP's `pom_discovery` app** (`SEP/app/sep/apps/pom_discovery`)
+does the half that needs a process on a database host: it sweeps the estate over Nomad
+every 10 minutes for the facts no metric carries — the installed binary version above all
+— and PMM pulls them. So there is a command group per side.
 
 ```bash
 ./om start pmm                  # 1. PMM first, always
 ./om start clusters             # 2. all four topologies (or name one)
 ./om start sep                  # 3. SEP backend
-./om pom sync                   # 4. pull PMM's inventory into SEP
-./om pom run                    # 5. run discovery, then show the result
+./om discovery sync             # 4. pull PMM's inventory into SEP
+./om discovery run              # 5. sweep the hosts for on-host facts
 ./om pom topology               # 6. the topology document, flattened
 ```
 
 Step 4 matters and is easy to skip: SEP holds its own copy of PMM's inventory, and a
-cluster started after the last sync is invisible to discovery until you refresh it.
-Everything in a run would then come back orphaned.
+cluster started after the last sync is invisible to the sweep until you refresh it.
+Every service would then come back orphaned — mapped to no executor host.
 
-In the browser the same snapshot is at
-**https://localhost:8443/pmm-ui/sep/pom** — one table over the whole estate, with
-environment and cluster as the leading columns.
+Step 5 is the only slow one: a sweep dispatches a Nomad job per host and takes tens of
+seconds. Step 6 never waits for it — the document is served from what the last completed
+sweep stored.
+
+In the browser it is at **https://localhost:8443/pmm-ui/pom**, three pages under
+*PSMDB OpenManager*:
+
+- **Overview** — a table per environment, a row per cluster; unfold a cluster for its
+  services.
+- **Topology** — one row per service, with every field the snapshot stores.
+- **Discovery** — SEP's sweeps and a button to run one; unfold a sweep for a row per
+  service, showing where it was probed, whether it answered, how long its host took, and
+  every fact it returned.
 
 Two conventions in the output are worth knowing before you read it as a fault:
 
@@ -321,20 +333,30 @@ Two conventions in the output are worth knowing before you read it as a fault:
   not apply.** A router and a standalone have no replica set and no oplog at all, which is
   a different statement from "we could not measure it".
 
-The rest of the inspector, every subcommand defaulting to the most recent run:
+The rest of the inspector, every subcommand defaulting to the most recent run. One group
+per side of the split — `pom` is PMM's document, `discovery` is SEP's sweeps:
 
 ```bash
-./om pom                # overview: status, counts, resolved services
-./om pom topology-raw   # the document as stored JSON — pipe it to jq
-./om pom nodes          # the service -> executor mapping, orphans included
-./om pom probe          # per-node probe JSON
-./om pom tasks          # dispatched probe task runs and their status
-./om pom runs           # run history, newest first
-./om pom token          # bearer token for SEP's /api/docs Authorize button, and for curl
+./om pom                # overview: the document, plus a row per service
+./om pom topology       # the document, flattened
+./om pom raw            # the document as stored JSON — pipe it to jq
+./om pom runs           # collection history, newest first
+./om pom run            # rebuild the document now
+./om pom sql | api      # pmm-managed's tables (pom_runs, pom_snapshots) / /v1/pom
+
+./om discovery          # the last sweep: age, counts, what it found
+./om discovery facts    # the facts it stored, per service
+./om discovery runs     # sweep history, newest first
+./om discovery run      # queue a sweep (tens of seconds)
+./om discovery sync     # refresh SEP's copy of PMM's inventory
+./om discovery sql | api  # SEP's table (pom_discovery_run) / the app's API
+./om discovery token    # bearer token for SEP's /api/docs Authorize button, and for curl
 ```
 
-The API behind all of it is `GET /api/apps/pom_api/topology`, plus
-`/discovery/runs` for the history and the trigger.
+The APIs behind all of it, one per side: `GET /v1/pom/topology` from pmm-managed
+(authorised by the Grafana session), and `GET/POST /api/apps/pom_discovery/runs` plus
+`/facts` from SEP. [`docs/architecture.md`](docs/architecture.md) has the full surface and
+who calls what.
 
 ---
 
