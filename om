@@ -25,6 +25,8 @@
 #                           agents joined into one document. Views: tree
 #                           (default), nodes, services, agents, raw
 #   ./om urls [comp...]     every URI a component serves (vmui, Swagger, ...)
+#   ./om hosts [--write]    /etc/hosts entries so the cluster URIs resolve here
+#                           (prints by default; --write needs sudo, --remove undoes)
 #   ./om ports              what each stack publishes onto the host
 #   ./om doctor             check prerequisites only
 #
@@ -784,6 +786,89 @@ psmdb_first_node() {
   docker ps --format '{{.Names}}' 2>/dev/null | grep "$filter" | sort | head -1
 }
 
+# ---------------------------------------------------------------------------
+# hosts — make the cluster names resolve on this machine
+# ---------------------------------------------------------------------------
+#
+# With these in /etc/hosts the network URIs from `./om status` work from the host
+# as-is, replica sets included: the driver resolves the seed, asks the set for its
+# members, and resolves those too. That is the part directConnection=true has to
+# skip.
+#
+# The catch is that container IPs are not stable. Docker hands out the next free
+# address, so one `./om restart standalone` moved a node from .4 to .8 here -- and
+# .4 can later belong to a different node, which turns a stale entry into a URI
+# that quietly reaches the wrong database. Hence: regenerated from live containers
+# on every run, written as one replaceable block, never appended to.
+
+HOSTS_FILE=/etc/hosts
+HOSTS_BEGIN="# >>> om psmdb >>>"
+HOSTS_END="# <<< om psmdb <<<"
+
+psmdb_hosts_block() {
+  local pattern name ip
+  pattern="^($(IFS='|'; printf '%s' "${PSMDB_PROFILES[*]}"))-"
+  printf '%s\n' "$HOSTS_BEGIN"
+  printf '# %s — regenerate with ./om hosts --write after any cluster restart\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  while read -r name; do
+    [[ -n "$name" ]] || continue
+    ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$name" 2>/dev/null)"
+    [[ -n "$ip" ]] && printf '%-15s %s\n' "$ip" "$name"
+  done < <(docker ps --format '{{.Names}}' 2>/dev/null | grep -E "$pattern" | sort)
+  printf '%s\n' "$HOSTS_END"
+}
+
+# True when /etc/hosts carries a block that no longer matches the running containers.
+psmdb_hosts_stale() {
+  grep -q "^$HOSTS_BEGIN\$" "$HOSTS_FILE" 2>/dev/null || return 1
+  local current live
+  current="$(sed -n "/^$HOSTS_BEGIN\$/,/^$HOSTS_END\$/p" "$HOSTS_FILE" | grep -vE '^#')"
+  live="$(psmdb_hosts_block | grep -vE '^#')"
+  [[ "$current" != "$live" ]]
+}
+
+cmd_hosts() {
+  local mode="${1:-print}"
+  case "$mode" in
+    print|--print|-p)
+      local body; body="$(psmdb_hosts_block)"
+      if [[ "$(printf '%s' "$body" | grep -cE '^[0-9]')" -eq 0 ]]; then
+        warn "no cluster containers are running — start one first"
+        return 0
+      fi
+      info "Add this to $HOSTS_FILE (needs sudo), or run: ./om hosts --write"
+      printf '%s\n' "$body"
+      psmdb_hosts_stale && warn "the block already in $HOSTS_FILE is out of date"
+      return 0
+      ;;
+    --write|write|-w) ;;
+    --remove|remove|-r) ;;
+    *) die "usage: ./om hosts [--write|--remove]   (default: print)" ;;
+  esac
+
+  [[ -w "$HOSTS_FILE" ]] || info "editing $HOSTS_FILE needs sudo — you may be prompted"
+  # Kept: the file is system state, and a bad edit here breaks name resolution for
+  # everything, not just this workspace.
+  sudo cp -n "$HOSTS_FILE" "$HOSTS_FILE.om.bak" 2>/dev/null || true
+  # Always drop the old block before writing, so repeated runs replace rather than
+  # stack up stale addresses.
+  sudo sed -i "/^$HOSTS_BEGIN\$/,/^$HOSTS_END\$/d" "$HOSTS_FILE" \
+    || die "could not edit $HOSTS_FILE"
+
+  case "$mode" in
+    --remove|remove|-r)
+      ok "removed the om block from $HOSTS_FILE"
+      return 0
+      ;;
+  esac
+
+  psmdb_hosts_block | sudo tee -a "$HOSTS_FILE" >/dev/null \
+    || die "could not write to $HOSTS_FILE"
+  ok "wrote $(psmdb_hosts_block | grep -cE '^[0-9]') entr(y|ies) to $HOSTS_FILE"
+  dim "the network URIs from ./om status now work from this machine"
+  dim "re-run after restarting a cluster; ./om hosts --remove takes them out again"
+}
+
 # The node image is ~1.6 GB and takes a few minutes: build it once, on demand,
 # rather than making every user remember a separate step.
 ensure_psmdb_image() {
@@ -1227,7 +1312,8 @@ cmd_status() {
     # routable from the host, but only with directConnection=true -- without it the
     # driver asks the set for its members, gets those same container names back, and
     # fails on them instead.
-    dim "the first is for SEP, a payload, another container — its names do not resolve here"
+    dim "the first is for SEP, a payload, another container — its names do not resolve"
+    dim "here unless you add them:  ./om hosts [--write]"
     dim "for a GUI client:  docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' <node>"
     dim "                   then mongodb://root:root-password@<ip>:27017/?authSource=admin&directConnection=true"
   fi
@@ -1718,6 +1804,7 @@ main() {
     sep-api) cmd_sep_api "$@" ;;
     ports)   cmd_ports ;;
     urls|uris) cmd_urls "$@" ;;
+    hosts)   cmd_hosts "$@" ;;
     inventory) cmd_inventory "$@" ;;
     doctor)  cmd_doctor ;;
     ""|-h|--help|help) usage ;;
