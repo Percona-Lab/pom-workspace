@@ -1,12 +1,12 @@
 # How OpenManager Fits Together
 
-**As of:** 2026-08-10
+**As of:** 2026-08-12
 **Derived from:** `pmm/` @ `sep-combined-local` (`v3.8.1-185-g5adae2f50` = PMM-15216 +
 PMM-15293 + PMM-15238; `docker-compose.dev.yml`, `.env`,
 `build/ansible/roles/{supervisord,nginx}/files/*`, `managed/services/supervisord/*`,
 `ui/apps/pmm/*`), `SEP/` @ `psmdb-openmanager` (`6f89d1a3`) (`app/main.py`,
 `settings.yaml`, `app/tasks/execution/**`, `app/sep/sync/syncers/pmm.py`,
-`app/sep/apps/{pom_worker,pom_api}/**`), the [`psmdb/`](../psmdb/) cluster stack
+`app/sep/apps/pom_discovery/**`), the [`psmdb/`](../psmdb/) cluster stack
 (`compose.yaml`, `Dockerfile`, `scripts/*`), plus the workspace's own [`om`](../om). Live
 state cross-checked against a running stack (`./om status`, `docker ps`,
 `GET /nomad/v1/nodes`).
@@ -16,8 +16,15 @@ will know what is running and why. Parts 3 onward add detail, one layer at a tim
 name in *italics* the first time it appears is explained in
 [`glossary.md`](glossary.md).
 
-> **What changed since the previous revision (2026-08-03)** — four things, and they are
-> all structural:
+> **What changed since 2026-08-10** — one thing, and it is structural: **POM was split
+> across the two products.** Deriving the MongoDB topology moved into pmm-managed, which
+> already owns both inputs; SEP kept only the work that needs a process on a database
+> host, as the `pom_discovery` app. `pom_worker` and `pom_api` were deleted. The whole of
+> it is in [`architecture.md`](architecture.md); this doc carries the parts that touch the
+> rest of the system.
+
+> **What changed in the 2026-08-10 revision (from 2026-08-03)** — four things, and they
+> are all structural:
 > 1. There is a **new local database stack**, [`psmdb/`](../psmdb/): four MongoDB
 >    topologies as Compose profiles, one container per node, joining PMM's network.
 > 2. **The executor moved onto the database hosts.** PMM's *embedded* Nomad server is the
@@ -224,9 +231,9 @@ flowchart TB
 11 containers for the sharded cluster — one per node, no sidecars.
 
 **The `cluster` column is not cosmetic.** SEP's inventory has no cluster *entity*, only a
-cluster *string* per service, set by `pmm-admin add mongodb --cluster=`. `pom_worker`
-groups a run's services into cluster documents by matching that string, so members of one
-topology must share it or the topology silently fragments.
+cluster *string* per service, set by `pmm-admin add mongodb --cluster=`. POM groups
+services into clusters by matching that string (falling back to the replica set), so
+members of one topology must share it or the topology silently fragments.
 
 ## Facts that shape it
 
@@ -238,7 +245,7 @@ topology must share it or the topology silently fragments.
   8443. Reach a node with `docker exec`.
 - **Readiness means registered, not started.** `./om start <profile>` waits until every
   node has `/root/.mongodb_uri` — the credentials file both `backup_mongo` and
-  `pom_worker`'s probe payload read by default. A node whose `pmm-agent` has not connected is not yet a
+  `pom_discovery`'s probe payload read by default. A node whose `pmm-agent` has not connected is not yet a
   usable execution host.
 - **Bootstrap runs *on* a node**, because MongoDB's localhost exception is the only way to
   create the first user under keyfile auth, and it really is localhost-only. One member
@@ -335,7 +342,7 @@ gets you the whole product, and why the URL path decides which program answers:
 | `/pmm-ui`, `/` | static files | the React frontend from `pmm/ui` — which now contains the SEP UI |
 | `/v1/` | pmm-managed `:7772` | the main REST API — inventory, settings, backups |
 | `/v1/qan` | qan-api2 `:9922` | query analytics API |
-| `/prometheus/api/v1`, `/victoriametrics/` | vmproxy `:8430` | metric queries, filtered per user — and the `/import/prometheus` write SEP's `pom_worker` uses |
+| `/prometheus/api/v1`, `/victoriametrics/` | vmproxy `:8430` | metric queries, filtered per user — POM's PromQL among them; `/import/prometheus` is the write path |
 | `/prometheus/rules`, `/prometheus/alerts` | vmalert `:8880` | rule and alert state |
 | `/nomad/` | nomad server `:4646` | **on**, via `PMM_ENABLE_NOMAD=1` — this is SEP's executor endpoint |
 | `/api`, `/sep_app`, `/files`, `/stream-logs`, `/execution-events` | `host.docker.internal:8000` | **SEP**, running natively on the host. `auth_request off`, dev only |
@@ -389,7 +396,7 @@ flowchart LR
     VM --> GRAF["Grafana / PMM UI"]
     CH --> GRAF
     VM --> VMA["vmalert"]
-    SEPX["SEP pom_worker<br/>POST /prometheus/api/v1/import/prometheus"] -.->|"third, minor path"| VM
+    VM -.->|"PromQL, read-only"| POM["pmm-managed services/pom<br/>derives the MongoDB topology"]
 ```
 
 - **Metrics** — numbers over time. `vmagent` scrapes the exporters and pushes into
@@ -398,9 +405,11 @@ flowchart LR
   pmm-agent, relayed through pmm-managed to qan-api2, stored in ClickHouse. ClickHouse is
   a *column store*, which is the right shape for "group millions of queries by
   fingerprint"; VictoriaMetrics would be the wrong tool, and vice versa.
-- **A third, minor path**: SEP can *write* to VictoriaMetrics directly. `pom_worker` posts
-  Prometheus text exposition to `/prometheus/api/v1/import/prometheus` with the PMM
-  credentials it already holds — see Part 5.
+- **A third reader**: POM queries VictoriaMetrics from inside pmm-managed to derive the
+  MongoDB topology — see [`architecture.md`](architecture.md). It only reads. SEP *can*
+  write to VM directly (`/prometheus/api/v1/import/prometheus` with the PMM credentials it
+  holds), and the `.prom` textfile route the backup payloads use is the other write path,
+  but nothing in POM uses either today.
 
 ## How agents connect
 
@@ -518,9 +527,14 @@ needs no code**. The React shell fetches `/api/apps/<name>/schema` and renders t
 from it, so a brand-new app appears in the sidebar with no rebuild. Only the `base`
 flavor (`custom_ui=True`) needs a real React component.
 
-**`pom_worker`** — not a UI app at all: `sidebar=False`, no router, registered only so its
-Celery task is discoverable. It is the clearest example of the new execution shape, so the
-whole pipeline is worth stating:
+**`pom_discovery`** — not a UI app at all: `sidebar=False`, no page, registered so its
+Celery task is discoverable and it can be switched off. It is the clearest example of the
+current execution shape, and of the split that shape now serves.
+
+POM's *derivation* lives in pmm-managed, not here — it reads PMM's own inventory and
+VictoriaMetrics, and reconstructing the MongoDB topology is a gap in PMM rather than a
+SEP feature. What is left in SEP is the half that genuinely needs a process on a database
+host. `pom_discovery` is that half:
 
 1. list MongoDB services from SEP's inventory;
 2. resolve each to the executor host its probe must run on — strictly, so an unmatched
@@ -528,56 +542,34 @@ whole pipeline is worth stating:
 3. dispatch the probe payload **once per executor host** (carrying every service that host
    serves) via the pre-seeded system `run-python` task, and collect NDJSON back over the
    task-log chunk store rather than the 16 KB result file;
-4. **read the same estate back out of VictoriaMetrics** — identity, versions, vendor and
-   edition, replica-set state and endpoint, reachability, CPU and free connections,
-   replication lag and the oplog window, all declared as a catalog of signals rather than
-   hardcoded queries. This is the source with real coverage: the probe reaches only
-   services whose Nomad `raw_exec` executor is healthy, where this reaches every service
-   PMM monitors;
-5. merge all three sources by declared per-field precedence, keeping the source and
-   observation time on every field;
-6. fold the result into **one topology document** — `environments -> clusters ->
-   services` — and store it whole in `pom_snapshot`, alongside the per-service mapping
-   and probe rows in `pom_node`;
-7. optionally emit a VictoriaMetrics summary — `EMIT_METRICS`, plus `EMIT_RAW_JSON` for
-   eyeballing a run in vmui.
+4. store the facts, keyed by **PMM's service UUID** — the only key the consumer can join
+   on — as one JSONB array on the sweep's row in `pom_discovery_run`;
+5. serve them at `GET /api/apps/pom_discovery/facts`, which **never probes**: it answers
+   from the last completed sweep and reports its age.
 
-`pom_worker` reads its `credentials_path` from the `/root/.mongodb_uri` that
+That last point is the load-bearing one. A sweep dispatches Nomad jobs and takes tens of
+seconds; pmm-managed assembles its document in about a tenth of a second and pulls these
+facts on the way. The endpoint being a stored-row read is what keeps the two apart. The
+sweep runs on its own 10-minute clock.
+
+What the probe contributes is what no metric carries: the **installed** binary version as
+against the running one — their divergence is the upgraded-but-not-restarted case — plus
+the config path, the command line, the git version and the OS pair.
+
+`pom_discovery` reads its `credentials_path` from the `/root/.mongodb_uri` that
 `register.sh` writes, the same file `backup_mongo` uses.
 
-The document is the deliverable, and two of its conventions are load-bearing rather
-than cosmetic. `cpu_usage_percent` and `connections_free_percent` are **-1 when not
-measured** — never null, never 0, because zero CPU is a real reading. `state`,
-`replication_lag_seconds` and `oplog_window_seconds` are **null when they do not apply**:
-a router and a standalone have no replica set and no oplog at all, which is a different
-statement from "we could not measure it".
+It also carries the executor-mapping and Nomad fan-out machinery (`mapping.py`,
+`dispatch.py`, `payload/`), inherited when `pom_worker` was retired. The upgrade and
+restart apps will want exactly those, so expect them to move to a shared home once there
+is a second caller.
 
-`process_role` (`mongod` / `mongos` / `configsvr` / `shardsvr`) is *derived*, not guessed:
-`mongodb_mongos_sharding_shards_total` is emitted only by a router, and the exporter's
-`cl_role` names config and shard servers. An earlier version inferred it from the port
-number.
+> `pom_worker` and `pom_api` — the earlier, SEP-only POM — were **deleted on 2026-08-12**
+> once the pmm-managed implementation held parity. Their tables (`pom_run`, `pom_node`,
+> `pom_snapshot`) went with them.
 
-**`pom_api`** — the read side, `custom_ui=True`, serving that document whole at
-`GET /api/apps/pom_api/topology` for a bespoke PMM page, plus the discovery run history
-and trigger under `/discovery/runs`. It declares `requires_apps=("pom_worker",)`, so
-disabling the worker gates the API rather than leaving it serving an ageing snapshot
-behind a trigger nothing will run.
-
-Step 7 carries three measured constraints worth knowing before you copy it: a metric value
-is a float64 so the result JSON can only be a *label*; a label value is capped at **4096
-bytes and exceeding it is silent** (the push returns 204 and drops the sample), which is
-why the full result lives in Postgres; and a pushed sample is invisible for ~30s
-(`-search.latencyOffset`), so an immediate read-back returning nothing is not a failure.
-Emission never fails the job.
-
-Step 4 has two traps of its own, both measured. **`service_name` is not a key** — every
-re-registration mints a fresh PMM service UUID while reusing the name, and the superseded
-series survive until retention expires, so 38 names in this workspace resolve to 206
-`service_id` values; queries join on inventory's `external_id`, which holds that UUID.
-And **sample age is not what it looks like**: `last_over_time` stamps its result at the
-evaluation time, and `timestamp(last_over_time(...))` reports that same evaluation time
-rounded to the step, so it calls a series scraped days ago "seconds old". MetricsQL's
-`lag()` is the one that returns the real age.
+The full picture, including the document's conventions and the traps behind them, is in
+[`architecture.md`](architecture.md).
 
 To write an app, start with [`../notes/sep-apps-how-to-write-one.md`](../notes/sep-apps-how-to-write-one.md).
 Scaffold with `make startapp` and never copy an existing app — the in-tree ones carry
@@ -594,7 +586,7 @@ the cross-repo one, and the whole reason these two repos share a workspace.
 ## Celery — the background clock
 
 *Celery* runs the scheduled work: syncers, periodic maintenance, and jobs like
-`pom_worker`'s discovery pass. One trap worth knowing up front: on a fresh checkout the backend **will
+`pom_discovery`'s probe sweep. One trap worth knowing up front: on a fresh checkout the backend **will
 not start** until Celery's beat scheduler has created its own tables once. `./om setup`
 does that for you; the reasoning is in
 [`../notes/sep-dev-quickstart.md`](../notes/sep-dev-quickstart.md) §3.3b.
@@ -848,7 +840,7 @@ As configured by this workspace's `pmm/.env` and `om`:
 | vmagent | VictoriaMetrics | metrics push |
 | SEP `PMMSyncer` | PMM `/v1/inventory` | REST + Bearer service account token |
 | SEP tasks app | PMM `/nomad` on `:8443` | REST over HTTPS, credentials in the URL — register, dispatch, poll, stream logs |
-| SEP `pom_worker` | PMM `/prometheus/api/v1/import/prometheus` | Prometheus text exposition, PMM credentials |
+| pmm-managed `services/pom` | SEP `/api/apps/pom_discovery/facts` | REST + Bearer, pulls on-host facts; `PMM_SEP_URL` |
 | SEP (all three services + beat) | PMM's embedded PostgreSQL `:5432` | database `sep`, role `sep` |
 | SEP core app | Grafana in pmm-server | validates a `pmm_session` cookie, maps the org role |
 | PMM nginx | SEP `:8000` | proxies `/api`, `/sep_app`, `/files`, `/stream-logs`, `/execution-events` via `host.docker.internal` |
@@ -873,7 +865,7 @@ As configured by this workspace's `pmm/.env` and `om`:
 | `SEP/settings.yaml` | apps, syncers, and the `development` block that points SEP at PMM's Postgres and Nomad |
 | `SEP/app/api/routes/oauth.py` | `/session/exchange` — the PMM session → SEP bearer swap |
 | `SEP/app/sep/sync/syncers/pmm.py` | the SEP→PMM inventory pull |
-| `SEP/app/sep/apps/pom_worker/{service,dispatch,metrics}.py` | the current end-to-end execution example |
+| `SEP/app/sep/apps/pom_discovery/{service,dispatch,mapping}.py` | the current end-to-end execution example |
 | `SEP/app/tasks/execution/executors/nomad/models.py` | job register, dispatch, log streaming |
 
 ## Known drift
