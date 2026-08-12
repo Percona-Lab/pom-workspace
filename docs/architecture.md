@@ -118,7 +118,7 @@ refresh on the sweep's own schedule.
 | --- | --- | --- |
 | `pmm-managed` DB — `pom_runs` | pmm-managed | one row per collection: counts, per-source verdict, errors |
 | `pmm-managed` DB — `pom_snapshots` | pmm-managed | the topology document as JSONB, one per run, `ON DELETE CASCADE` |
-| `sep` DB — `pom_discovery_run` | SEP | one row per sweep, its facts as a JSONB array |
+| `sep` DB — `pom_discovery_run` | SEP | one row per sweep: its facts, and a record per mapped service (host, resolution, answered, host duration), both JSONB |
 | VictoriaMetrics | PMM | the exporter series POM reads; **POM writes nothing** |
 
 Both tables are pruned on write (100 runs / 50 sweeps), so neither grows unbounded. The
@@ -137,6 +137,7 @@ the only key the consumer can join on.
 | `POST /v1/pom/discovery/runs` | pmm-managed | recollect now (409 if one is in flight) |
 | `GET /api/apps/pom_discovery/facts` | SEP | the last sweep's facts — pulled by pmm-managed |
 | `GET/POST /api/apps/pom_discovery/runs` | SEP | sweep history / queue one (202; 409 if one is in flight) — called by the browser |
+| `GET /api/apps/pom_discovery/runs/{id}` | SEP | one sweep with its per-service records and its facts; the list carries neither |
 
 `/v1/pom` is authorised by the Grafana session (`viewer`), via two entries in
 `grafana/auth_server.go` — `/v1/pom` for REST and `/pom.` for native gRPC.
@@ -153,7 +154,7 @@ routes, each answering a different question:
 | --- | --- | --- |
 | `/pom` | `GET /v1/pom/topology` | a table per environment, a row per cluster, unfolding to its services |
 | `/pom/topology` | the same document | one row per service, every field the snapshot stores |
-| `/pom/runs` | `GET/POST /api/apps/pom_discovery/runs` | SEP's sweeps, and a button that queues one |
+| `/pom/runs` | `GET/POST /api/apps/pom_discovery/runs`, `GET .../runs/{id}` on unfold | SEP's sweeps, a button that queues one, and per sweep a row per service: where it was probed, whether it answered, how long its host took, and every fact it returned |
 
 The first two are wrapped in `PomPage`, *not* `SepPage`: that wrapper holds children
 behind a SEP token exchange and fails closed, which would blank pages whose every byte
