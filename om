@@ -1202,8 +1202,16 @@ cmd_status() {
       up="$(psmdb_running "$p")"
       if [[ "${up:-0}" -gt 0 ]]; then
         status_line "$p" 0 "${up}/${expected} container(s) up"
-        local uri
-        uri="$(psmdb_uri "$p")" && dim "$uri"
+        local uri node
+        if uri="$(psmdb_uri "$p")"; then
+          # Labelled, because the two are not interchangeable and the first one does
+          # not work from a terminal on this machine -- which is exactly the mistake
+          # an unlabelled connection string invites.
+          dim "on pmm's network  $uri"
+          node="$(psmdb_first_node "$p")"
+          [[ -n "$node" ]] && \
+            dim "from this host    docker exec -it $node sh -c 'mongosh \"\$(cat /root/.mongodb_uri)\"'"
+        fi
       else
         status_line "$p" 1 "stopped"
       fi
@@ -1214,11 +1222,14 @@ cmd_status() {
   dim "logs: ./om logs <pmm|sep-backend|sep-frontend|<cluster>> [-f]"
   dim "urls: ./om urls [comp...] — the same list for stopped components too"
   if [[ -d "$PSMDB_DIR" ]] && [[ -n "$(psmdb_up_profiles)" ]]; then
-    # Said once rather than per cluster: the URIs above are for something already on
-    # PMM's network -- SEP, a payload, another container. The nodes publish nothing to
-    # the host, so from here it is docker exec, and each node carries its own URI.
-    dim "URIs resolve on PMM's docker network; nothing is published to the host"
-    dim "from here:  docker exec -it <node> sh -c 'mongosh \"\$(cat /root/.mongodb_uri)\"'"
+    # The network URIs name containers, which only resolve inside the network. A GUI
+    # client on this machine can still reach one node directly: container IPs are
+    # routable from the host, but only with directConnection=true -- without it the
+    # driver asks the set for its members, gets those same container names back, and
+    # fails on them instead.
+    dim "the first is for SEP, a payload, another container — its names do not resolve here"
+    dim "for a GUI client:  docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' <node>"
+    dim "                   then mongodb://root:root-password@<ip>:27017/?authSource=admin&directConnection=true"
   fi
 }
 
