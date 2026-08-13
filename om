@@ -79,6 +79,48 @@ SEP_DIR="$ROOT/SEP"
 PMM_DIR="$ROOT/pmm"
 HARNESS_DIR="$ROOT/harness"
 STATE_DIR="$ROOT/.om"
+
+# SEP's own settings.yaml deep-merged with this workspace's development overrides,
+# written to harness/ and handed to SEP as SETTINGS_FILE (PreEnvSettings reads it,
+# app/core/config.py). That keeps the SEP checkout at upstream's file, so its branch
+# carries POM code alone, exactly as harness/pmm.conf does for pmm.
+#
+# Rendered from SEP's current settings.yaml on every run rather than snapshotted, so
+# an upstream change to any setting this workspace does not override is picked up
+# instead of silently pinned.
+#
+# Exported for every child process: uvicorn, celery, alembic and the ad-hoc python
+# below all construct settings, and they must all read the same file.
+SEP_SETTINGS="$HARNESS_DIR/sep-settings.yaml"
+export SETTINGS_FILE="$SEP_SETTINGS"
+
+render_sep_settings() {
+  local src="$SEP_DIR/settings.yaml" overlay="$HARNESS_DIR/sep-settings-overlay.yaml"
+  [[ -f "$src" ]] || return 0          # no submodule yet: nothing to render, not an error
+  [[ -f "$overlay" ]] || die "SEP settings overlay missing at $overlay"
+  python3 - "$src" "$overlay" "$SEP_SETTINGS" <<'PY' || die "rendering $SEP_SETTINGS failed"
+import sys, yaml
+
+def merge(base, over):
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            merge(base[key], value)
+        else:
+            # An explicit null overwrites rather than being skipped: that is how the
+            # overlay drops an auth provider the default block merged in.
+            base[key] = value
+    return base
+
+src, overlay, out = sys.argv[1:4]
+with open(src) as fh:
+    data = yaml.safe_load(fh)
+with open(overlay) as fh:
+    data = merge(data, yaml.safe_load(fh))
+with open(out + ".tmp", "w") as fh:
+    yaml.safe_dump(data, fh, sort_keys=False, default_flow_style=False)
+PY
+  mv "$SEP_SETTINGS.tmp" "$SEP_SETTINGS"
+}
 PID_DIR="$STATE_DIR/pids"
 LOG_DIR="$STATE_DIR/logs"
 
@@ -1831,6 +1873,10 @@ usage() { sed -n '3,/^$/p' "${BASH_SOURCE[0]}" | sed "s/^# \{0,1\}//"; }
 
 main() {
   local cmd="${1:-}"; shift || true
+  # Before anything, so every command works from one rendered file. Cheap, and it
+  # has to happen here rather than in start_sep_backend: migrations, the beat
+  # bootstrap and the inventory sync all build settings in their own processes.
+  render_sep_settings
   case "$cmd" in
     setup)   cmd_setup "$@" ;;
     start)   cmd_start "$@" ;;

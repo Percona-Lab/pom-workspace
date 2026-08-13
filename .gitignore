@@ -27,3 +27,4 @@ mongo_terraform_ansible/
 
 # Rendered by ./om start pmm from pmm.conf + harness/sep-locations.conf.
 harness/pmm.conf
+harness/sep-settings.yaml
