@@ -1,0 +1,28 @@
+# Ready-to-use ci.yml for a PMM feature build carrying POM.
+#
+# Copy this over ci.yml in a branch of Percona-Lab/pmm-submodules, commit, push, and
+# open a draft PR. Pushing to a feature branch is what triggers the Jenkins build.
+# https://github.com/Percona-Lab/pmm-submodules#how-to-create-a-feature-build
+#
+# `url` is the line that makes a fork work. Without it the build takes percona/pmm,
+# whatever branch name you give. The README documents it, and .gitmodules confirms the
+# dependency for the main repo is named `pmm`.
+#
+# One entry is enough. PMM-15333-pom-poc is forked off PMM-15293-sep-session-exchange
+# and measures 39 commits ahead of percona/pmm main with nothing behind it, so it
+# already carries the whole SEP-integration chain -- PMM-15216 and PMM-15293 are both
+# ancestors of it -- as well as POM's pmm-managed service and dashboard.
+#
+# SEP is deliberately absent: it is not a pmm-submodules dependency and no PMM build
+# can produce it. Its image is built separately (`make image-sidecar-embedded` in the
+# SEP checkout) and paired with this one at run time by sidecar/pmm-fb/compose.yaml.
+#
+# NOTE ON ACCESS: the branch has to live in Percona-Lab/pmm-submodules itself. Every
+# one of the last 15 feature-build PRs has its head branch there and none comes from a
+# fork, and this account currently has pull-only permission on that repo. The fork
+# support above is for the *dependencies*, not for pmm-submodules. So this needs write
+# access, or a colleague to push the branch.
+deps:
+  - name: pmm
+    url: https://github.com/plebioda/pmm
+    branch: PMM-15333-pom-poc
