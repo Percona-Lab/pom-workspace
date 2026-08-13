@@ -6,7 +6,7 @@
 # container. This script only has to make the process startable.
 #
 # Contract (compose sets these):
-#   ROLE           mongod | mongos
+#   ROLE           mongod | mongos | client
 #   MONGO_PORT     27017 shard/standalone · 27018 shardsvr · 27019 configsvr
 #   REPLSET        replica set name; empty means standalone (no replication)
 #   CLUSTER_ROLE   configsvr | shardsvr | empty
@@ -94,6 +94,17 @@ write_mongos_conf() {
     } > "$MONGOS_CONF"
     log "mongos.conf: port=${MONGO_PORT} configDB=${CONFIG_DB}"
 }
+
+# ROLE=client is a host with a PMM client and nothing else, from the WITH_PSMDB=0
+# build of this image. There is no server to configure, no keyfile to install
+# (nothing here joins a replica set), and no mongod user to chown to - that user
+# arrives with percona-server-mongodb-server, which this build does not carry.
+# So hand straight over to supervisord, which will find only pmm-agent and
+# register-client.sh in its conf.d.
+if [ "$ROLE" = "client" ]; then
+    log "pmm-client-only host: no database to configure"
+    exec "$@"
+fi
 
 install_keyfile
 if [ "$ROLE" = "mongos" ]; then

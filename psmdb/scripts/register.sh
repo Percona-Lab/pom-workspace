@@ -18,6 +18,11 @@
 #                            pom_worker's probe payload, both default here).
 #                            $HOME is /root because the Nomad client inherits
 #                            pmm-agent's user, which is root in this container.
+#
+# Last thing it does is publish $READY_MARKER, the one signal `./om start` waits
+# on for every node in the sandbox. register-client.sh publishes the same marker
+# on a host that has no database, so om never has to ask what kind of node it is
+# looking at.
 
 set -o errexit
 set -o nounset
@@ -29,8 +34,13 @@ MONGO_ROOT_USER="${MONGO_ROOT_USER:-root}"
 MONGO_ROOT_PASSWORD="${MONGO_ROOT_PASSWORD:-root-password}"
 REPLSET="${REPLSET:-}"
 ROLE="${ROLE:-mongod}"
+# See register-client.sh: /run rather than /root, because it is a fact about the
+# running container and must not outlive it.
+READY_MARKER="${READY_MARKER:-/run/om-node-ready}"
 
 log() { printf '[register] %s\n' "$*" >&2; }
+
+mark_ready() { : > "$READY_MARKER"; }
 
 # Wait for the local server to answer. On a replica-set member this succeeds
 # before rs.initiate(), which is fine — pmm-admin only needs to connect.
@@ -65,6 +75,7 @@ done
 
 if pmm-admin list 2>/dev/null | grep -q "MongoDB[[:space:]]\+${PMM_SERVICE_NAME}\b"; then
     log "${PMM_SERVICE_NAME} already registered"
+    mark_ready
     exit 0
 fi
 
@@ -85,4 +96,5 @@ pmm-admin add mongodb \
     --port="$MONGO_PORT" \
     "${extra[@]}" >&2
 
+mark_ready
 log "registered ${PMM_SERVICE_NAME} in cluster ${PMM_CLUSTER}"

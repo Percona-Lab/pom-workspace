@@ -230,6 +230,15 @@ flowchart TB
 
 11 containers for the sharded cluster — one per node, no sidecars.
 
+There is a fifth profile, `pmm-client`, which is not a topology: three unrelated hosts
+carrying a PMM client and **no database** - same Dockerfile built with `WITH_PSMDB=0`, so
+no `mongod`, no `pbm-agent`, not even the PSMDB packages. The Nomad client rides inside
+pmm-agent rather than inside mongod, so they are still full SEP execution hosts: a place
+for a payload with no database to talk to, and the *before* state of provisioning one
+(the Percona apt repos are enabled on them, just unused). They export no service, so they
+have no `cluster` string and no `/root/.mongodb_uri`. Started individually -
+`./om start pmm-client-node01` - because each node carries its own compose profile too.
+
 **The `cluster` column is not cosmetic.** SEP's inventory has no cluster *entity*, only a
 cluster *string* per service, set by `pmm-admin add mongodb --cluster=`. POM groups
 services into clusters by matching that string (falling back to the replica set), so

@@ -56,8 +56,10 @@
 #   ./om discovery api <p>  any /api/apps/pom_discovery path
 #   ./om discovery token    bearer token for /api/docs Authorize and for curl
 #
-# Components: pmm, sep-backend, sep-frontend, and the PSMDB clusters:
+# Components: pmm, sep-backend, sep-frontend, the PSMDB clusters:
 #             standalone, replicaset-single, replicaset-cluster, sharded-cluster
+#             and pmm-client - hosts carrying a PMM client and no database at
+#             all, spawned one at a time as pmm-client-node00 .. node02
 #             (psmdb/compose.yaml; each needs pmm running first)
 # Groups:     sep (= sep-backend + sep-frontend), clusters (= all four PSMDB
 #             topologies, also spelled psmdb), all
@@ -71,6 +73,7 @@
 #   ./om start                              everything back, same clusters
 #   ./om start pmm sep replicaset-cluster   a full stack with a 3-node replica set
 #   ./om stop replicaset-cluster            containers down, data volumes kept
+#   ./om start pmm-client-node00            one bare host, no database on it
 
 set -euo pipefail
 
@@ -161,6 +164,26 @@ PSMDB_PROFILES=(standalone replicaset-single replicaset-cluster sharded-cluster)
 PSMDB_LAST_UP_FILE="$STATE_DIR/psmdb-last-up"
 PSMDB_IMAGE="openmanager/psmdb-node:7.0"
 PSMDB_NETWORK=pmm_default
+
+# Hosts with a PMM client and nothing else - no mongod, no pbm-agent, none of the
+# PSMDB packages. Same Dockerfile as the database nodes, built WITH_PSMDB=0, so
+# they still carry pmm-agent and the Nomad client it brings: PMM lists them as
+# nodes and SEP will dispatch to them. That makes them the place to develop a
+# payload with no database to talk to, and the starting point for one that
+# installs a database (the psmdb apt repos are enabled on them, just unused).
+#
+# One compose profile for the pool plus a private profile per node, so
+# `./om start pmm-client` brings up all of them and `./om start pmm-client-node01`
+# brings up exactly one. CLIENT_NODES must match the number of services declared
+# in psmdb/compose.yaml.
+CLIENT_PROFILE=pmm-client
+CLIENT_IMAGE="openmanager/pmm-client-node:3"
+CLIENT_NODES=3
+
+# Everything that is a sandbox node container, database-bearing or not: what the
+# /etc/hosts block covers, what a bare `./om stop` remembers, and what `./om start`
+# with no arguments brings back.
+NODE_PROFILES=("${PSMDB_PROFILES[@]}" "$CLIENT_PROFILE")
 
 NODE_MIN="22.22.0"
 PNPM_PIN="11.1.3"
@@ -782,27 +805,32 @@ start_sep_frontend() {
 }
 
 # ---------------------------------------------------------------------------
-# PSMDB clusters
+# Sandbox nodes - the PSMDB clusters, and the database-less hosts beside them
 # ---------------------------------------------------------------------------
 
 psmdb_compose() { ( cd "$PSMDB_DIR" && docker compose "$@" ); }
 
 # Containers currently up for a profile. Every service is named
 # <profile>-<role><n> — standalone-node00, replicaset-cluster-node01,
-# sharded-cluster-shard00svr0 — so the profile name *is* the prefix and no
-# lookup table can drift out of sync with compose.yaml.
+# sharded-cluster-shard00svr0, pmm-client-node02 - so the profile name *is* the
+# prefix and no lookup table can drift out of sync with compose.yaml.
+#
+# The alternative `$` branch is for a client node's private profile, where the
+# profile name is the whole container name rather than a prefix of several
+# (pmm-client-node01). It is what makes `./om start pmm-client-node01` count and
+# wait for its one node instead of finding none.
 #
 # One ordering trap this creates: "replicaset-single" is not a prefix of
 # "replicaset-cluster" and vice versa, so the counts stay disjoint. Keep it that
 # way if you add a topology.
 psmdb_running() {
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^$1-" || true
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -cE "^$1(-|\$)" || true
 }
 
-# Every cluster profile with at least one container up, in PSMDB_PROFILES order.
+# Every node profile with at least one container up, in NODE_PROFILES order.
 psmdb_up_profiles() {
   local p
-  for p in "${PSMDB_PROFILES[@]}"; do
+  for p in "${NODE_PROFILES[@]}"; do
     [[ "$(psmdb_running "$p")" -gt 0 ]] && printf '%s\n' "$p"
   done
   return 0
@@ -812,6 +840,10 @@ psmdb_up_profiles() {
 # the argument-less `./om stop`: an explicit `./om stop sharded-cluster` is a
 # statement about one profile, not about what the machine should look like next
 # time, and must not overwrite the memory.
+#
+# Records the pool profile for the client hosts, not the individual nodes, so a
+# machine left with one client host up comes back with all of them. Restoring the
+# exact set is not worth a second state file for hosts this cheap.
 psmdb_remember_up() {
   mkdir -p "$(dirname "$PSMDB_LAST_UP_FILE")"
   psmdb_up_profiles > "$PSMDB_LAST_UP_FILE"
@@ -824,11 +856,30 @@ psmdb_remembered() {
   local line p
   while read -r line; do
     [[ -n "$line" ]] || continue
-    for p in "${PSMDB_PROFILES[@]}"; do
+    for p in "${NODE_PROFILES[@]}"; do
       [[ "$line" == "$p" ]] && printf '%s\n' "$line" && break
     done
   done < "$PSMDB_LAST_UP_FILE"
   return 0
+}
+
+# True when the argument names one of the declared client nodes. Generated from
+# CLIENT_NODES rather than matched with a glob so `./om start pmm-client-node07`
+# is rejected here, with the list of what exists, instead of reaching compose -
+# which answers an unknown profile by starting nothing and saying nothing.
+client_node_name() {
+  local n
+  for (( n = 0; n < CLIENT_NODES; n++ )); do
+    [[ "$1" == "$(printf '%s-node%02d' "$CLIENT_PROFILE" "$n")" ]] && return 0
+  done
+  return 1
+}
+
+client_node_names() {
+  local n
+  for (( n = 0; n < CLIENT_NODES; n++ )); do
+    printf '%s-node%02d\n' "$CLIENT_PROFILE" "$n"
+  done
 }
 
 # The root credentials every node is bootstrapped with, read from compose.yaml so a
@@ -889,7 +940,7 @@ HOSTS_END="# <<< om psmdb <<<"
 
 psmdb_hosts_block() {
   local pattern name ip
-  pattern="^($(IFS='|'; printf '%s' "${PSMDB_PROFILES[*]}"))-"
+  pattern="^($(IFS='|'; printf '%s' "${NODE_PROFILES[*]}"))-"
   printf '%s\n' "$HOSTS_BEGIN"
   printf '# %s — regenerate with ./om hosts --write after any cluster restart\n' "$(date '+%Y-%m-%d %H:%M:%S')"
   while read -r name; do
@@ -953,11 +1004,18 @@ cmd_hosts() {
 
 # The node image is ~1.6 GB and takes a few minutes: build it once, on demand,
 # rather than making every user remember a separate step.
-ensure_psmdb_image() {
-  docker image inspect "$PSMDB_IMAGE" >/dev/null 2>&1 && return 0
-  info "psmdb: building $PSMDB_IMAGE (first time only, a few minutes)"
-  ( cd "$PSMDB_DIR" && docker build -t "$PSMDB_IMAGE" . ) \
-    || die "failed to build $PSMDB_IMAGE"
+#
+# Two images come out of the one psmdb/Dockerfile, selected by --build-arg, so a
+# workspace that only ever starts client hosts never builds the database one and
+# vice versa. Both are cached on the tag alone: change the Dockerfile or anything
+# under psmdb/scripts and you must rebuild by hand, since an existing tag is
+# taken at face value here.
+ensure_node_image() {
+  local image="$1"; shift
+  docker image inspect "$image" >/dev/null 2>&1 && return 0
+  info "psmdb: building $image (first time only, a few minutes)"
+  ( cd "$PSMDB_DIR" && docker build "$@" -t "$image" . ) \
+    || die "failed to build $image"
   ok "image built"
 }
 
@@ -999,7 +1057,7 @@ psmdb_stale_network() {
   return 1
 }
 
-start_psmdb() {
+start_sandbox_node() {
   local profile="$1"
   [[ -d "$PSMDB_DIR" ]] || die "psmdb/ not found at $PSMDB_DIR"
 
@@ -1009,8 +1067,16 @@ start_psmdb() {
   docker network inspect "$PSMDB_NETWORK" >/dev/null 2>&1 \
     || die "network $PSMDB_NETWORK missing — run './om start pmm' first"
 
-  ensure_psmdb_image
-  [[ -f "$PSMDB_DIR/secrets/keyfile" ]] || ( cd "$PSMDB_DIR" && ./bootstrap.sh >/dev/null )
+  # Both the pool profile and a single node's private profile start with
+  # $CLIENT_PROFILE, so one test covers `pmm-client` and `pmm-client-node01`.
+  if [[ "$profile" == "$CLIENT_PROFILE"* ]]; then
+    ensure_node_image "$CLIENT_IMAGE" --build-arg WITH_PSMDB=0
+  else
+    ensure_node_image "$PSMDB_IMAGE"
+    # The keyfile is replica-set internal auth. A client host mounts none and
+    # joins nothing, so generating one for it would be theatre.
+    [[ -f "$PSMDB_DIR/secrets/keyfile" ]] || ( cd "$PSMDB_DIR" && ./bootstrap.sh >/dev/null )
+  fi
 
   local recreate=()
   if psmdb_stale_network "$profile"; then
@@ -1024,20 +1090,28 @@ start_psmdb() {
   psmdb_compose --profile "$profile" up -d "${recreate[@]}"
 
   # Registration is the useful readiness signal, not "container started": a node
-  # is only usable once its pmm-agent has connected and register.sh has written
-  # the credentials file the SEP payloads read.
-  local prefix nodes i ready
-  prefix="$profile-"
-  nodes="$(docker ps --format '{{.Names}}' | grep -c "^$prefix" || true)"
+  # is only usable once its pmm-agent has connected, which on a database node also
+  # means register.sh has written the credentials file the SEP payloads read.
+  #
+  # /run/om-node-ready is published by register.sh and register-client.sh alike,
+  # so this one test covers a database node and a client host without asking which
+  # it is looking at. /root/.mongodb_uri is the same signal from before the marker
+  # existed - kept so a psmdb-node image built earlier still reports ready rather
+  # than timing out until it is rebuilt.
+  local pattern nodes i ready
+  pattern="^$profile(-|\$)"
+  nodes="$(docker ps --format '{{.Names}}' | grep -cE "$pattern" || true)"
   for i in $(seq 1 60); do
     ready=0
     local n
     while IFS= read -r n; do
       [[ -n "$n" ]] || continue
-      docker exec "$n" test -f /root/.mongodb_uri >/dev/null 2>&1 && ready=$((ready + 1))
-    done < <(docker ps --format '{{.Names}}' | grep "^$prefix" || true)
+      docker exec "$n" sh -c \
+        'test -f /run/om-node-ready || test -f /root/.mongodb_uri' >/dev/null 2>&1 \
+        && ready=$((ready + 1))
+    done < <(docker ps --format '{{.Names}}' | grep -E "$pattern" || true)
     if [[ "$ready" -ge "$nodes" ]] && [[ "$nodes" -gt 0 ]]; then
-      ok "$profile: $nodes/$nodes node(s) bootstrapped and registered"
+      ok "$profile: $nodes/$nodes node(s) up and registered with PMM"
       return 0
     fi
     sleep 5
@@ -1045,12 +1119,18 @@ start_psmdb() {
   warn "$profile: only $ready/$nodes node(s) finished bootstrap — ./om logs $profile"
 }
 
-stop_psmdb() {
+stop_sandbox_node() {
   local profile="$1"
   info "$profile: stopping"
   psmdb_compose --profile "$profile" stop >/dev/null 2>&1 || true
-  ok "$profile stopped (containers kept; data volumes intact)"
-  dim "wipe its data with: cd psmdb && docker compose --profile $profile down -v"
+  # A client host writes nothing it would want back, so there is no data to
+  # reassure anyone about and no `down -v` worth suggesting.
+  if [[ "$profile" == "$CLIENT_PROFILE"* ]]; then
+    ok "$profile stopped (containers kept; these hosts carry no data)"
+  else
+    ok "$profile stopped (containers kept; data volumes intact)"
+    dim "wipe its data with: cd psmdb && docker compose --profile $profile down -v"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1383,12 +1463,30 @@ cmd_status() {
         status_line "$p" 1 "stopped"
       fi
     done
+
+    # The client hosts. No URI line, deliberately: the whole point of these is
+    # that there is nothing on them to connect to. What is worth printing is
+    # which of the pool are up, since they are spawned individually.
+    echo
+    info "PMM-client-only hosts (psmdb/compose.yaml)"
+    local cup names
+    cup="$(psmdb_running "$CLIENT_PROFILE")"
+    if [[ "${cup:-0}" -gt 0 ]]; then
+      status_line "$CLIENT_PROFILE" 0 "${cup}/${CLIENT_NODES} host(s) up - pmm-agent + Nomad, no database"
+      names="$(docker ps --format '{{.Names}}' | grep -E "^$CLIENT_PROFILE-" | sort | paste -sd' ' -)"
+      [[ -n "$names" ]] && dim "$names"
+    else
+      status_line "$CLIENT_PROFILE" 1 "stopped - ./om start $(client_node_names | head -1)"
+    fi
   fi
 
   echo
-  dim "logs: ./om logs <pmm|sep-backend|sep-frontend|<cluster>> [-f]"
+  dim "logs: ./om logs <pmm|sep-backend|sep-frontend|<cluster>|pmm-client> [-f]"
   dim "urls: ./om urls [comp...] — the same list for stopped components too"
-  if [[ -d "$PSMDB_DIR" ]] && [[ -n "$(psmdb_up_profiles)" ]]; then
+  # Every line below is about reaching a *database*, so it is gated on a database
+  # topology being up rather than on any node: with only client hosts running there
+  # are no URIs above for "the first is for SEP" to refer to.
+  if [[ -d "$PSMDB_DIR" ]] && [[ -n "$(psmdb_up_profiles | grep -vx "$CLIENT_PROFILE")" ]]; then
     # The network URIs name containers, which only resolve inside the network. A GUI
     # client on this machine can still reach one node directly: container IPs are
     # routable from the host, but only with directConnection=true -- without it the
@@ -1411,15 +1509,17 @@ cmd_logs() {
         || die "$PMM_CONTAINER does not exist — ./om start pmm first"
       if [[ -n "$follow" ]]; then docker logs -f --tail=200 "$PMM_CONTAINER"
       else docker logs --tail=200 "$PMM_CONTAINER"; fi ;;
-    standalone|replicaset-single|replicaset-cluster|sharded-cluster)
+    standalone|replicaset-single|replicaset-cluster|sharded-cluster|pmm-client|pmm-client-node[0-9][0-9])
       # No om-managed log file: these are compose services, so defer to compose.
+      # A single client node works here too, because its own name is also a
+      # compose profile - see the pmm-client block in psmdb/compose.yaml.
       if [[ -n "$follow" ]]; then psmdb_compose --profile "$comp" logs -f --tail=200
       else psmdb_compose --profile "$comp" logs --tail=200; fi ;;
     sep-backend|sep-frontend)
       local f; f="$(log_file "$comp")"
       [[ -f "$f" ]] || die "no log yet for $comp"
       if [[ -n "$follow" ]]; then tail -f "$f"; else tail -n 200 "$f"; fi ;;
-    "") die "usage: ./om logs <pmm|sep-backend|sep-frontend|replicaset-cluster|replicaset-single|standalone|sharded-cluster> [-f]" ;;
+    "") die "usage: ./om logs <pmm|sep-backend|sep-frontend|replicaset-cluster|replicaset-single|standalone|sharded-cluster|pmm-client[-nodeNN]> [-f]" ;;
     *)  die "unknown component '$comp'" ;;
   esac
 }
@@ -1804,9 +1904,16 @@ expand_components() {
       sep-backend|backend)   COMPONENTS+=(sep-backend) ;;
       sep-frontend|frontend) COMPONENTS+=(sep-frontend) ;;
       # `psmdb` is spelled both ways because it is what the directory is called.
+      # It stays the four *database* topologies: the client hosts are not a
+      # cluster and nobody asking for "the clusters" means them.
       clusters|psmdb)        COMPONENTS+=("${PSMDB_PROFILES[@]}") ;;
       standalone|replicaset-single|replicaset-cluster|sharded-cluster) COMPONENTS+=("$a") ;;
-      *) die "unknown component '$a' (pmm|sep-backend|sep-frontend|sep|all|clusters|standalone|replicaset-single|replicaset-cluster|sharded-cluster)" ;;
+      # The whole pool, or one host of it by name.
+      pmm-client|pmm-clients|clients) COMPONENTS+=("$CLIENT_PROFILE") ;;
+      *)
+        client_node_name "$a" || die "unknown component '$a' (pmm|sep-backend|sep-frontend|sep|all|clusters|standalone|replicaset-single|replicaset-cluster|sharded-cluster|pmm-client|$(client_node_names | paste -sd'|' -))"
+        COMPONENTS+=("$a")
+        ;;
     esac
   done
 }
@@ -1830,7 +1937,8 @@ cmd_start() {
       pmm)          start_pmm ;;
       sep-backend)  start_sep_backend ;;
       sep-frontend) start_sep_frontend ;;
-      standalone|replicaset-single|replicaset-cluster|sharded-cluster) start_psmdb "$c" ;;
+      standalone|replicaset-single|replicaset-cluster|sharded-cluster) start_sandbox_node "$c" ;;
+      pmm-client|pmm-client-node[0-9][0-9]) start_sandbox_node "$c" ;;
     esac
   done
   echo
@@ -1856,7 +1964,8 @@ cmd_stop() {
       pmm)          stop_pmm ;;
       sep-backend)  info "sep-backend: stopping";  stop_native sep-backend ;;
       sep-frontend) info "sep-frontend: stopping"; stop_native sep-frontend ;;
-      standalone|replicaset-single|replicaset-cluster|sharded-cluster) stop_psmdb "$c" ;;
+      standalone|replicaset-single|replicaset-cluster|sharded-cluster) stop_sandbox_node "$c" ;;
+      pmm-client|pmm-client-node[0-9][0-9]) stop_sandbox_node "$c" ;;
     esac
   done
 }

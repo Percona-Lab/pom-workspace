@@ -278,6 +278,25 @@ with a fresh network id, stranding cluster containers created before the restart
 (`network …not found` on start). `./om start <profile>` detects this and recreates the
 containers; data volumes are kept.
 
+### Hosts with a PMM client and no database
+
+`pmm-client` is a pool of three hosts built from the same Dockerfile with
+`WITH_PSMDB=0`: `pmm-agent` and the executor client it carries, and no `mongod`,
+no `pbm-agent`, none of the PSMDB packages. PMM lists them as nodes and SEP will
+dispatch to them, so they are where a payload with no database to talk to gets
+developed - and, since the Percona apt repos are still enabled on them, the
+starting point for a payload that *installs* a database on a bare machine.
+
+```bash
+./om start pmm-client               # all three
+./om start pmm-client-node01        # just that one
+./om logs pmm-client-node01 -f
+```
+
+They export no service to PMM's inventory, so they carry no cluster string and no
+credentials file, and nothing about them appears in `./om status` beyond which of
+them are up.
+
 Full detail — the in-place upgrade loop, bootstrap ordering, and the rough edges — is in
 [`psmdb/README.md`](psmdb/README.md).
 

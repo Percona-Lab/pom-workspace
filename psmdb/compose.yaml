@@ -1,8 +1,8 @@
 # PSMDB sandbox topologies for the PMM + SEP stack.
 #
 # Four independent topologies behind compose profiles, so you deploy only what
-# you need. Nothing here starts unless you name a profile — MinIO is the sole
-# exception, since PBM in any topology wants a store.
+# you need, plus a pool of database-less hosts under `pmm-client`. Nothing here
+# starts unless you name a profile.
 #
 #   docker compose --profile replicaset-cluster up -d
 #   docker compose --profile replicaset-cluster --profile replicaset-single up -d
@@ -73,6 +73,34 @@ x-node: &node
     PBM_S3_ACCESS_KEY: minioadmin
     PBM_S3_SECRET_KEY: minioadmin
 
+# A host with a PMM client and nothing else: same Dockerfile, built WITH_PSMDB=0,
+# so there is no mongod, no pbm-agent and not even the PSMDB packages on it. What
+# it does have is the Nomad client pmm-agent brings, which is the whole reason to
+# want one - PMM lists it as a node and SEP will dispatch to it, so it is where a
+# payload with no database to talk to gets developed, and where a payload that
+# *installs* a database starts from.
+#
+# Keeps cgroup/mount privileges for the same reason the database nodes need them
+# (see above); drops the keyfile, which is internal replica-set auth and means
+# nothing here, and the data volume, since nothing writes one.
+x-client-node: &client-node
+  image: openmanager/pmm-client-node:3
+  restart: unless-stopped
+  networks: [pmm]
+  cgroup: host
+  cap_add:
+    - SYS_ADMIN
+  security_opt:
+    - apparmor:unconfined
+    - seccomp:unconfined
+  volumes:
+    - *cgroup-mount
+  environment: &client-node-env
+    ROLE: client
+    PMM_SERVER: pmm-server:8443
+    PMM_USER: admin
+    PMM_PASSWORD: admin
+
 # Per-topology environments live up here, not on the first member, so exactly one
 # member can carry RS_BOOTSTRAP without the others inheriting it through the
 # anchor. Two nodes racing rs.initiate() would be a genuine bug, not noise.
@@ -108,11 +136,16 @@ x-sharded-cluster-shard01-env: &sharded-cluster-shard01-env
   RS_MEMBERS: sharded-cluster-shard01svr0:27018,sharded-cluster-shard01svr1:27018,sharded-cluster-shard01arb0:27018:arbiter
 
 services:
-  # ── shared ────────────────────────────────────────────────────────────────
+  # ── shared by every *database* topology ───────────────────────────────────
+  # PBM in any topology wants an object store, so MinIO carries all four database
+  # profiles rather than a profile of its own. It deliberately does not carry
+  # `pmm-client`: a host with no database has nothing to back up, and starting a
+  # backup store beside it would only invite the question of what it is for.
   minio:
     image: minio/minio:latest
     container_name: psmdb-minio
     hostname: psmdb-minio
+    profiles: [standalone, replicaset-single, replicaset-cluster, sharded-cluster]
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -130,6 +163,7 @@ services:
   minio-bucket:
     image: minio/mc:latest
     container_name: psmdb-minio-bucket
+    profiles: [standalone, replicaset-single, replicaset-cluster, sharded-cluster]
     depends_on:
       minio: {condition: service_healthy}
     networks: [pmm]
@@ -357,6 +391,38 @@ services:
       PMM_CLUSTER: sharded-cluster
       CONFIG_DB: sharded-cluster-cfg/sharded-cluster-cfg00:27019,sharded-cluster-cfg01:27019,sharded-cluster-cfg02:27019
       PBM_ENABLED: "0"
+
+  # ── profile: pmm-client ───────────────────────────────────────────────────
+  # Machines with a PMM client and no database. Not a topology - they are not
+  # related to each other and there is nothing to initiate - just a pool of bare
+  # hosts, so the count here is arbitrary and adding a fourth is a copy of one
+  # block (keep `CLIENT_NODES` in ../om in step with it).
+  #
+  # Every node carries a private profile alongside the shared one, which is how
+  # you spawn exactly the machines you want rather than all of them:
+  #
+  #   ./om start pmm-client              all of them
+  #   ./om start pmm-client-node01       just that one
+  #
+  # No RS_BOOTSTRAP, PMM_CLUSTER or credentials anywhere below: a cluster string
+  # is a property of a *service* in PMM's inventory, and these hosts export none.
+  pmm-client-node00:
+    <<: *client-node
+    profiles: [pmm-client, pmm-client-node00]
+    container_name: pmm-client-node00
+    hostname: pmm-client-node00
+
+  pmm-client-node01:
+    <<: *client-node
+    profiles: [pmm-client, pmm-client-node01]
+    container_name: pmm-client-node01
+    hostname: pmm-client-node01
+
+  pmm-client-node02:
+    <<: *client-node
+    profiles: [pmm-client, pmm-client-node02]
+    container_name: pmm-client-node02
+    hostname: pmm-client-node02
 
 networks:
   # Created by pmm/docker-compose.dev.yml (./om start pmm). Joining it rather

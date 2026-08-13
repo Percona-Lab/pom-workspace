@@ -187,6 +187,12 @@ mongod/mongos + pbm-agent + pmm-agent, so the Nomad client lives beside the data
 manages. Started per profile — `./om start replicaset-cluster` — or all at once with
 `./om start clusters`, for which `psmdb` is an alias.
 
+**`pmm-client` hosts.** A fifth profile in the same directory that is *not* a cluster:
+hosts built from the same image with `WITH_PSMDB=0`, so they carry pmm-agent and its
+Nomad client and no database at all. Full SEP execution hosts that export no service -
+somewhere to run a payload that has nothing to query, and the *before* state of one that
+installs a database. Spawned individually: `./om start pmm-client-node01`.
+
 **MinIO.** S3-compatible object storage, used locally as a backup target. Defaults to
 port 9000, the same default as PMM's ClickHouse — in `psmdb/` it publishes nothing, so
 the two do not contend.

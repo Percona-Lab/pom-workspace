@@ -2,9 +2,10 @@
 
 Four MongoDB topologies as Docker Compose profiles, sitting on the network PMM
 already uses, with a **Nomad client on every database node** so SEP can dispatch
-work onto the host that owns the data — including in-place `apt` upgrades.
+work onto the host that owns the data - including in-place `apt` upgrades. Plus a
+pool of hosts that carry the Nomad client and **no database at all** (§8).
 
-**As of:** 2026-08-06
+**As of:** 2026-08-13
 **Verified against:** `pmm` @ `sep-combined-local` (PMM-15216 + PMM-15293 +
 PMM-15238), `SEP` @ `pmm-mongo-status`, PSMDB 7.0.39-21, PBM 2.15.0,
 pmm-client 3.9.0, Nomad from the pmm-client deb.
@@ -33,6 +34,10 @@ for every connecting pmm-agent and pushes its config and mTLS material down the
 existing gRPC stream, so the node appears in SEP's *Execution Host* dropdown with
 no certificate handling of your own.
 
+Because that client rides inside pmm-agent and not inside mongod, the bottom three
+rows are optional - drop them and you have a SEP execution host with no database
+on it at all, which is the `pmm-client` profile in §8.
+
 Half the container count of the Terraform sandbox for the same topology — 11 vs
 22 for the sharded cluster — because there are no sidecars.
 
@@ -50,6 +55,7 @@ cd /home/plebioda/openmanager
 ./om status                       # per-topology container counts
 ./om logs replicaset-cluster -f
 ./om stop replicaset-cluster              # containers down, data volumes kept
+./om start pmm-client-node00              # a host with no database on it (§8)
 ```
 
 `./om start` builds the node image and generates `secrets/keyfile` on first use,
@@ -62,6 +68,7 @@ Compose directly works too, and is what `om` calls:
 cd psmdb
 ./bootstrap.sh
 docker build -t openmanager/psmdb-node:7.0 .
+docker build --build-arg WITH_PSMDB=0 -t openmanager/pmm-client-node:3 .   # §8
 docker compose --profile replicaset-cluster --profile replicaset-single up -d
 COMPOSE_PROFILES=sharded-cluster docker compose up -d
 docker compose --profile replicaset-cluster down -v         # containers *and* data
@@ -73,6 +80,7 @@ docker compose --profile replicaset-cluster down -v         # containers *and* d
 | `replicaset-single` | 1-member replica set (has an oplog, so PBM works) | 1 | `replicaset-single` |
 | `replicaset-cluster` | 3 data-bearing members | 3 | `replicaset-cluster` |
 | `sharded-cluster` | 2 mongos, 3 config, 2 shards of svr0/svr1/arb0 | 11 | `sharded-cluster` |
+| `pmm-client` | hosts with a PMM client and no database - §8 | 3 | none |
 
 Nothing is published to the host — deliberately, since omtest1 and PMM already
 contend for 9000 and 8443. Reach a node with `docker exec`.
@@ -194,13 +202,64 @@ Everything is idempotent — containers get recreated onto existing data volumes
 
 | File | Role |
 | --- | --- |
-| `Dockerfile` | the node image — PSMDB 7.0 + PBM + pmm-client + python3, all from Percona apt repos |
-| `compose.yaml` | four profiles, MinIO, joins `pmm_default` |
+| `Dockerfile` | both node images - PSMDB 7.0 + PBM + pmm-client + python3 from Percona apt repos, or `WITH_PSMDB=0` for the client-only build |
+| `compose.yaml` | four database profiles + `pmm-client`, MinIO, joins `pmm_default` |
 | `bootstrap.sh` | generates `secrets/keyfile`, checks the network exists |
-| `supervisord.conf` | the five supervised programs |
+| `supervisord/pmm-agent.conf` | the one program both images run |
+| `supervisord/psmdb.conf` | the four database programs, `WITH_PSMDB=1` only |
+| `supervisord/client.conf` | the readiness one-shot, `WITH_PSMDB=0` only |
 | `scripts/entrypoint.sh` | renders the mongod/mongos config from the environment |
 | `scripts/run-mongo.sh` | mongod or mongos, one program either way |
 | `scripts/run-pmm-agent.sh` | waits for PMM, `pmm-agent setup`, then the agent |
 | `scripts/run-pbm-agent.sh` | pbm-agent, idle on mongos and arbiters |
 | `scripts/cluster-init.sh` | `rs.initiate` + root user + PBM store; `sh.addShard` on a mongos |
 | `scripts/register.sh` | `pmm-admin add mongodb --cluster=…`, writes `/root/.mongodb_uri` |
+| `scripts/register-client.sh` | the same readiness marker, on a host with nothing to register |
+
+---
+
+## 8. Hosts with a PMM client and no database
+
+`pmm-client` is not a topology. It is a pool of three unrelated machines that
+carry a PMM client and nothing else - **no `mongod`, no `pbm-agent`, and not even
+the PSMDB packages installed**. They come from this same Dockerfile built with
+`WITH_PSMDB=0`, so the base, the libc, the python and the pmm-client are
+identical to the database nodes standing beside them; only the database is
+absent.
+
+```bash
+./om start pmm-client              # all three
+./om start pmm-client-node01       # exactly one - each node is its own profile too
+./om logs pmm-client-node01 -f
+```
+
+**Why it is useful.** The Nomad client rides inside pmm-agent, not inside mongod,
+so a host with no database is still a full SEP execution host. That gives you:
+
+- a place to develop a payload that has no database to talk to - anything that
+  inspects the host, installs software, or calls out to something else;
+- the *before* state of provisioning: the psmdb apt repos are enabled on these
+  hosts and simply unused, so a payload can `apt-get install
+  percona-server-mongodb-server` and turn one into a database host, through the
+  same seam §3's in-place upgrade uses on a host that already has one;
+- a control for anything that reasons about inventory - a node PMM knows about
+  that exports no service at all.
+
+**What SEP and PMM see.** The node itself, registered by `pmm-agent setup`, and
+no service. There is no cluster string because a cluster string is a property of a
+*service* in PMM's inventory, and these export none; there is no
+`/root/.mongodb_uri` because there is no database whose credentials it would hold.
+They appear in `GET /api/sep/hosts/` and in the *Execution Host* dropdown, and
+nowhere in `/v1/inventory/services`.
+
+**Readiness.** `register-client.sh` waits for `pmm-admin status` to succeed and
+then writes `/run/om-node-ready` - the same marker `register.sh` writes on a
+database node once it has registered. `./om start` waits on that one file for
+every node in the sandbox, so it never has to ask which kind it is looking at.
+
+**Adding a fourth.** Copy one three-line service block in `compose.yaml` (giving
+it its own private profile alongside `pmm-client`) and bump `CLIENT_NODES` in
+`../om` to match.
+
+**MinIO does not come up with them.** It carries the four database profiles
+rather than none, because a host with no database has nothing to back up.
