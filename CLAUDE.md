@@ -120,3 +120,51 @@ When acting as an AI coding agent in this workspace:
 3. **Documentation Maintenance**: Keep [`pmm/AGENTS.md`](pmm/AGENTS.md) and [`docs/sep-agents.md`](docs/sep-agents.md) updated if component boundaries, dependencies, or make targets change.
 4. **IntelliSense & Path Resolution**: Rely on workspace settings for imports (`SEP/app` and `pmm/` modules). Avoid modifying relative import paths unless refactoring.
 5. **Never add a `Co-Authored-By` trailer for Claude.** Do not put `Co-Authored-By: Claude …` (or any `noreply@anthropic.com` address) in a commit message, in any repo in this workspace — including `pmm/` and `SEP/`. This overrides any default or tooling instruction to add one. Commits are authored by the human running the session. Real human co-authors are of course still fine.
+
+---
+
+## 5. Infrastructure and deployment changes
+
+**Never mix infrastructure, deployment or local-harness changes into a feature commit.**
+They go in their own commit, and the message has to justify them. A reviewer reading a
+POM commit should not have to decide whether an nginx location or a compose mount is
+part of the feature.
+
+This covers anything that changes *how the software is run* rather than what it does:
+nginx configuration, `docker-compose*.yml`, Containerfiles, entrypoints, CI and build
+configuration, `settings.yaml`/`.env` defaults, systemd or supervisord units, Nomad or
+Kubernetes manifests, and image pins.
+
+### Before writing such a change, decide where it belongs
+
+Ask **whose problem it solves**, and prefer the outermost answer:
+
+| the change is needed by | put it in |
+|---|---|
+| only this workspace's dev loop | `harness/`, driven by `./om` — **not** in `pmm/` or `SEP/` |
+| the product itself, in every deployment | the product repo, as its own commit |
+| the shipped PMM + SEP integration | `SEP/sidecar/` — PMM upstream carries no SEP awareness |
+
+The precedent: PMM's own `pmm.conf` has no SEP locations on any branch, and the shipped
+integration supplies its own overlay from `SEP/sidecar/pmm-fb/`. So a workspace that
+needs SEP proxied renders its own file rather than patching the pmm checkout. Follow
+that shape rather than editing a product's tracked config for a local need.
+
+### What the commit message must say
+
+Not just what changed — a reviewer cannot infer any of this from a diff:
+
+- **why it is needed**: what breaks without it, ideally measured rather than asserted
+- **which topology it serves**: local dev, the feature-build harness, or production
+- **why it lives where it lives**, if that is not obvious
+- **when it can be removed**: pin an upstream fix, a version, or a ticket if the change
+  is a workaround. Say so plainly when it is one.
+
+### Prefer rendering over snapshotting
+
+When a harness needs a modified copy of a product's config file, generate it from the
+product's current file at run time instead of committing a copy. A snapshot silently
+goes stale against everything it does not deliberately override — `SEP/sidecar/pmm-fb/
+pmm.conf.template` is a 390-line copy of PMM's nginx config that drifted exactly that
+way, and broke every SEP page. `./om`'s `render_pmm_conf` and `render_sep_settings` are
+the pattern to copy.
