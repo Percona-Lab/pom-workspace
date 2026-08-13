@@ -77,6 +77,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SEP_DIR="$ROOT/SEP"
 PMM_DIR="$ROOT/pmm"
+HARNESS_DIR="$ROOT/harness"
 STATE_DIR="$ROOT/.om"
 PID_DIR="$STATE_DIR/pids"
 LOG_DIR="$STATE_DIR/logs"
@@ -596,6 +597,39 @@ ensure_pmm_managed() {
   fi
 }
 
+# pmm.conf with the workspace's SEP locations injected, written to harness/.
+#
+# PMM's nginx has no include hook inside its server block, so a location cannot
+# be added without replacing the whole file. Rendering it from pmm's current copy
+# on every start keeps PMM's other locations exactly as the checkout has them --
+# a snapshot would drift, which is how SEP's own committed template ended up
+# still proxying the five bare prefixes the SEP UI stopped using on 2026-08-10.
+#
+# The fragment goes in ahead of `location /pmm-ui`, inside the server block.
+render_pmm_conf() {
+  local src="$PMM_DIR/build/ansible/roles/nginx/files/conf.d/pmm.conf"
+  local frag="$HARNESS_DIR/sep-locations.conf"
+  local out="$HARNESS_DIR/pmm.conf"
+  [[ -f "$src" ]]  || die "pmm.conf missing at $src"
+  [[ -f "$frag" ]] || die "SEP locations fragment missing at $frag"
+  grep -q '^    # PMM UI$' "$src" || die "pmm.conf has no '# PMM UI' anchor — render_pmm_conf needs updating"
+  awk -v frag="$frag" '
+    /^    # PMM UI$/ && !done { while ((getline line < frag) > 0) print line; print ""; done = 1 }
+    { print }
+  ' "$src" > "$out.tmp" || die "rendering pmm.conf failed"
+  grep -q 'location /sep/' "$out.tmp" || die "rendered pmm.conf has no /sep location"
+  mv "$out.tmp" "$out"
+}
+
+# Both compose files, in order. The first one fixes the project directory, so
+# pmm/ must lead: it keeps the project name `pmm` (as `make env-up` produces) and
+# makes the override's relative paths resolve against the pmm checkout.
+pmm_compose() {
+  ( cd "$PMM_DIR" && COMPOSE_PROFILES=pmm docker compose \
+      -f docker-compose.dev.yml \
+      -f "$HARNESS_DIR/pmm-compose.override.yml" "$@" )
+}
+
 start_pmm() {
   info "pmm: devcontainer (from repo)"
   [[ -f "$PMM_DIR/.env" ]] || die "pmm/.env missing — run ./om setup first"
@@ -604,9 +638,14 @@ start_pmm() {
   if [[ -n "$img" ]] && ! docker image inspect "$img" >/dev/null 2>&1; then
     warn "$img is not present locally — first start pulls several GB"
   fi
-  # Delegates to PMM's own tooling: compose up --wait plus its env-pg-config
-  # step, which tunes the embedded PostgreSQL on a fresh /srv volume.
-  make -C "$PMM_DIR" env-up
+  # PMM's own docker-compose.dev.yml plus harness/pmm-compose.override.yml, which
+  # carries what this workspace needs and the pmm checkout should not: the SEP
+  # nginx overlay, the host-gateway alias, and the entrypoint mounts the published
+  # dev image is too old to provide. Then PMM's env-pg-config, which tunes the
+  # embedded PostgreSQL on a fresh /srv volume.
+  render_pmm_conf
+  pmm_compose up -d --wait --wait-timeout 100
+  make -C "$PMM_DIR" env-pg-config
   ok "pmm-server up — https://localhost:$PMM_HTTPS_PORT (admin/admin)"
   dim "running the image's binaries; './om build pmm' compiles your working tree"
   ensure_pmm_managed
@@ -615,7 +654,8 @@ start_pmm() {
 
 stop_pmm() {
   info "pmm: devcontainer down"
-  make -C "$PMM_DIR" env-down
+  # Same file pair as the start, so compose tears down what it brought up.
+  pmm_compose down --remove-orphans
   ok "pmm stopped"
 }
 

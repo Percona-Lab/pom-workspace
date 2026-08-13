@@ -24,3 +24,6 @@ mongo_terraform_ansible/
 
 # Per-machine Claude Code permissions. .claude/settings.json IS committed.
 .claude/settings.local.json
+
+# Rendered by ./om start pmm from pmm.conf + harness/sep-locations.conf.
+harness/pmm.conf

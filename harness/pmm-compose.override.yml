@@ -1,0 +1,36 @@
+# Compose overlay for pmm/docker-compose.dev.yml, applied by `./om start pmm`.
+#
+# Everything the workspace needs from the PMM container that PMM itself has no
+# reason to carry. Keeping it here means the pmm checkout stays a clean branch of
+# POM code, which is also how the shipped integration works: SEP's
+# sidecar/pmm-fb/compose.yaml supplies its own overlay rather than patching PMM.
+#
+# Relative paths resolve against the project directory, which is pmm/ because om
+# passes pmm/docker-compose.dev.yml first and runs compose from there.
+
+services:
+  pmm-server:
+    # Lets the SEP locations reach a SEP backend running natively on the host
+    # (./om start sep-backend). Implicit on Docker Desktop, explicit on Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      # PMM's own pmm.conf with the SEP locations injected, rendered by om on
+      # every start. Overrides the mount docker-compose.dev.yml already makes
+      # from the repo copy: same target, so this entry wins.
+      - ../harness/pmm.conf:/etc/nginx/conf.d/pmm.conf:ro
+
+      # SEP PostgreSQL exposure (PMM-15238 / percona/pmm#5700). PMM_SERVER_IMAGE
+      # is perconalab/pmm-server:3-dev-container, a published image older than
+      # the branch, so it runs the *image's* /opt/entrypoint.sh and PMM_ENABLE_SEP
+      # is a silent no-op unless the branch's version is mounted over it.
+      # postgres-migration comes along because the same PR moved the PG version
+      # literals into the entrypoint and passes them down as exported variables;
+      # the image's copy would abort.
+      #
+      # A feature build of the branch bakes all three in and needs none of this,
+      # which is why SEP's harness pins pmm-server-fb rather than the dev image.
+      - ./build/docker/server/entrypoint.sh:/opt/entrypoint.sh:ro
+      - ./build/ansible/roles/postgres/files/postgres-sep:/opt/ansible/roles/postgres/files/postgres-sep:ro
+      - ./build/ansible/roles/postgres/files/postgres-migration:/opt/ansible/roles/postgres/files/postgres-migration:ro
