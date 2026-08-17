@@ -45,14 +45,16 @@
 #   ./om pom sql <query>    psql against pom_runs / pom_snapshots
 #   ./om pom api <path>     any /v1/pom path, e.g. `api discovery/runs -X POST -d {}`
 #
-# POM discovery in SEP (table pom_discovery_run, API /api/apps/pom_discovery):
+# POM discovery in SEP (schema pom: host, service, discovery_run;
+#                      API /api/apps/pom_discovery):
 #
 #   ./om discovery          overview: the last sweep and what it collected
+#   ./om discovery estate [f] the hosts and services POM holds; [f] filters
 #   ./om discovery facts [f] the stored facts, per service; [f] filters
 #   ./om discovery runs [n] sweeps, newest first
 #   ./om discovery run      queue a sweep (Nomad jobs; tens of seconds)
 #   ./om discovery sync     refresh SEP inventory from PMM (after a rebuild)
-#   ./om discovery sql <q>  psql against pom_discovery_run
+#   ./om discovery sql <q>  psql against the pom schema
 #   ./om discovery api <p>  any /api/apps/pom_discovery path
 #   ./om discovery token    bearer token for /api/docs Authorize and for curl
 #
@@ -1567,7 +1569,7 @@ sep_token() {
 #
 # POM is split across both products, so there are two stores and two APIs:
 #
-#   sep_psql   SEP's database      pom_discovery_run  — what the probe collected
+#   sep_psql   SEP's database      pom.host/service/discovery_run - what the probe saw
 #   pmm_psql   pmm-managed's       pom_runs/pom_snapshots — the topology documents
 #   pmm_api    /v1/pom             what the UI reads
 #   sep_api    /api/apps/<app>     any SEP app, discovery being the first
@@ -1830,8 +1832,62 @@ disc_cmd_run() {
   dim "watch it with: ./om discovery runs"
 }
 
+# The estate as POM currently holds it: one line per host, its services indented
+# under it, and anything running that PMM has no service for called out.
+#
+# Reads the tables rather than the API on purpose. The API is what a consumer sees;
+# this is for the question the API cannot answer -- "is the row actually there, and
+# what does it say" -- which is the one you have when a sweep looks right and a page
+# looks wrong.
+disc_cmd_estate() {
+  local filter="${1:-}"
+  sep_psql -t -A -F$'\t' -c "
+    select h.name,
+           coalesce(h.executor_host, '-'),
+           coalesce(to_char(h.last_success_at, 'YYYY-MM-DD HH24:MI'), 'never'),
+           coalesce(h.observed->>'os', '-'),
+           coalesce(jsonb_array_length(h.observed->'unregistered_mongods'), 0),
+           coalesce(h.consecutive_failures, 0),
+           coalesce((select string_agg(s.name || ' :' || coalesce(s.port::text, '?')
+                                       || case when s.last_success_at is null
+                                               then ' (not probed)' else '' end,
+                                       '|' order by s.name)
+                     from pom.service s where s.node_id = h.node_id), '')
+    from pom.host h
+    order by h.name;" | FILTER="$filter" python3 -c '
+import os, sys
+
+needle = os.environ.get("FILTER", "").lower()
+rows = [line.rstrip("\n").split("\t") for line in sys.stdin if line.strip()]
+if not rows:
+    sys.exit("  no host rows - has a sweep run? ./om discovery run")
+
+shown = 0
+for name, executor, seen, os_name, strangers, failures, services in rows:
+    if needle and needle not in " ".join((name, executor, os_name, services)).lower():
+        continue
+    shown += 1
+    marks = []
+    if executor == "-":
+        marks.append("no executor")
+    if int(failures):
+        marks.append("%s consecutive failure(s)" % failures)
+    if int(strangers):
+        marks.append("%s mongod(s) PMM does not know" % strangers)
+    print("  %-30s %-20s last probed %s" % (name, os_name, seen))
+    if marks:
+        print("      ! " + "; ".join(marks))
+    for svc in filter(None, services.split("|")):
+        print("      %s" % svc)
+    if not services:
+        print("      (no MongoDB service registered here)")
+if not shown:
+    sys.exit("  nothing matched %r" % needle)
+'
+}
+
 disc_cmd_sql() {
-  [[ $# -gt 0 ]] || die "usage: ./om discovery sql <query>   (table: pom_discovery_run)"
+  [[ $# -gt 0 ]] || die "usage: ./om discovery sql <query>   (tables: pom.host, pom.service, pom.discovery_run)"
   sep_psql -c "$*"
 }
 
@@ -1862,6 +1918,7 @@ cmd_discovery() {
   local sub="${1:-show}"; shift || true
   case "$sub" in
     show)  disc_cmd_show "$@" ;;
+    estate) disc_cmd_estate "$@" ;;
     facts) disc_cmd_facts "$@" ;;
     runs)  disc_cmd_runs "$@" ;;
     run)   disc_cmd_run "$@" ;;
@@ -1869,7 +1926,7 @@ cmd_discovery() {
     sql)   disc_cmd_sql "$@" ;;
     api)   disc_cmd_api "$@" ;;
     token) sep_token ;;
-    *) die "unknown discovery subcommand '$sub' (show|facts|runs|run|sync|sql|api|token)" ;;
+    *) die "unknown discovery subcommand '$sub' (show|estate|facts|runs|run|sync|sql|api|token)" ;;
   esac
 }
 
