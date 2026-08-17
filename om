@@ -825,6 +825,15 @@ stop_pmm() {
 }
 
 start_sep_backend() {
+  # A directory with no databases in it means ./om setup has not run for this one.
+  # Worth saying now: SEP starts perfectly well against empty files and then fails
+  # in ways that read as application bugs rather than "the migrations never ran".
+  if [[ -n "$SEP_DB_DIR" && ! -f "$SEP_DB_DIR/sep.db" ]]; then
+    warn "no databases in $SEP_DB_DIR - run ./om setup first"
+    dim "OM_SEP_DB_DIR is read fresh on every invocation and remembered nowhere,"
+    dim "so it has to be set for setup and for every command after it"
+  fi
+
   # The celery worker + beat run in-process (SEP's --start-celery) by default:
   # without them nothing executes. Task execution is dispatched through celery
   # (app/tasks/routes.py :: execute_task_queue.apply_async), running-task status
@@ -1544,7 +1553,8 @@ component_uris() { # comp -> "label<TAB>uri" lines
         "Swagger UI"    "$sep/api/docs" \
         "OpenAPI JSON"  "$sep/api/openapi.json" \
         "Inventory API" "$sep/api/inventory/docs" \
-        "Tasks API"     "$sep/api/tasks/docs"
+        "Tasks API"     "$sep/api/tasks/docs" \
+        "Data"          "$(sep_data_location)"
       ;;
     sep-frontend)
       printf '%s\t%s\n' "Dev server" "http://localhost:$SEP_FRONTEND_PORT/"
@@ -1778,6 +1788,19 @@ sep_token() {
 # Both psql helpers run inside the pmm-server container rather than over the
 # published port: the databases live there, the socket needs no password, and it
 # keeps a host psql client from being a prerequisite.
+
+# Where SEP's data actually is, for the status line. The PMM block advertises PMM's
+# embedded PostgreSQL whatever this says -- that database exists either way; what
+# changes is whether SEP is one of its users.
+sep_data_location() {
+  if [[ -n "$SEP_DB_DIR" ]]; then
+    printf '%s/*.db (OM_SEP_DB_DIR)' "$SEP_DB_DIR"
+  else
+    printf 'postgres://%s@%s:%s/%s' \
+      "$POM_DB_USER" "$POM_DB_HOST" "$POM_DB_PORT" "$POM_DB_NAME"
+  fi
+}
+
 
 sep_psql() {
   docker exec -i "$PMM_CONTAINER" psql "postgres://${POM_DB_USER}@127.0.0.1/${POM_DB_NAME}" "$@" \
