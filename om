@@ -52,7 +52,7 @@
 #
 #   ./om discovery          overview: the last sweep and what it collected
 #   ./om discovery estate [f] the hosts and services POM holds; [f] filters
-#   ./om discovery facts [f] the stored facts, per service; [f] filters
+#   ./om discovery facts [f] what POM observed, per service; [f] filters
 #   ./om discovery runs [n] sweeps, newest first
 #   ./om discovery run      queue a sweep (Nomad jobs; tens of seconds)
 #   ./om discovery sync     refresh SEP inventory from PMM (after a rebuild)
@@ -1994,75 +1994,73 @@ cmd_pom() {
 
 disc_cmd_show() {
   info "POM discovery (SEP app pom_discovery)"
-  sep_api pom_discovery facts | python3 -c '
+  sep_api pom_discovery hosts | python3 -c '
 import json, sys
 from collections import Counter
 try:
-    d = json.load(sys.stdin)
+    hosts = json.load(sys.stdin)
 except ValueError:
-    sys.exit("  could not read the app — is sep-backend up and pom_discovery enabled?")
-if not d.get("run_id"):
-    sys.exit("  no sweep has completed yet — trigger one with ./om discovery run")
-c = d.get("counts") or {}
-print("  sweep %s  %s  %ds old  stale=%s" % (
-    d["run_id"], d["status"], int(d["age_seconds"]), d["stale"]))
-if d.get("error"):
-    print("  error: %s" % d["error"])
-print("  %s service(s): %s resolved, %s orphaned, %s answered" % (
-    c.get("services_total"), c.get("services_resolved"),
-    c.get("services_orphaned"), c.get("services_answered")))
-facts = d.get("facts") or []
-print("  %d fact(s) over %d service(s)" % (len(facts), len({f["service_id"] for f in facts})))
-counts = sorted(Counter(f["field"] for f in facts).items())
-print("  fields: " + ", ".join("%s=%d" % kv for kv in counts))
+    sys.exit("  could not read the app - is sep-backend up and pom_discovery enabled?")
+if not isinstance(hosts, list):
+    sys.exit("  unexpected answer from /hosts: %s" % str(hosts)[:200])
+if not hosts:
+    sys.exit("  no host rows - has a sweep run? ./om discovery run")
+
+services = [s for h in hosts for s in h["services"]]
+probed = [h for h in hosts if h["last_success_at"]]
+failing = [h for h in hosts if h["failing_since"]]
+no_executor = [h for h in hosts if not h["executor_host"]]
+answered = [s for s in services if s["last_success_at"]]
+strangers = sum(len(h["observed"].get("unregistered_mongods") or []) for h in hosts)
+
+print("  %d host(s): %d probed, %d failing, %d with no executor" % (
+    len(hosts), len(probed), len(failing), len(no_executor)))
+print("  %d service(s): %d answered" % (len(services), len(answered)))
+if strangers:
+    print("  %d mongod(s) running that PMM has no service for" % strangers)
+
+# The estate is upserted, so what a field is worth knowing is how many rows still
+# carry it - not how many the last sweep happened to reach.
+fields = Counter(k for s in services for k in s["observed"] if k != "collected_at")
+if fields:
+    print("  service fields: " + ", ".join(
+        "%s=%d" % kv for kv in sorted(fields.items())))
 '
 }
 
-# The facts themselves, one service per block, labelled with the service name.
+# The observations themselves, one service per block, labelled with the service name.
 #
-# The names come from PMM: discovery stores facts against PMM's service UUID, because
-# that is the only key the consumer can join on, so on its own it can only show you
-# UUIDs. Resolving them here is what makes `facts standalone` -- the obvious thing to
-# type -- work at all. The optional argument matches the name or any field value.
+# Reads the estate rather than the database, which is what makes this different from
+# `estate`: the same rows as PMM sees them, through the same endpoint, so a
+# disagreement between this and the sql view is a serialisation bug worth finding.
+# The optional argument matches the name or any observed value.
 disc_cmd_facts() {
-  local names
-  names="$(pmm_api topology 2>/dev/null || true)"
-  sep_api pom_discovery facts | FILTER="${1:-}" NAMES="$names" python3 -c '
+  sep_api pom_discovery services | FILTER="${1:-}" python3 -c '
 import json, os, sys
-from collections import defaultdict
 
-d = json.load(sys.stdin)
-facts = d.get("facts") or []
-if not facts:
-    sys.exit("  no facts stored — the last sweep collected nothing")
-
-# id -> name, best effort: without PMM the blocks are still listed, just by UUID.
-names = {}
-try:
-    topo = json.loads(os.environ.get("NAMES") or "{}")
-    for env in topo.get("environments") or []:
-        for cluster in env.get("clusters") or []:
-            for svc in cluster.get("services") or []:
-                if svc.get("service_id"):
-                    names[svc["service_id"]] = svc["service_name"]
-except ValueError:
-    pass
-
-by_service = defaultdict(dict)
-for f in facts:
-    by_service[f["service_id"]][f["field"]] = f["value"]
+services = json.load(sys.stdin)
+if not isinstance(services, list):
+    sys.exit("  unexpected answer from /services: %s" % str(services)[:200])
+if not services:
+    sys.exit("  no service rows - has a sweep run? ./om discovery run")
 
 needle = os.environ.get("FILTER", "").lower()
 shown = 0
-for sid, fields in sorted(by_service.items(), key=lambda kv: names.get(kv[0], kv[0])):
-    name = names.get(sid)
-    label = "%s  (%s)" % (name, sid) if name else sid
-    blob = " ".join([label] + ["%s=%s" % kv for kv in fields.items()]).lower()
+for service in sorted(services, key=lambda s: s["name"] or s["service_id"]):
+    observed = {k: v for k, v in service["observed"].items() if k != "collected_at"}
+    label = "%s  (%s)" % (service["name"], service["service_id"])
+    blob = " ".join([label] + ["%s=%s" % kv for kv in observed.items()]).lower()
     if needle and needle not in blob:
         continue
     shown += 1
     print("  " + label)
-    for k, v in sorted(fields.items()):
+    if service["failing_since"]:
+        print("      ! %d consecutive failure(s) since %s: %s" % (
+            service["consecutive_failures"], service["failing_since"][:16],
+            (service["last_error"] or "no detail recorded")[:100]))
+    if not observed:
+        print("      (never answered a probe)")
+    for k, v in sorted(observed.items()):
         print("      %-20s %s" % (k, v))
 if not shown:
     sys.exit("  nothing matched %r" % needle)
