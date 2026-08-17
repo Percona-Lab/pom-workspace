@@ -28,6 +28,8 @@
 #   ./om hosts [--write]    /etc/hosts entries so the cluster URIs resolve here
 #                           (prints by default; --write needs sudo, --remove undoes)
 #   ./om ports              what each stack publishes onto the host
+#   ./om reset <tier>       clear local state so ./om setup rebuilds it
+#                           (state | data | all; --env also drops SEP/.env)
 #   ./om doctor             check prerequisites only
 #
 # POM is split across both products. pmm-managed derives the topology document
@@ -58,6 +60,10 @@
 #   ./om discovery api <p>  any /api/apps/pom_discovery path, e.g.
 #                           `api hosts?has_service=false`, `api hosts/<id> -X DELETE`
 #   ./om discovery token    bearer token for /api/docs Authorize and for curl
+#
+# SEP's data lives in PMM's embedded PostgreSQL by default. Set OM_SEP_DB_DIR to a
+# directory to keep it in SQLite files there instead, which is how a second
+# checkout gets its own data without sharing this one's.
 #
 # Components: pmm, sep-backend, sep-frontend, the PSMDB clusters:
 #             standalone, replicaset-single, replicaset-cluster, sharded-cluster
@@ -100,12 +106,67 @@ STATE_DIR="$ROOT/.om"
 SEP_SETTINGS="$HARNESS_DIR/sep-settings.yaml"
 export SETTINGS_FILE="$SEP_SETTINGS"
 
+# SEP's dotenv, rendered for the same reason the settings file is: so the checkout's
+# own SEP/.env stays the machine's secrets file and this workspace can subtract from
+# it without editing it.
+#
+# It only differs from SEP/.env when the data is on disk (below). Environment sources
+# outrank the YAML file, so a DATABASE__PASSWORD in .env survives every attempt to
+# render a password-free SQLite database into settings -- it arrives as a real
+# password and builds `sqlite+aiosqlite://:secret@/path/sep.db`, which pydantic
+# rejects as a URL with an empty host. Dropping the keys is the only thing that
+# works, and ENV_FILE is the supported way to say so.
+SEP_ENV_FILE="$HARNESS_DIR/sep.env"
+
+# Where SEP keeps its data.
+#
+# Unset (the default): PMM's embedded PostgreSQL, which is what the overlay pins and
+# what a single workspace wants -- the same `sep` database PMM provisions under
+# PMM_ENABLE_SEP, shared by all three services and the Celery beat store.
+#
+# Set to a directory: SQLite files under it instead, one per service. That is what a
+# second checkout wants. Two worktrees cannot run at the same time -- container
+# names, host ports and the Docker network are all absolute -- but they can each keep
+# their own data and take turns, which is the part that actually bites: a worktree at
+# an older revision otherwise finds tables its migrations know nothing about.
+#
+#   OM_SEP_DB_DIR=~/.local/share/om/branch-x ./om start
+#
+# Export it in the shell you use for that worktree, or put it in a direnv file. It is
+# read on every ./om invocation, so nothing is remembered between them.
+SEP_DB_DIR="${OM_SEP_DB_DIR:-}"
+
+# Render the dotenv SEP reads, and point it there.
+#
+# With the default backend this is SEP/.env verbatim, so nothing changes. With the
+# data on disk it is SEP/.env minus the database credentials, because a password for
+# a SQLite file is not merely unnecessary -- it makes the URL invalid.
+render_sep_env() {
+  local src="$SEP_DIR/.env"
+  [[ -f "$src" ]] || { export ENV_FILE="$src"; return 0; }
+
+  if [[ -z "$SEP_DB_DIR" ]]; then
+    export ENV_FILE="$src"
+    return 0
+  fi
+
+  # Only the DATABASE credentials go; PMM__API_KEY and everything else are still
+  # wanted, and are still the machine's rather than this file's to invent.
+  grep -vE '^[A-Z]+__DATABASE__(PASSWORD|USER|HOST|PORT|NAME|ENGINE)=' "$src" \
+    > "$SEP_ENV_FILE.tmp" || true
+  mv "$SEP_ENV_FILE.tmp" "$SEP_ENV_FILE"
+  export ENV_FILE="$SEP_ENV_FILE"
+}
+
+
 render_sep_settings() {
   local src="$SEP_DIR/settings.yaml" overlay="$HARNESS_DIR/sep-settings-overlay.yaml"
   [[ -f "$src" ]] || return 0          # no submodule yet: nothing to render, not an error
   [[ -f "$overlay" ]] || die "SEP settings overlay missing at $overlay"
-  python3 - "$src" "$overlay" "$SEP_SETTINGS" <<'PY' || die "rendering $SEP_SETTINGS failed"
-import sys, yaml
+  render_sep_env
+  [[ -n "$SEP_DB_DIR" ]] && mkdir -p "$SEP_DB_DIR"
+  python3 - "$src" "$overlay" "$SEP_SETTINGS" "$SEP_DB_DIR" <<'PY' || die "rendering $SEP_SETTINGS failed"
+import os, sys, yaml
 
 def merge(base, over):
     for key, value in over.items():
@@ -117,11 +178,47 @@ def merge(base, over):
             base[key] = value
     return base
 
-src, overlay, out = sys.argv[1:4]
+
+def on_disk(profile, directory):
+    """Point every service at a SQLite file under `directory`.
+
+    Applied after the merge, so it overrides whatever the overlay pinned rather than
+    fighting the YAML anchor it uses to share one block across three services.
+
+    Each service gets its own file because SEP names them that way by default, and
+    because Alembic tracks them separately -- one file per service keeps a migration
+    failure in one from being a puzzle about the others. The beat store is a fourth:
+    it is not SEP's schema at all, it belongs to sqlalchemy_celery_beat.
+    """
+    for service, filename in (
+        ("SEP", "sep.db"),
+        ("INVENTORY", "inventory.db"),
+        ("TASKS", "tasks.db"),
+    ):
+        profile.setdefault(service, {})["DATABASE"] = {
+            "ENGINE": "sqlite",
+            # Empty rather than null: SEP's own settings.yaml documents this as what
+            # keeps URL construction from producing a host section for SQLite.
+            "HOST": "",
+            "PORT": None,
+            "USER": None,
+            "PASSWORD": None,
+            "NAME": os.path.join(directory, filename),
+        }
+    beat = os.path.join(directory, "schedule.db")
+    profile.setdefault("CELERY", {})["BEAT_DBURI"] = f"sqlite:///{beat}"
+    # BEAT_SCHEMA would be meaningless here; SEP's own validator forces it to None on
+    # SQLite, and saying so in the file avoids a reader wondering which wins.
+    profile["CELERY"]["BEAT_SCHEMA"] = None
+
+
+src, overlay, out, db_dir = sys.argv[1:5]
 with open(src) as fh:
     data = yaml.safe_load(fh)
 with open(overlay) as fh:
     data = merge(data, yaml.safe_load(fh))
+if db_dir:
+    on_disk(data.setdefault("development", {}), db_dir)
 with open(out + ".tmp", "w") as fh:
     yaml.safe_dump(data, fh, sort_keys=False, default_flow_style=False)
 PY
@@ -1142,6 +1239,109 @@ stop_sandbox_node() {
 #
 # The PSMDB clusters publish nothing (psmdb/compose.yaml maps no host ports), so
 # only the SEP and PMM stacks are in play and nothing currently collides.
+# ---------------------------------------------------------------------------
+# reset - put the workspace back to something ./om setup can rebuild
+# ---------------------------------------------------------------------------
+#
+# Three tiers, because "clear everything" spans things that cost seconds to rebuild
+# and things that cannot be rebuilt at all:
+#
+#   state   run state and rendered files. Seconds. Safe.
+#   data    the databases and the cluster volumes. Minutes, and the estate is gone.
+#   all     the above plus the venv, node_modules, containers and images. Tens of
+#           minutes, because the PSMDB image is ~1.6 GB and PMM's is larger.
+#
+# SEP/.env survives every tier unless --env is passed. It holds per-machine secrets
+# nothing local can regenerate -- the PMM service-account token above all -- so
+# deleting it turns a five-minute reset into "find the token again", which is not
+# what anyone means by "reset".
+
+reset_state() {
+  info "state: run state and rendered settings"
+  rm -rf "$PID_DIR" "$LOG_DIR" "$PSMDB_LAST_UP_FILE"
+  rm -f "$SEP_SETTINGS" "$SEP_SETTINGS.tmp"
+  ok "removed .om/ run state; harness/sep-settings.yaml is re-rendered every run"
+}
+
+reset_data() {
+  info "data: SEP's databases and the cluster volumes"
+
+  # The schema, not the database: `sep` itself is provisioned by PMM's postgres-sep
+  # under PMM_ENABLE_SEP, so dropping it would need PMM's own setup to run again.
+  # Dropping the tables inside it is what makes `make migrate` rebuild from base.
+  if [[ -z "$SEP_DB_DIR" ]]; then
+    if docker exec "$PMM_CONTAINER" true 2>/dev/null; then
+      sep_psql -q -c "DROP SCHEMA IF EXISTS pom CASCADE;" \
+               -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null 2>&1 \
+        && ok "dropped SEP's schemas in $POM_DB_NAME" \
+        || warn "could not reach $POM_DB_NAME - is pmm running?"
+    else
+      warn "$PMM_CONTAINER is not running; skipped the database"
+    fi
+  else
+    rm -f "$SEP_DB_DIR"/*.db
+    ok "removed the SQLite files under $SEP_DB_DIR"
+  fi
+
+  if [[ -d "$PSMDB_DIR" ]]; then
+    local profile
+    for profile in "${NODE_PROFILES[@]}"; do
+      psmdb_compose --profile "$profile" down -v >/dev/null 2>&1 || true
+    done
+    ok "psmdb containers and data volumes removed"
+  fi
+}
+
+reset_all() {
+  info "all: build outputs and images"
+  rm -rf "$SEP_DIR/venv" "$SEP_DIR/frontend/node_modules"
+  ok "removed SEP's venv and frontend/node_modules"
+
+  docker rm -f "$PMM_CONTAINER" >/dev/null 2>&1 && ok "removed $PMM_CONTAINER" || true
+  docker image rm -f "$PSMDB_IMAGE" "$CLIENT_IMAGE" >/dev/null 2>&1 \
+    && ok "removed the psmdb node images" || true
+  rm -f "$PSMDB_DIR/secrets/keyfile"
+  dim "the keyfile is regenerated on the next cluster start"
+}
+
+cmd_reset() {
+  local tier="" drop_env=""
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --state|state) tier=state ;;
+      --data|data)   tier=data ;;
+      --all|all)     tier=all ;;
+      --env)         drop_env=1 ;;
+      *) die "usage: ./om reset <state|data|all> [--env]" ;;
+    esac
+  done
+  [[ -n "$tier" ]] || die "usage: ./om reset <state|data|all> [--env]
+    state  run state and rendered settings (safe)
+    data   ...and SEP's databases and the cluster volumes
+    all    ...and the venv, node_modules, PMM container and psmdb images
+    --env  also delete SEP/.env, which holds secrets nothing can regenerate"
+
+  warn "this removes local state; nothing in git is touched"
+  dim "stopping everything first"
+  cmd_stop >/dev/null 2>&1 || true
+
+  reset_state
+  [[ "$tier" == data || "$tier" == all ]] && reset_data
+  [[ "$tier" == all ]] && reset_all
+
+  if [[ -n "$drop_env" ]]; then
+    rm -f "$SEP_DIR/.env"
+    warn "removed SEP/.env - the PMM API key and database passwords go with it"
+  else
+    dim "SEP/.env kept (pass --env to remove it too)"
+  fi
+
+  echo
+  ok "reset to '$tier'"
+  dim "next: ./om setup"
+}
+
 cmd_ports() {
   info "Known host ports"
   printf '  %-6s %-22s %s\n' PORT OWNER NOTE
@@ -1584,6 +1784,44 @@ sep_psql() {
     || die "cannot reach SEP's database in $PMM_CONTAINER — is pmm running?"
 }
 
+# The SQLite file SEP's own tables live in, when OM_SEP_DB_DIR selects that backend.
+# POM's tables are SEP's, so this is the file they are in; inventory and tasks keep
+# their own, which is also why `service` here cannot collide with inventory's.
+sep_sqlite_file() { printf '%s/sep.db' "$SEP_DB_DIR"; }
+
+# How POM's tables are addressed, which is not the same on both backends.
+#
+# The models declare a *symbolic* schema that the engine translates per bind: to
+# `pom` on PostgreSQL, and to the default schema on SQLite, which has no schemas.
+# So the same table is `pom.host` in one and plain `host` in the other, and a query
+# written for one is a syntax error against the other.
+pom_table() {
+  if [[ -n "$SEP_DB_DIR" ]]; then printf '%s' "$1"; else printf 'pom.%s' "$1"; fi
+}
+
+# Run one query against SEP's database, whichever backend it is on, and print rows
+# separated by tabs with no header. `python3` rather than the `sqlite3` CLI because
+# the CLI is not a dependency this workspace otherwise has, and python3 always is.
+sep_query() {
+  if [[ -z "$SEP_DB_DIR" ]]; then
+    sep_psql -t -A -F$'\t' -c "$1"
+    return
+  fi
+  python3 - "$(sep_sqlite_file)" "$1" <<'PY'
+import sqlite3, sys
+path, query = sys.argv[1:3]
+try:
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+except sqlite3.Error as err:
+    sys.exit(f"cannot open {path}: {err}")
+try:
+    for row in con.execute(query):
+        print("\t".join("" if value is None else str(value) for value in row))
+except sqlite3.Error as err:
+    sys.exit(str(err))
+PY
+}
+
 pmm_psql() {
   docker exec -i "$PMM_CONTAINER" psql "postgres://pmm-managed@127.0.0.1/pmm-managed" "$@" \
     || die "cannot reach pmm-managed's database in $PMM_CONTAINER — is pmm running?"
@@ -1842,54 +2080,108 @@ disc_cmd_run() {
 # looks wrong.
 disc_cmd_estate() {
   local filter="${1:-}"
-  sep_psql -t -A -F$'\t' -c "
-    select h.name,
-           coalesce(h.executor_host, '-'),
-           coalesce(to_char(h.last_success_at, 'YYYY-MM-DD HH24:MI'), 'never'),
-           coalesce(h.observed->>'os', '-'),
-           coalesce(jsonb_array_length(h.observed->'unregistered_mongods'), 0),
-           coalesce(h.consecutive_failures, 0),
-           coalesce((select string_agg(s.name || ' :' || coalesce(s.port::text, '?')
-                                       || case when s.last_success_at is null
-                                               then ' (not probed)' else '' end,
-                                       '|' order by s.name)
-                     from pom.service s where s.node_id = h.node_id), '')
-    from pom.host h
-    order by h.name;" | FILTER="$filter" python3 -c '
-import os, sys
+  # Two plain selects rather than one shaped query. Everything that made the shaped
+  # version readable -- to_char, ::text, string_agg, jsonb_array_length -- is
+  # PostgreSQL-only, and SEP's data can now be on SQLite. `cast(x as text)` and
+  # `coalesce` are the portable subset; the rest is done below, where it is easier to
+  # read anyway.
+  local hosts services
+  hosts="$(sep_query "
+    select h.node_id, h.name, coalesce(h.executor_host, ''),
+           coalesce(cast(h.last_success_at as text), ''),
+           coalesce(cast(h.observed as text), '{}'),
+           coalesce(h.consecutive_failures, 0)
+    from $(pom_table host) h order by h.name;")"
+  services="$(sep_query "
+    select s.node_id, coalesce(s.name, '?'), coalesce(cast(s.port as text), '?'),
+           coalesce(cast(s.last_success_at as text), '')
+    from $(pom_table service) s order by s.name;")"
+
+  FILTER="$filter" SERVICES="$services" python3 -c '
+import json, os, sys
+from collections import defaultdict
+
+by_node = defaultdict(list)
+for line in os.environ.get("SERVICES", "").splitlines():
+    if not line.strip():
+        continue
+    node_id, name, port, probed = (line.split("\t") + [""] * 4)[:4]
+    by_node[node_id].append("%s :%s%s" % (name, port, "" if probed else " (not probed)"))
 
 needle = os.environ.get("FILTER", "").lower()
-rows = [line.rstrip("\n").split("\t") for line in sys.stdin if line.strip()]
-if not rows:
-    sys.exit("  no host rows - has a sweep run? ./om discovery run")
+shown = rows = 0
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    rows += 1
+    node_id, name, executor, seen, observed, failures = (
+        line.rstrip("\n").split("\t") + [""] * 6
+    )[:6]
+    try:
+        document = json.loads(observed or "{}")
+    except ValueError:
+        document = {}
+    os_name = document.get("os") or "-"
+    strangers = len(document.get("unregistered_mongods") or [])
+    services = by_node.get(node_id, [])
 
-shown = 0
-for name, executor, seen, os_name, strangers, failures, services in rows:
-    if needle and needle not in " ".join((name, executor, os_name, services)).lower():
+    if needle and needle not in " ".join([name, executor, os_name, *services]).lower():
         continue
     shown += 1
+
     marks = []
-    if executor == "-":
+    if not executor:
         marks.append("no executor")
-    if int(failures):
+    if int(failures or 0):
         marks.append("%s consecutive failure(s)" % failures)
-    if int(strangers):
+    if strangers:
         marks.append("%s mongod(s) PMM does not know" % strangers)
-    print("  %-30s %-20s last probed %s" % (name, os_name, seen))
+
+    print("  %-30s %-20s last probed %s" % (name, os_name, seen[:16] or "never"))
     if marks:
         print("      ! " + "; ".join(marks))
-    for svc in filter(None, services.split("|")):
-        print("      %s" % svc)
+    for service in services:
+        print("      %s" % service)
     if not services:
         print("      (no MongoDB service registered here)")
+
+if not rows:
+    sys.exit("  no host rows - has a sweep run? ./om discovery run")
 if not shown:
     sys.exit("  nothing matched %r" % needle)
-'
+' <<< "$hosts"
 }
 
+
 disc_cmd_sql() {
-  [[ $# -gt 0 ]] || die "usage: ./om discovery sql <query>   (tables: pom.host, pom.service, pom.discovery_run)"
-  sep_psql -c "$*"
+  [[ $# -gt 0 ]] || die "usage: ./om discovery sql <query>
+    tables: $(pom_table host), $(pom_table service), $(pom_table discovery_run)"
+  if [[ -z "$SEP_DB_DIR" ]]; then
+    sep_psql -c "$*"
+    return
+  fi
+  # Column-aligned rather than the tab-separated form sep_query gives, because this
+  # one is read by a person rather than piped into another program.
+  python3 - "$(sep_sqlite_file)" "$*" <<'SQLITE'
+import sqlite3, sys
+path, query = sys.argv[1:3]
+try:
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    cursor = con.execute(query)
+except sqlite3.Error as err:
+    sys.exit(str(err))
+rows = cursor.fetchall()
+if cursor.description is None:
+    sys.exit(0)
+headers = [column[0] for column in cursor.description]
+table = [headers, *[["" if v is None else str(v) for v in row] for row in rows]]
+widths = [max(len(row[i]) for row in table) for i in range(len(headers))]
+for index, row in enumerate(table):
+    print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+    if index == 0:
+        print("  ".join("-" * width for width in widths))
+print(f"({len(rows)} rows)")
+SQLITE
 }
 
 # Any path under the app's API. Extra arguments go straight to curl, so a write is
@@ -2075,6 +2367,7 @@ main() {
     urls|uris) cmd_urls "$@" ;;
     hosts)   cmd_hosts "$@" ;;
     inventory) cmd_inventory "$@" ;;
+    reset)   cmd_reset "$@" ;;
     doctor)  cmd_doctor ;;
     ""|-h|--help|help) usage ;;
     *) err "unknown command '$cmd'"; echo; usage; exit 1 ;;
