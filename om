@@ -55,7 +55,8 @@
 #   ./om discovery run      queue a sweep (Nomad jobs; tens of seconds)
 #   ./om discovery sync     refresh SEP inventory from PMM (after a rebuild)
 #   ./om discovery sql <q>  psql against the pom schema
-#   ./om discovery api <p>  any /api/apps/pom_discovery path
+#   ./om discovery api <p>  any /api/apps/pom_discovery path, e.g.
+#                           `api hosts?has_service=false`, `api hosts/<id> -X DELETE`
 #   ./om discovery token    bearer token for /api/docs Authorize and for curl
 #
 # Components: pmm, sep-backend, sep-frontend, the PSMDB clusters:
@@ -1891,10 +1892,26 @@ disc_cmd_sql() {
   sep_psql -c "$*"
 }
 
+# Any path under the app's API. Extra arguments go straight to curl, so a write is
+# `discovery api hosts/<node_id> -X DELETE`.
+#
+# The status line is printed as well as the body, because the useful writes here have
+# no body: a successful DELETE is `204` and nothing else, which json_out can only
+# render as "(empty response)" -- indistinguishable from a request that failed
+# silently. Reporting the code makes 204 and 404 tell their own story.
 disc_cmd_api() {
-  [[ $# -gt 0 ]] || die "usage: ./om discovery api <path> [curl args]   e.g. ./om discovery api facts"
+  [[ $# -gt 0 ]] || die "usage: ./om discovery api <path> [curl args]   e.g. ./om discovery api hosts"
   local path="$1"; shift
-  sep_api pom_discovery "$path" "$@" | json_out
+  local response status body
+  response="$(sep_api pom_discovery "$path" -w $'\n%{http_code}' "$@")"
+  status="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  [[ -n "$body" ]] && printf '%s' "$body" | json_out
+  case "$status" in
+    2*) ok   "HTTP $status" ;;
+    *)  warn "HTTP $status" ;;
+  esac
 }
 
 disc_cmd_sync() {
