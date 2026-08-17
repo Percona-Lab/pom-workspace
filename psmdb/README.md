@@ -190,6 +190,19 @@ Everything is idempotent — containers get recreated onto existing data volumes
   comes up with zero shards and a mongos that looks healthy.
 - **Stale PMM inventory.** `--force` on `pmm-agent setup` replaces a node of the
   same name, but services from a torn-down topology linger until removed in PMM.
+- **Restarting `pmm-agent` used to de-register the node's database.** `setup
+  --force` replaces the node, and replacing a node takes its services with it.
+  `register.sh` is a supervisord one-shot that ran at container start, so nothing
+  added the service back: the node returned healthy, its mongod kept running, and
+  PMM simply stopped knowing there was a database on it. Nothing surfaced that -
+  it was found only because POM reported a mongod it had no service for.
+  `run-pmm-agent.sh` now re-asserts registration on every start, so a
+  `supervisorctl restart pmm-agent` is safe again. If you meet a node in the old
+  state, `supervisorctl start register` inside it puts the service back.
+- **Restarting `pmm-agent` gives the node a new PMM node id**, because `--force`
+  replaces rather than updates it. Anything keyed on that id - POM's `pom.host`,
+  for one - gains a row and keeps the old one. Harmless here, worth knowing before
+  you conclude an estate has twice the hosts it does.
 - **Ubuntu, not RHEL.** Chosen for `apt`. The same Dockerfile works on
   `oraclelinux:9` with `dnf` if you need to match a RHEL estate — the official
   `percona/percona-server-mongodb` image is UBI 9 and its mongod is rpm-owned, so

@@ -47,5 +47,26 @@ pmm-agent setup \
     --force \
     "$(hostname)" container "$(hostname)" >&2
 
+# `setup --force` REPLACES the node in PMM, and replacing a node takes its services
+# with it. On a container's first start that costs nothing -- register.sh is about to
+# add the service anyway. On a *restart* of this program it is silent damage: the
+# one-shot ran days ago and will not run again, so the node comes back healthy with
+# its MongoDB service gone, and nothing says so. Observed exactly that way: a
+# supervisorctl restart of this program to recover a Nomad client left a monitored
+# database unmonitored, and the only thing that noticed was POM reporting a mongod it
+# had no service for.
+#
+# So re-assert registration whenever this program starts. Both names are tried
+# because the database image supervises `register` and the pmm-client-only image
+# supervises `register-client`; the absent one simply fails and is ignored.
+# Backgrounded because both scripts wait for *this* agent to connect, which cannot
+# happen until the exec below replaces this shell.
+(
+    sleep 5
+    for program in register register-client; do
+        supervisorctl start "$program" >/dev/null 2>&1 || true
+    done
+) &
+
 log "setup complete, starting agent"
 exec pmm-agent --config-file="$CONFIG"
