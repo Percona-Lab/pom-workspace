@@ -2215,8 +2215,20 @@ for line in sys.stdin:
     shown += 1
 
     marks = []
-    if not executor:
-        marks.append("no executor")
+    # Three different answers to "nothing can run here", not one. Never onboarded,
+    # onboarded and down, and onboarded with a broken driver need three different
+    # people to fix them, so the view says which.
+    state = document.get("executor") or {}
+    if not state.get("registered", bool(executor)):
+        marks.append("no executor client registered")
+    elif not state.get("reachable", True):
+        marks.append("executor registered but unreachable")
+    elif not state.get("driver_healthy", True):
+        detail = state.get("detail")
+        marks.append(
+            "executor reachable but its driver is unhealthy"
+            + (": %s" % detail if detail else "")
+        )
     if int(failures or 0):
         marks.append("%s consecutive failure(s)" % failures)
     if strangers:
