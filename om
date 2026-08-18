@@ -19,7 +19,7 @@
 #                           container is serving the image's stale binary/bundle,
 #                           which a container recreate always leaves it doing)
 #   ./om pom [sub]          POM in PMM: topology documents (see below)
-#   ./om discovery [sub]    POM discovery in SEP: on-host facts (see below)
+#   ./om discovery [sub]    POM's estate in SEP: hosts, services, sweeps (see below)
 #   ./om sep-api <app> <p>  call any SEP app's API
 #   ./om inventory [view]   PMM's inventory as JSON on stdout, nodes/services/
 #                           agents joined into one document. Views: tree
@@ -32,10 +32,21 @@
 #                           (state | data | all; --env also drops SEP/.env)
 #   ./om doctor             check prerequisites only
 #
-# POM is split across both products. pmm-managed derives the topology document
-# from PMM's own inventory and VictoriaMetrics; SEP's pom_discovery app probes the
-# database hosts over Nomad for the facts no metric carries, and PMM pulls them.
-# There is a command group per side, and each reaches both its store and its API.
+# POM is split across both products. pmm-managed derives the topology document from
+# PMM's own inventory and VictoriaMetrics; SEP's pom_discovery app probes every host
+# over Nomad -- database or not -- and keeps an upserted estate of what it found.
+# pmm-managed reads that estate, and also proxies it at /v1/pom/inventory/* so the UI
+# reaches it through PMM's own origin.
+#
+# There is a command group per side, and each reaches both its store and its API. The
+# estate is therefore reachable two ways on purpose:
+#
+#   ./om discovery estate     straight from the tables
+#   ./om discovery facts      through SEP's own API
+#   ./om pom api inventory/hosts   through PMM's proxy, as the UI sees it
+#
+# They should never disagree, so a disagreement is a serialisation bug rather than
+# three views of different things.
 #
 # POM in PMM (tables pom_runs / pom_snapshots, API /v1/pom):
 #
@@ -46,11 +57,12 @@
 #   ./om pom run            trigger a collection (fast; does NOT probe)
 #   ./om pom sql <query>    psql against pom_runs / pom_snapshots
 #   ./om pom api <path>     any /v1/pom path, e.g. `api discovery/runs -X POST -d {}`
+#                           or `api inventory/hosts` for the proxied estate
 #
 # POM discovery in SEP (schema pom: host, service, discovery_run;
 #                      API /api/apps/pom_discovery):
 #
-#   ./om discovery          overview: the last sweep and what it collected
+#   ./om discovery          overview: how much of the estate is probed and failing
 #   ./om discovery estate [f] the hosts and services POM holds; [f] filters
 #   ./om discovery facts [f] what POM observed, per service; [f] filters
 #   ./om discovery config    the app's settings, and where each value comes from

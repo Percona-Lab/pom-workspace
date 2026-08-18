@@ -1,6 +1,6 @@
 # How OpenManager Fits Together
 
-**As of:** 2026-08-12
+**As of:** 2026-08-18
 **Derived from:** `pmm/` @ `sep-combined-local` (`v3.8.1-185-g5adae2f50` = PMM-15216 +
 PMM-15293 + PMM-15238; `docker-compose.dev.yml`, `.env`,
 `build/ansible/roles/{supervisord,nginx}/files/*`, `managed/services/supervisord/*`,
@@ -15,6 +15,14 @@ state cross-checked against a running stack (`./om status`, `docker ps`,
 will know what is running and why. Parts 3 onward add detail, one layer at a time. Every
 name in *italics* the first time it appears is explained in
 [`glossary.md`](glossary.md).
+
+> **What changed since 2026-08-12** - POM grew an **inventory of its own**. The
+> `pom_discovery` app now keeps upserted `pom.host` and `pom.service` tables rather than
+> serving the last sweep's output, pmm-managed **proxies** that estate at
+> `/v1/pom/inventory/*`, and the PMM UI gained Services, Hosts and Discovery pages that
+> reach it through PMM's own origin - so no POM page in the browser talks to SEP any
+> more. The decisions still open are in
+> [`pom-open-questions.md`](pom-open-questions.md).
 
 > **What changed since 2026-08-10** — one thing, and it is structural: **POM was split
 > across the two products.** Deriving the MongoDB topology moved into pmm-managed, which
@@ -540,32 +548,38 @@ flavor (`custom_ui=True`) needs a real React component.
 Celery task is discoverable and it can be switched off. It is the clearest example of the
 current execution shape, and of the split that shape now serves.
 
-POM's *derivation* lives in pmm-managed, not here — it reads PMM's own inventory and
+POM's *derivation* lives in pmm-managed - it reads PMM's own inventory and
 VictoriaMetrics, and reconstructing the MongoDB topology is a gap in PMM rather than a
 SEP feature. What is left in SEP is the half that genuinely needs a process on a database
 host. `pom_discovery` is that half:
 
-1. list MongoDB services from SEP's inventory;
-2. resolve each to the executor host its probe must run on — strictly, so an unmatched
-   service is recorded as *orphaned* rather than probed somewhere wrong;
-3. dispatch the probe payload **once per executor host** (carrying every service that host
-   serves) via the pre-seeded system `run-python` task, and collect NDJSON back over the
-   task-log chunk store rather than the 16 KB result file;
-4. store the facts, keyed by **PMM's service UUID** — the only key the consumer can join
-   on — as a JSONB array on the sweep's row in `pom_discovery_run`, beside a second array
-   holding one record per mapped service: its executor host, how that host was matched,
-   whether it answered, and how long the host's dispatch took;
-5. serve them at `GET /api/apps/pom_discovery/facts`, which **never probes**: it answers
-   from the last completed sweep and reports its age.
+1. enumerate **hosts** from SEP's inventory nodes, crossed with the executor list - not
+   from services, because a host with no database has no service to be found through, and
+   that host is the point: it is where a database can be installed;
+2. match each to the executor host its probe must run on - strictly, so an unmatched
+   host is recorded as orphaned rather than probed somewhere wrong;
+3. dispatch the probe payload **once per executor host** via the pre-seeded system
+   `run-python` task, and collect NDJSON back over the task-log chunk store rather than
+   the 16 KB result file;
+4. **upsert** what it found into `pom.host` and `pom.service`, keyed on PMM's own node
+   and service ids - the only keys the consumer can join on;
+5. serve the estate at `GET /api/apps/pom_discovery/{hosts,services}`, which **never
+   probes**: it answers from stored rows, each carrying its own age.
 
 That last point is the load-bearing one. A sweep dispatches Nomad jobs and takes tens of
-seconds; pmm-managed assembles its document in about a tenth of a second and pulls these
-facts on the way. The endpoint being a stored-row read is what keeps the two apart. The
-sweep runs on its own 10-minute clock.
+seconds; pmm-managed assembles its document in about a tenth of a second and reads these
+rows on the way. The endpoint being a stored-row read is what keeps the two apart. The
+sweep runs on its own 10-minute clock, and can be scoped to named hosts.
 
-What the probe contributes is what no metric carries: the **installed** binary version as
-against the running one — their divergence is the upgraded-but-not-restarted case — plus
-the config path, the command line, the git version and the OS pair.
+Because the rows are upserted rather than replaced per sweep, a service the newest sweep
+failed to reach still answers with what it last reported and how old that is - where the
+retired `GET /facts` would have dropped it, making an unreachable host look like a host
+with nothing installed on it.
+
+What the probe contributes is what no metric carries: the **installed** package version
+as against the running one - their divergence is the upgraded-but-not-restarted case -
+the config path, the command line, the OS pair, whether the host can reach Percona's
+repository, and any mongod running that PMM has no service for.
 
 `pom_discovery` reads its `credentials_path` from the `/root/.mongodb_uri` that
 `register.sh` writes, the same file `backup_mongo` uses.
@@ -577,7 +591,8 @@ is a second caller.
 
 > `pom_worker` and `pom_api` — the earlier, SEP-only POM — were **deleted on 2026-08-12**
 > once the pmm-managed implementation held parity. Their tables (`pom_run`, `pom_node`,
-> `pom_snapshot`) went with them.
+> `pom_snapshot`) went with them. `GET /facts` followed on **2026-08-17**, replaced by
+> the estate above.
 
 The full picture, including the document's conventions and the traps behind them, is in
 [`architecture.md`](architecture.md).
