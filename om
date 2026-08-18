@@ -53,6 +53,8 @@
 #   ./om discovery          overview: the last sweep and what it collected
 #   ./om discovery estate [f] the hosts and services POM holds; [f] filters
 #   ./om discovery facts [f] what POM observed, per service; [f] filters
+#   ./om discovery config    the app's settings, and where each value comes from
+#   ./om discovery config <k> <v>   change one; `-` as the value reverts it
 #   ./om discovery runs [n] sweeps, newest first
 #   ./om discovery run      queue a sweep (Nomad jobs; tens of seconds)
 #   ./om discovery sync     refresh SEP inventory from PMM (after a rebuild)
@@ -2067,6 +2069,68 @@ if not shown:
 '
 }
 
+# The app's settings, read and written over its own /config.
+#
+# Not `./om discovery sql "select * from settingoverride"`: that shows the rows that
+# *override* the YAML and nothing else, so a value the deployment configured looks
+# identical to one that was never configured at all. The endpoint reports both, which
+# is the question worth asking -- "why is it sweeping every 10 minutes" is answered by
+# the origin, not by the number.
+#
+# The key set is not symmetric between reading and writing: SCHEDULE is listed as
+# SCHEDULE__every and SCHEDULE__period, but only the parent key accepts null, which is
+# how the sweep is turned off. Both spellings are passed straight through.
+disc_cmd_config() {
+  local key="${1:-}" value="${2:-}"
+
+  if [[ -z "$key" ]]; then
+    info "POM discovery configuration"
+    sep_api pom_discovery config | python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    sys.exit("  could not read the app - is sep-backend up?")
+if not isinstance(rows, list):
+    sys.exit("  unexpected answer from /config: %s" % str(rows)[:200])
+for row in rows:
+    if row["reload"] != "hot":
+        continue
+    origin = "overridden" if row["has_override"] else "from settings.yaml"
+    advanced = "  (advanced)" if row["is_advanced"] else ""
+    print("  %-22s %-20s %s%s" % (row["key"], row["value"], origin, advanced))
+print()
+print("  change one with: ./om discovery config <key> <value>")
+print("  revert one with: ./om discovery config <key> -")
+'
+    return
+  fi
+
+  [[ -n "$value" ]] || die "usage: ./om discovery config <key> <value>   ('-' reverts)"
+
+  if [[ "$value" == "-" ]]; then
+    dim "reverting $key to the deployed value"
+    sep_api pom_discovery "config/$key" -X DELETE -o /dev/null -w '%{http_code}\n'
+    return
+  fi
+
+  # Passed through as JSON so `null`, `true` and numbers keep their types; anything
+  # that is not valid JSON is sent as a string, which is what a bare path or name is.
+  local body
+  body="$(KEY="$key" VALUE="$value" python3 -c '
+import json, os
+raw = os.environ["VALUE"]
+try:
+    parsed = json.loads(raw)
+except ValueError:
+    parsed = raw
+print(json.dumps({os.environ["KEY"]: parsed}))
+')"
+  sep_api pom_discovery config -X PATCH \
+    -H 'Content-Type: application/json' -d "$body" | json_out
+}
+
+
 disc_cmd_runs() {
   info "Probe sweeps (SEP)"
   sep_api pom_discovery "runs?limit=${1:-15}" | python3 -c '
@@ -2249,6 +2313,7 @@ cmd_discovery() {
   case "$sub" in
     show)  disc_cmd_show "$@" ;;
     estate) disc_cmd_estate "$@" ;;
+    config) disc_cmd_config "$@" ;;
     facts) disc_cmd_facts "$@" ;;
     runs)  disc_cmd_runs "$@" ;;
     run)   disc_cmd_run "$@" ;;
@@ -2256,7 +2321,7 @@ cmd_discovery() {
     sql)   disc_cmd_sql "$@" ;;
     api)   disc_cmd_api "$@" ;;
     token) sep_token ;;
-    *) die "unknown discovery subcommand '$sub' (show|estate|facts|runs|run|sync|sql|api|token)" ;;
+    *) die "unknown discovery subcommand '$sub' (show|estate|facts|config|runs|run|sync|sql|api|token)" ;;
   esac
 }
 
