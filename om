@@ -2234,6 +2234,16 @@ for line in sys.stdin:
     if strangers:
         marks.append("%s mongod(s) PMM does not know" % strangers)
 
+    # Only when it is a problem. A working repository on every host would be one
+    # more line per host saying nothing, and this view is read by scanning it.
+    repo = document.get("repo") or {}
+    if repo and not repo.get("reachable"):
+        via = " via %s" % repo["proxy"] if repo.get("proxy") else ""
+        marks.append(
+            "cannot reach %s%s: %s"
+            % (repo.get("url", "the repository"), via, repo.get("error") or "no detail")
+        )
+
     print("  %-30s %-20s last probed %s" % (name, os_name, seen[:16] or "never"))
     if marks:
         print("      ! " + "; ".join(marks))
