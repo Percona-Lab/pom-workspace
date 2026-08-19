@@ -216,10 +216,12 @@ Three things that are not about POM but will bite at PR time:
   do with POM - it is a datetime-picker test - but it costs a re-run often enough to be
   worth someone's attention.
 
-- **Sign-off.** PMM's `AGENTS.md` requires `git commit -s`. The POM commits made before
-  2026-08-18 do not carry a `Signed-off-by` trailer, though upstream commits on the same
-  branch do. Fixing them needs a history rewrite, which should be a deliberate decision
-  before this goes near a PR, since DCO is usually enforced there.
+- **Sign-off: done, and worth knowing why only one repo.** PMM's `AGENTS.md` requires
+  `git commit -s`, and three POM commits predating 2026-08-19 lacked the trailer; they
+  were amended while the history was already being rewritten. **SEP was deliberately
+  left alone** - none of its last twenty upstream commits carry a sign-off, so it does
+  not use DCO and adding trailers there would have invented a convention. Checking that
+  before applying is the point: the two repos share a branch name and not a policy.
 - **`make gen` in `pmm/`.** The full target rewrites 56 API files with a blank-line
   difference from a protoc-gen-go version that is not whatever produced the committed
   output. Use `buf generate --path pom/v1/pom.proto .` from `api/` to keep the diff to
