@@ -521,6 +521,18 @@ image has outrun the checkout: `users.xml` comes from the image and
 pins the image by digest for this reason - if you overrode the pin, put it back. POM
 itself is unaffected, since it reads PostgreSQL and VictoriaMetrics.
 
+**`container pmm-server exited (1)` within a second, with no supervisord output** - the
+entrypoint died before supervisord started. `docker logs pmm-server` shows where. If it
+is `rm: cannot remove '/srv/grafana/plugins/…': Permission denied`, the `/srv` volume
+holds files written by a *different* image version that this one cannot clean up, and the
+entrypoint runs under `set -o errexit`. Clear the volume:
+
+```bash
+./om stop pmm
+./om reset data      # includes pmm-data, PMM's /srv
+./om start pmm
+```
+
 **PMM answers on 443 instead of 8443** - `docker ps` shows `0.0.0.0:443->8443/tcp`.
 Compose interpolates the published port when the container is **created**, so editing
 `PMM_PORT_HTTPS` and restarting changes nothing. Recreate it with `./om stop pmm && ./om

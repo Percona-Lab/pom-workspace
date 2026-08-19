@@ -1562,23 +1562,25 @@ reset_state() {
 }
 
 reset_data() {
-  info "data: SEP's databases and the cluster volumes"
+  info "data: SEP's databases, the cluster volumes and PMM's /srv"
 
-  # The schema, not the database: `sep` itself is provisioned by PMM's postgres-sep
-  # under PMM_ENABLE_SEP, so dropping it would need PMM's own setup to run again.
-  # Dropping the tables inside it is what makes `make migrate` rebuild from base.
-  if [[ -z "$SEP_DB_DIR" ]]; then
-    if docker exec "$PMM_CONTAINER" true 2>/dev/null; then
-      sep_psql -q -c "DROP SCHEMA IF EXISTS pom CASCADE;" \
-               -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null 2>&1 \
-        && ok "dropped SEP's schemas in $POM_DB_NAME" \
-        || warn "could not reach $POM_DB_NAME - is pmm running?"
-    else
-      warn "$PMM_CONTAINER is not running; skipped the database"
-    fi
-  else
+  # On the default backend SEP's data is inside PMM's /srv, so reset_pmm_data below
+  # is what clears it and there is nothing to do here.
+  #
+  # This used to drop the `pom` and `public` schemas over psql instead, on the
+  # reasoning that the `sep` database itself is provisioned by PMM's postgres-sep
+  # and should outlive a reset. That became unreachable the moment this tier
+  # started removing pmm-data: cmd_reset stops everything before calling us, so
+  # the container was always gone by the time the drop was attempted, and the only
+  # thing it ever printed was "pmm-server is not running; skipped the database" -
+  # a warning about a step whose work had already been done a few lines later.
+  # Provisioning is not a reason to keep it either: postgres-sep re-runs on every
+  # start, so a removed volume comes back with the role and database in place.
+  if [[ -n "$SEP_DB_DIR" ]]; then
     rm -f "$SEP_DB_DIR"/*.db
     ok "removed the SQLite files under $SEP_DB_DIR"
+  else
+    dim "SEP's tables live in PMM's /srv; they go with the volume below"
   fi
 
   if [[ -d "$PSMDB_DIR" ]]; then
@@ -1587,6 +1589,40 @@ reset_data() {
       psmdb_compose --profile "$profile" down -v >/dev/null 2>&1 || true
     done
     ok "psmdb containers and data volumes removed"
+  fi
+
+  reset_pmm_data
+}
+
+# PMM's /srv, which is the volume people mean when a container will not start.
+#
+# It used to be left alone, and the omission was silent: `reset data` claimed to
+# clear data and then reported success while the one volume worth clearing stayed
+# behind. That matters most when the image has changed underneath the volume,
+# because /srv then holds files the new image's entrypoint cannot remove - a
+# denied `rm` in the Grafana plugin sync is enough to kill an entrypoint that runs
+# under `set -o errexit`, and the container exits 1 before supervisord logs a line.
+#
+# Named, not derived: docker-compose.dev.yml declares `name: pmm-data` with no
+# project prefix, so it is that exact volume and it is shared by every checkout on
+# the machine.
+reset_pmm_data() {
+  docker volume inspect pmm-data >/dev/null 2>&1 || { dim "no pmm-data volume"; return 0; }
+
+  # The container holds the volume open, and a running PMM is also the one case
+  # where wiping it is more likely to be a mistake than an intention.
+  if docker ps --format '{{.Names}}' | grep -qx "$PMM_CONTAINER"; then
+    warn "$PMM_CONTAINER is running; kept its /srv volume"
+    dim "to clear it: ./om stop pmm && ./om reset data"
+    return 0
+  fi
+
+  if docker volume rm pmm-data >/dev/null 2>&1; then
+    ok "removed the pmm-data volume (PMM's /srv)"
+    dim "next ./om start pmm re-provisions PostgreSQL, Grafana and the sep database"
+  else
+    warn "could not remove the pmm-data volume - something still has it open"
+    dim "docker ps -a --filter volume=pmm-data"
   fi
 }
 
@@ -1616,7 +1652,7 @@ cmd_reset() {
   done
   [[ -n "$tier" ]] || die "usage: ./om reset <state|data|all> [--env]
     state  run state and rendered settings (safe)
-    data   ...and SEP's databases and the cluster volumes
+    data   ...and SEP's databases, the cluster volumes and PMM's /srv (pmm-data)
     all    ...and the venv, node_modules, PMM container and psmdb images
     --env  also delete SEP/.env, which holds secrets nothing can regenerate"
 
