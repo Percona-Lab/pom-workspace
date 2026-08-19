@@ -1206,8 +1206,15 @@ start_pmm() {
   # 100s was survivable while everyone's /srv already existed. `./om bootstrap`
   # made the cold path the normal one and it started failing there, which is the
   # only place it matters and the worst place to fail.
+  # Timed, because the failure this reports is not always a timeout. `--wait`
+  # also gives up the instant a container turns unhealthy, so this can return in
+  # forty seconds - and saying "within 300s" when forty elapsed sent the last two
+  # investigations at the wrong thing entirely. harness/pmm-compose.override.yml
+  # sets a start period that matches a cold start, which is what stops that
+  # happening; the elapsed time here is how anyone would notice if it came back.
+  local t0=$SECONDS
   if ! pmm_compose up -d --wait --wait-timeout 300; then
-    err "pmm-server did not become healthy within 300s"
+    err "pmm-server did not become healthy (gave up after $((SECONDS - t0))s)"
     dim "it may still be converging - check with:"
     dim "  docker inspect pmm-server --format '{{.State.Health.Status}}'"
     dim "  docker logs pmm-server | tail -50"

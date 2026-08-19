@@ -15,6 +15,30 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+    # Same probe as the image, with a start period that matches a cold start.
+    #
+    # The image allows 25s before failures start counting, then 3 failures at 4s
+    # apart. On an existing /srv that is ample. On an empty one it is not close:
+    # the entrypoint provisions PostgreSQL, Grafana, VictoriaMetrics and
+    # ClickHouse first, and readyz answers about two minutes in. So the container
+    # is declared unhealthy at roughly 40 seconds, every time, on exactly the run
+    # where nothing is wrong.
+    #
+    # That is worse than a slow start because `docker compose up --wait` aborts
+    # the moment a container turns unhealthy - it does not wait out
+    # --wait-timeout. `./om start pmm` therefore failed after ~40s while claiming
+    # 300s had elapsed, and the container went healthy a minute later untouched.
+    #
+    # 240s is the cold-start figure with room to spare. Failures after it still
+    # mark the container unhealthy in the usual way, so nothing is being papered
+    # over - the probe is unchanged, only the grace before it counts.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/v1/server/readyz"]
+      interval: 4s
+      timeout: 2s
+      retries: 3
+      start_period: 240s
+
     volumes:
       # PMM's own pmm.conf with the SEP locations injected, rendered by om on
       # every start. Overrides the mount docker-compose.dev.yml already makes
