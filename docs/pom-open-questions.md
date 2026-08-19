@@ -179,7 +179,34 @@ The third is the cheapest and the least dishonest, and does not preclude the oth
 
 ---
 
-## 9. Process points, not design
+## 9. Minification can break a payload on hosts you do not control
+
+**Needs: someone to decide whether this is POM's problem or the Tasks layer's.**
+POM's payload is fixed; the hazard is not POM-specific.
+
+Every payload the Tasks layer dispatches goes through `python-minifier`, which
+normalises inner string quotes to double. An f-string containing a method call on a
+literal - `f"...{'&'.join(options)}"`, legal on every Python there has ever been -
+comes out as `f"...{"&".join(E)}"`, which is PEP 701 and parses only on **Python 3.12
+and later**.
+
+Found because `pmm-server` had failed its probe 183 consecutive times with
+`SyntaxError: f-string: expecting '}'` while every database host answered. The
+containers carry Python 3.12.3; `pmm-server` carries 3.9.25.
+
+What makes it worth recording rather than just fixing: **the bug exists only after
+minification, and only on some hosts.** It is invisible in review, in a local run, and
+on most of an estate. Any app whose payload touches a host with an older Python has
+the same exposure, and nothing warns them.
+
+POM now has a test that minifies its payload and rejects the construct. Options for
+the general case, none chosen: minify with a target version if the library supports
+one; run the same check over every payload in the Tasks layer's own tests; or
+document a minimum Python for a monitored host and check it during the probe.
+
+---
+
+## 10. Process points, not design
 
 Three things that are not about POM but will bite at PR time:
 
