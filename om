@@ -37,8 +37,11 @@
 #   ./om hosts [--write]    /etc/hosts entries so the cluster URIs resolve here
 #                           (prints by default; --write needs sudo, --remove undoes)
 #   ./om ports              what each stack publishes onto the host
-#   ./om reset <tier>       clear local state so ./om setup rebuilds it
-#                           (state | data | all; --env also drops SEP/.env)
+#   ./om reset <tier>       clear local state so ./om bootstrap rebuilds it
+#                           state | data | all. `all` is the from-scratch one: it
+#                           leaves nothing cached that could make a later success
+#                           mean less than it looks. --images also drops the PMM
+#                           server image (several GB to pull again).
 #   ./om doctor             check prerequisites only
 #
 # POM is split across both products. pmm-managed derives the topology document from
@@ -1711,20 +1714,74 @@ reset_pmm_data() {
   fi
 }
 
+# Everything a `./om bootstrap` can rebuild, so that it has to.
+#
+# The point of this tier is that nothing survives to explain a later success: a
+# workspace that still works because of a cached artefact is not a workspace whose
+# setup works, and that difference is only ever discovered by a colleague.
 reset_all() {
-  info "all: build outputs and images"
+  info "all: build outputs, caches, containers and images"
   rm -rf "$SEP_DIR/venv" "$SEP_DIR/frontend/node_modules"
   ok "removed SEP's venv and frontend/node_modules"
 
   docker rm -f "$PMM_CONTAINER" >/dev/null 2>&1 && ok "removed $PMM_CONTAINER" || true
+
+  # PMM's devcontainer build caches. Keeping them makes the next start much
+  # faster and makes it a different thing from the one a fresh clone performs -
+  # a broken `make setup` inside the container stays hidden behind a warm
+  # node_modules, which is exactly the class of bug this tier exists to expose.
+  local volume removed=()
+  for volume in go-modules node-modules go-cache; do
+    docker volume inspect "$volume" >/dev/null 2>&1 || continue
+    docker volume rm "$volume" >/dev/null 2>&1 && removed+=("$volume") \
+      || warn "could not remove the $volume volume - something still has it open"
+  done
+  [[ ${#removed[@]} -gt 0 ]] && ok "removed the devcontainer caches: ${removed[*]}"
+
   docker image rm -f "$PSMDB_IMAGE" "$CLIENT_IMAGE" >/dev/null 2>&1 \
     && ok "removed the psmdb node images" || true
   rm -f "$PSMDB_DIR/secrets/keyfile"
   dim "the keyfile is regenerated on the next cluster start"
+
+  # Both dotenv files, always, and without asking - which is only defensible
+  # because this tier has already removed pmm-data. Keeping them would be worse
+  # than dropping them: PMM_SEP_POSTGRES_PASSWORD would survive into a workspace
+  # whose `sep` role no longer exists, and `./om env` would faithfully reuse a
+  # password for a role that is about to be provisioned with a different one.
+  rm -f "$PMM_DIR/.env" "$SEP_DIR/.env"
+  ok "removed pmm/.env and SEP/.env"
+  dim "./om env regenerates both, including a fresh Grafana token"
 }
 
+# The PMM server image, which `all` deliberately leaves alone.
+#
+# Several GB over the network rather than something rebuilt locally, so it is a
+# flag rather than part of a tier: almost nobody clearing their workspace means
+# "and re-download the image", and the ones who do know they mean it.
+reset_images() {
+  local img
+  img="$(env_value "$PMM_DIR/.env" PMM_SERVER_IMAGE)"
+  [[ -n "$img" ]] || img="$(sed -n 's/^PMM_SERVER_IMAGE=//p' "$PMM_DIR/.env.dev.example" | tail -1)"
+  [[ -n "$img" ]] || { dim "no PMM_SERVER_IMAGE to remove"; return 0; }
+
+  if docker image rm -f "$img" >/dev/null 2>&1; then
+    ok "removed $img"
+    warn "the next ./om start pmm pulls it again - several GB"
+  else
+    dim "$img was not present locally"
+  fi
+}
+
+RESET_USAGE="usage: ./om reset <state|data|all> [--env] [--images]
+    state    run state and rendered settings (safe)
+    data     ...and SEP's databases, the cluster volumes and PMM's /srv (pmm-data)
+    all      ...and the venv, node_modules, devcontainer caches, the PMM
+             container, the psmdb images, and both .env files
+    --env    also delete the .env files on the state/data tiers ('all' always does)
+    --images also delete the PMM server image; the next start re-pulls several GB"
+
 cmd_reset() {
-  local tier="" drop_env=""
+  local tier="" drop_env="" drop_images=""
   local arg
   for arg in "$@"; do
     case "$arg" in
@@ -1732,33 +1789,43 @@ cmd_reset() {
       --data|data)   tier=data ;;
       --all|all)     tier=all ;;
       --env)         drop_env=1 ;;
-      *) die "usage: ./om reset <state|data|all> [--env]" ;;
+      --images)      drop_images=1 ;;
+      *) die "$RESET_USAGE" ;;
     esac
   done
-  [[ -n "$tier" ]] || die "usage: ./om reset <state|data|all> [--env]
-    state  run state and rendered settings (safe)
-    data   ...and SEP's databases, the cluster volumes and PMM's /srv (pmm-data)
-    all    ...and the venv, node_modules, PMM container and psmdb images
-    --env  also delete SEP/.env, which holds secrets nothing can regenerate"
+  [[ -n "$tier" ]] || die "$RESET_USAGE"
 
   warn "this removes local state; nothing in git is touched"
   dim "stopping everything first"
   cmd_stop >/dev/null 2>&1 || true
 
+  # Before reset_all, which needs pmm/.env to know which image to remove.
+  [[ -n "$drop_images" ]] && reset_images
+
   reset_state
   [[ "$tier" == data || "$tier" == all ]] && reset_data
   [[ "$tier" == all ]] && reset_all
 
-  if [[ -n "$drop_env" ]]; then
-    rm -f "$SEP_DIR/.env"
-    warn "removed SEP/.env - the PMM API key and database passwords go with it"
-  else
-    dim "SEP/.env kept (pass --env to remove it too)"
+  # 'all' has already dropped both files as part of clearing everything a
+  # bootstrap rebuilds; this is the opt-in for the tiers that have not.
+  if [[ -n "$drop_env" && "$tier" != all ]]; then
+    rm -f "$PMM_DIR/.env" "$SEP_DIR/.env"
+    warn "removed pmm/.env and SEP/.env"
+    # Only a hazard below the 'all' tier, where pmm-data may still hold a `sep`
+    # role provisioned with the password that just went. ./om env then generates
+    # a new one and SEP authenticates with a password PostgreSQL does not have.
+    [[ "$tier" == state ]] && dim "pmm-data still holds the old sep role - clear it too, or SEP will not connect"
+  elif [[ "$tier" != all ]]; then
+    dim "the .env files were kept (pass --env to remove them too)"
   fi
 
   echo
   ok "reset to '$tier'"
-  dim "next: ./om setup"
+  if [[ "$tier" == all ]]; then
+    dim "next: ./om bootstrap   (rebuilds everything from a clean slate)"
+  else
+    dim "next: ./om bootstrap"
+  fi
 }
 
 cmd_ports() {
