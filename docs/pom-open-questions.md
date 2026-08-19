@@ -150,7 +150,36 @@ bigger win, and belongs to whoever owns the task templates.
 
 ---
 
-## 8. Process points, not design
+## 8. Executor state is cheap but refreshed on the expensive path
+
+**Needs: a decision on where to refresh it. Noticed by using the Hosts page.**
+
+Starting a stopped host and watching the page is the reproduction. The executor client
+registers with Nomad within seconds, but the Hosts page keeps saying "Agent down" for
+up to eleven minutes: the row's `executor` sub-document is written only during a
+sweep - default every ten minutes - and the page then polls every sixty seconds.
+
+The mismatch is that those facts cost nothing to obtain. SEP reads them from the Tasks
+API in milliseconds and never touches a host, unlike everything else on the row, which
+needs a Nomad job per host and tens of seconds. A fact available instantly is being
+refreshed on a schedule sized for facts that are not.
+
+Options, none chosen, and the trade is real:
+
+- **Refresh on read**, in the app's `GET /hosts`. Always current, but it puts a Tasks
+  API call on every page load and makes the estate unreadable when Tasks is down -
+  which is the failure the whole upserted design exists to survive.
+- **A cheap periodic refresh** of just the executor block, on its own faster clock,
+  separate from the sweep. Keeps the read path local; adds a second schedule.
+- **Leave it, and say so in the UI.** The row already knows `last_attempt_at`; the
+  executor cell could carry its age like the probe columns do, so "Agent down (11
+  minutes ago)" reads as stale rather than as current.
+
+The third is the cheapest and the least dishonest, and does not preclude the others.
+
+---
+
+## 9. Process points, not design
 
 Three things that are not about POM but will bite at PR time:
 
