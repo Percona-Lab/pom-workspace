@@ -1,6 +1,6 @@
 # POM - How It Works Today
 
-**As of:** 2026-08-18
+**As of:** 2026-08-19
 **Derived from:** `pmm/` @ `PMM-15326-pom-inventory` (`api/pom/v1/`,
 `managed/services/pom/`, `managed/services/grafana/auth_server.go`,
 `ui/packages/plugins/pom/`), `SEP/` @ `PMM-15326-pom-inventory`
@@ -132,6 +132,14 @@ sequenceDiagram
 service to be discovered through, and that host is the point: it is where a database
 can be installed.
 
+**The payload runs on whatever Python the host has.** The Tasks layer minifies it
+before dispatch, and the minifier rewrites an f-string's inner quotes into PEP 701
+syntax that only Python 3.12 and later can parse - so an f-string containing a method
+call on a literal is a syntax error on an older host and fine on a newer one. This
+workspace's own `pmm-server` runs 3.9 and failed every probe for that reason while the
+database containers, on 3.12, were unaffected. Values are bound to names before any
+f-string, and a test minifies the payload and rejects the construct.
+
 **A refresh can be scoped.** `{"node_ids": [...]}` refreshes named hosts; absent or
 empty means the whole estate. Conflict is judged **per host**, so a one-host refresh is
 not refused merely because the ten-minute schedule happens to be running.
@@ -173,9 +181,9 @@ erDiagram
     }
     DISCOVERY_RUN {
         uuid id PK
-        varchar status "running/success/partial/failed"
+        varchar status "running/success/partial/failed/skipped"
         jsonb scope "node ids, or SQL NULL for the whole estate"
-        jsonb nodes "one outcome record per attempted entity"
+        jsonb nodes "one outcome record per attempted host, services nested"
     }
 ```
 

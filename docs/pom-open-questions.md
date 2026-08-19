@@ -1,6 +1,6 @@
 # POM - open questions
 
-**As of:** 2026-08-18
+**As of:** 2026-08-19
 **Status:** the eleven-step build order is complete. Nothing below is a bug or missing
 work; each is a decision that was made provisionally and should be confirmed, or
 deliberately deferred and should be scheduled.
