@@ -1,0 +1,93 @@
+# Workspace overlay for pmm/.env, applied by `./om env`.
+#
+# pmm/.env is rendered as pmm/.env.dev.example - upstream's file, whatever it says
+# today - with the keys below overwritten. Only what this workspace needs
+# differently lives here, so an upstream change to a key we do not override is
+# picked up rather than silently pinned. Same reason harness/pmm.conf and
+# harness/sep-settings.yaml are rendered instead of committed as copies.
+#
+# Two placeholder values are resolved by ./om env rather than read literally:
+#
+#   @generate   invent a secret on first run, and reuse the existing one after,
+#               because several of these are baked into state on the /srv volume
+#               and changing one silently breaks an estate that already works.
+#
+# Anything not marked is a plain value and is committed as written. No real
+# passwords or tokens belong in this file.
+
+# --- the dev image ----------------------------------------------------------
+#
+# Pinned by digest, not by the `3-dev-container` tag.
+#
+# That tag is a moving bookmark: Percona's CI repoints it at a build of main every
+# time main moves, so `docker pull` can hand two colleagues different servers for
+# the same branch. That is not a theoretical tidiness problem here, because PMM's
+# ClickHouse configuration is split across the boundary: users.xml ships inside the
+# image, dev/clickhouse-config.xml is bind-mounted from the checkout. The two must
+# agree.
+#
+# percona/pmm@ba6720641 (PMM-15309, 2026-08-16) added a `datasource` settings
+# profile using changeable_in_readonly, which ClickHouse refuses unless the
+# checkout's config sets settings_constraints_replace_previous - and this branch,
+# based on 2026-08-11, does not set it. The result is ClickHouse exiting 91 on
+# every retry until supervisord gives up, taking qan-api2 with it, while every
+# other program starts normally and the container merely reports unhealthy.
+#
+# Remove this pin once the branch has merged upstream/main, which brings both
+# halves of PMM-15309 at once, and go back to:
+#
+#   PMM_SERVER_IMAGE=perconalab/pmm-server:3-dev-container
+#
+PMM_SERVER_IMAGE=perconalab/pmm-server@sha256:d6a3f1660b43bce0965818f557344c200bedc5bc305228c1de06eea6c24db9dd
+
+# --- ports ------------------------------------------------------------------
+#
+# SEP pins PMM.ENDPOINT to https://127.0.0.1:8443, so PMM has to be published
+# there or PMMSyncer cannot reach it. Compose interpolates this at container
+# create time, which is why changing it needs `./om stop pmm && ./om start pmm`
+# rather than a restart.
+PMM_PORT_HTTPS=8443
+
+# Moved off ClickHouse's defaults so a ClickHouse running natively on the host
+# keeps 9000/8123.
+PMM_PORT_CH_TCP=9900
+PMM_PORT_CH_HTTP=8923
+
+# --- what POM needs turned on -----------------------------------------------
+#
+# Nomad is how SEP's pom_discovery reaches hosts at all: no Nomad, no probes, and
+# the estate stays empty however often a sweep runs.
+PMM_ENABLE_NOMAD=1
+
+# Nomad garbage-collects and stops scheduling when a disk fills. A dev box running
+# four PSMDB topologies plus two toolchains sits far closer to these than a server
+# does, and the failure reads as "host unreachable" rather than "disk full".
+PMM_NOMAD_GC_DISK_USAGE_THRESHOLD=95
+PMM_NOMAD_GC_INODE_USAGE_THRESHOLD=90
+
+# Provisions the `sep` role and database inside PMM's embedded PostgreSQL, which
+# is where SEP's three services and the Celery beat store all live.
+PMM_ENABLE_SEP=1
+
+# The container has to resolve its own published name for Nomad's advertised
+# address to be reachable from the client nodes.
+PMM_PUBLIC_ADDRESS=pmm-server
+
+# --- reaching SEP -----------------------------------------------------------
+#
+# pmm-managed proxies SEP's discovery app at /v1/pom/inventory/*. host.docker.internal
+# is supplied by harness/pmm-compose.override.yml, so this points at a SEP backend
+# running natively on the host (./om start sep-backend).
+PMM_SEP_URL=http://host.docker.internal:8000
+
+# Bearer token pmm-managed sends to SEP. Nothing on the SEP side pins its value, so
+# it is generated rather than shared.
+PMM_SEP_TOKEN=@generate
+
+# Password for the `sep` role PMM provisions. SEP's four database settings and the
+# Celery beat URI all have to carry the same value, which is what ./om env exists
+# to stop anyone doing by hand.
+#
+# Baked into the role on the /srv volume at first start: changing it later leaves
+# SEP authenticating with a password PostgreSQL no longer has.
+PMM_SEP_POSTGRES_PASSWORD=@generate

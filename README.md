@@ -109,39 +109,51 @@ git add SEP && git commit -m "Bump SEP"
 
 ## 4. First-time setup
 
-**Order matters.** SEP's migrations run against PostgreSQL *inside the PMM container*, so
-PMM has to be configured and running before `./om setup` gets to them. Doing it in the
-wrong order fails at `make migrate` with a connection error, and `./om setup` aborts
-before it writes `pmm/.env`.
-
-### 4.1 `pmm/.env`
-
-`pmm/.env` is gitignored, so a fresh clone has none. Start from the dev example — the
-release `.env.example` would give you a stock server with no toolchain inside, and the
-mounted working tree would not be buildable:
+Four commands, in this order:
 
 ```bash
-cp pmm/.env.dev.example pmm/.env
+./om env          # write pmm/.env and SEP/.env
+./om start pmm    # first start pulls several GB
+./om env          # again: mints the Grafana token, which needs PMM running
+./om setup        # venv, migrations, frontend deps
 ```
 
-Then set these. The first three are in the example with the wrong defaults; the last
-two are **not in the example at all** and have to be added:
+**The order is not a preference.** SEP's migrations run against PostgreSQL *inside the
+PMM container*, so PMM has to be configured and running before `./om setup` reaches them.
+And the Grafana service account token cannot exist before Grafana does, which is why
+`./om env` is run twice rather than once.
 
-```ini
-PMM_PORT_HTTPS=8443             # SEP pins PMM.ENDPOINT to https://127.0.0.1:8443
-PMM_ENABLE_NOMAD=1              # PMM's own flag for the embedded task executor SEP
-                                # dispatches to — keep the spelling, it is PMM's
-PMM_PUBLIC_ADDRESS=pmm-server   # the executor advertises this; must resolve from every
-                                # client container, so the hostname — not "localhost"
+### 4.1 `./om env`
 
-# Expose the embedded PostgreSQL to attached Docker subnets and provision a
-# non-superuser `sep` role owning a `sep` database. Consumed by the container's
-# entrypoint, not by pmm-managed. Pick any password; SEP/.env must match it.
-PMM_ENABLE_SEP=1
-PMM_SEP_POSTGRES_PASSWORD=<pick a password>
-```
+Both `.env` files are gitignored, so a fresh clone has neither. `./om env` writes them:
 
-`./om setup` will force `PMM_PORT_HTTPS=8443` for you if you forget, but not the rest.
+- **`pmm/.env`** is rendered as upstream's `pmm/.env.dev.example` with
+  [`harness/pmm-env.example`](harness/pmm-env.example) overlaid. Only the keys this
+  workspace needs differently are overridden, so an upstream change to any other key is
+  picked up instead of being frozen at whatever it said the day someone copied the file.
+- **`SEP/.env`** is rendered from [`harness/sep-env.example`](harness/sep-env.example).
+  SEP ships no example upstream, so that template is the whole file.
+
+If a file already exists you are asked before it is overwritten (`-y` skips the prompt,
+`--create` skips existing files entirely). Both templates are readable and commented -
+read them if you want to know what you are getting.
+
+**Secrets are generated, not invented by you.** Between the two files there is one
+database password, one bearer token and one Grafana token, and the password has to be
+byte-identical in five places across both files. That is the single most reliable thing
+to get wrong by hand, and the failure surfaces far from the cause: a mismatched
+`CELERY__BEAT_DBURI` reads as a Celery-beat problem rather than a password one.
+
+Re-running is safe. `PMM_SEP_POSTGRES_PASSWORD` is **reused, never regenerated**, because
+it is baked into the `sep` role on the `/srv` volume at first start; a new one would leave
+SEP presenting a password PostgreSQL no longer has.
+
+> **The dev image is pinned by digest**, not by the `3-dev-container` tag. That tag is a
+> moving bookmark Percona's CI repoints at a build of `main`, and PMM's ClickHouse
+> configuration is split across the boundary - `users.xml` ships in the image,
+> `dev/clickhouse-config.xml` is bind-mounted from the checkout. A tag that outruns the
+> branch breaks the pair and ClickHouse refuses to start. The pin and the removal
+> condition are documented in `harness/pmm-env.example`.
 
 ### 4.2 Start PMM
 
@@ -152,46 +164,40 @@ PMM_SEP_POSTGRES_PASSWORD=<pick a password>
 First start pulls several GB. When it is up, PMM is at **https://localhost:8443** with
 **admin / admin**.
 
-### 4.3 A PMM service account token
+The port matters: SEP pins `PMM.ENDPOINT` to `https://127.0.0.1:8443`, and compose
+interpolates the published port when the container is **created**, not when it is
+started. So a `pmm/.env` edited after the fact needs `./om stop pmm && ./om start pmm`,
+not a restart.
 
-PMM 3 has no "API keys" page. In PMM, go to *Administration → Users and access → Service
-accounts*, create one with the **Admin** role, and add a token. You need it twice — it
-backs both SEP's Grafana auth provider and `PMMSyncer`.
+### 4.3 `./om env`, again
 
-### 4.4 `SEP/.env`
-
-Also gitignored. Create it with the database password from §4.1 and the token from §4.3:
-
-```ini
-# PMM's embedded PostgreSQL. Host/port/name/user are already in settings.yaml's
-# development block; only the password comes from here.
-SEP__DATABASE__PASSWORD=<same as PMM_SEP_POSTGRES_PASSWORD>
-INVENTORY__DATABASE__PASSWORD=<same>
-TASKS__DATABASE__PASSWORD=<same>
-CELERY__BEAT_DBURI=postgresql://sep:<same>@127.0.0.1:5432/sep
-
-# Grafana service account token — backs the auth provider and PMMSyncer alike.
-AUTH__PROVIDER__GRAFANA__SERVICE_ACCOUNT_TOKEN=<glsa_...>
-PMM__API_KEY=<glsa_...>
+```bash
+./om env
 ```
 
+The second run mints a Grafana service account token (name `sep-local`, role **Admin**)
+and writes it into `SEP/.env`. It needs PMM running, which is why the first run skipped
+it with a warning.
+
+The Admin role is not overreach: the token does two jobs, backing SEP's Grafana auth
+provider, which reads users, and authenticating `PMMSyncer` when it asks PMM to run
+management tasks. It is one token in two keys on purpose - two would be two things to
+rotate for no benefit.
+
+If you would rather do it by hand, PMM 3 has no "API keys" page: go to *Administration →
+Users and access → Service accounts*, create one with the Admin role, add a token, and
+put the same `glsa_…` value in both `AUTH__PROVIDER__GRAFANA__SERVICE_ACCOUNT_TOKEN` and
+`PMM__API_KEY`.
+
 Grafana is the single active auth provider here: `settings.yaml` nulls the others out, and
-setting their `AUTH__PROVIDER__*` env vars would resurrect the entries it dropped. `./om
-setup` only creates `SEP/.env` when it is absent, and leaves an existing file untouched.
+setting their `AUTH__PROVIDER__*` env vars would resurrect the entries it dropped.
 
-Three things that bite:
+One trap survives hand-editing: **write each key once.** python-dotenv takes the **last**
+occurrence, so a second `PMM__API_KEY` further down silently wins, and every PMM request
+then comes back empty or unauthorized with nothing else looking wrong. `./om` reads it
+with `tail -1` for exactly this reason.
 
-- **Write each key once.** python-dotenv takes the **last** occurrence, so a second
-  `PMM__API_KEY` further down silently wins. Every PMM request then comes back empty or
-  unauthorized with nothing else looking wrong. `./om` reads it with `tail -1` for exactly
-  this reason.
-- **All four password values must match `PMM_SEP_POSTGRES_PASSWORD`**, including the one
-  embedded in `CELERY__BEAT_DBURI`. A mismatch there does not surface until `./om setup`
-  step 5, where it reads as a Celery-beat problem rather than a password one.
-- **The same `glsa_…` token goes in both token lines.** They are read by different
-  consumers - the auth provider and `PMMSyncer` - but there is only one token.
-
-### 4.5 `./om setup`
+### 4.4 `./om setup`
 
 ```bash
 ./om setup
@@ -200,8 +206,9 @@ Three things that bite:
 Idempotent and safe to re-run. In order:
 
 1. **`./om doctor`** — reports missing prerequisites, then continues with what it can.
-2. **SEP venv** — `make -C SEP venv`.
-3. **`SEP/.env`** — created empty only if absent, so you can fill in §4.4 yourself.
+2. **`./om env --create`** - writes either `.env` if it is missing, and completes a
+   `SEP/.env` still waiting on its Grafana token. Existing, complete files are untouched.
+3. **SEP venv** — `make -C SEP venv`.
 4. **Migrations** — `make -C SEP migrate`. Three Alembic tracks (`sep`, `inventory`,
    `tasks`) run in one pass; on this branch they share the one `sep` PostgreSQL database
    and coexist through distinct version tables.
@@ -213,8 +220,9 @@ Idempotent and safe to re-run. In order:
    default).
 6. **SEP frontend deps** — `pnpm install` in `SEP/frontend`; skipped with a warning if
    Node/pnpm are not ready. Only `sep-frontend` is blocked by that.
-7. **`pmm/.env`** — created from `.env.dev.example` if absent, and `PMM_PORT_HTTPS` forced
-   to 8443.
+7. **`pmm/.env` check** - warns if `PMM_PORT_HTTPS` is not 8443 rather than silently
+   rewriting it, since by this point the container has already been created with whatever
+   it said.
 
 ---
 
@@ -502,6 +510,21 @@ survived. `./om` tracks PIDs in `.om/pids/`; if that is stale, find and kill it 
 **A task sits at "running" with no output** — the executor's client GC destroyed the
 allocation because the disk crossed its 80% threshold, taking the logs with it.
 `PMM_NOMAD_GC_DISK_USAGE_THRESHOLD` in `pmm/.env` (PMM's own spelling) raises it.
+
+**`pmm-server` is `unhealthy` and Query Analytics is empty** - ClickHouse is failing to
+start while everything else runs, so the container's internal readiness probe never
+passes. Confirm with `docker exec pmm-server tail -50 /srv/logs/clickhouse-server.log`.
+
+If it says `Setting changeable_in_readonly for max_execution_time is not allowed`, the
+image has outrun the checkout: `users.xml` comes from the image and
+`dev/clickhouse-config.xml` from your branch, and the two no longer agree. `./om env`
+pins the image by digest for this reason - if you overrode the pin, put it back. POM
+itself is unaffected, since it reads PostgreSQL and VictoriaMetrics.
+
+**PMM answers on 443 instead of 8443** - `docker ps` shows `0.0.0.0:443->8443/tcp`.
+Compose interpolates the published port when the container is **created**, so editing
+`PMM_PORT_HTTPS` and restarting changes nothing. Recreate it with `./om stop pmm && ./om
+start pmm`.
 
 Logs for every native component live in `.om/logs/`; `./om logs <comp> [-f]` is the
 shortcut.

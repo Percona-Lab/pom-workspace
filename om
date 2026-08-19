@@ -6,6 +6,10 @@
 # PMM's own devcontainer, so `om build pmm` compiles your Go changes), and the
 # PSMDB clusters from psmdb/compose.yaml.
 #
+#   ./om env                write pmm/.env and SEP/.env from the harness templates,
+#                           generating the secrets they share (-y to skip the
+#                           overwrite prompt). Run it again after ./om start pmm if
+#                           the Grafana token could not be minted the first time.
 #   ./om setup              one-time bootstrap (idempotent, safe to re-run)
 #   ./om start [comp...]    start components (no args: all, plus the clusters
 #                           that were up when you last ran a bare ./om stop)
@@ -572,6 +576,295 @@ cmd_doctor() {
 # setup
 # ---------------------------------------------------------------------------
 
+# --- the two dotenv files ---------------------------------------------------
+#
+# Between them pmm/.env and SEP/.env carry one generated password, one generated
+# token and one minted Grafana token, and the password has to be byte-identical in
+# five places across both files. Getting that wrong produces a workspace that
+# starts cleanly and then fails somewhere unrelated, so it is a command rather
+# than a paragraph of instructions.
+#
+# The templates live in harness/ because they are this workspace's needs and not
+# the products': pmm/.env.dev.example is upstream's file and is merged into, never
+# edited. SEP has no example upstream, so harness/sep-env.example is the whole file.
+PMM_ENV_TEMPLATE="$HARNESS_DIR/pmm-env.example"
+SEP_ENV_TEMPLATE="$HARNESS_DIR/sep-env.example"
+
+# Last assignment wins, which is what both docker compose and python-dotenv do.
+env_value() { # file key -> value on stdout, empty when absent
+  [[ -f "$1" ]] || return 0
+  sed -n "s/^$2=//p" "$1" | tail -1
+}
+
+gen_secret() { # [bytes] -> 2*bytes hex characters
+  local bytes="${1:-16}"
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex "$bytes"
+  else
+    head -c "$bytes" /dev/urandom | od -An -tx1 | tr -d ' \n'
+  fi
+}
+
+# Asks on the terminal rather than on stdin, so a prompt still works when the
+# command's stdin is a pipe. No controlling terminal means no answer, and the
+# safe reading of no answer is "do not overwrite" - the group redirection is what
+# keeps bash from printing its own complaint about /dev/tty in that case.
+confirm() { # question -> 0 when the answer is yes
+  [[ "${OM_YES:-0}" == 1 ]] && return 0
+  { : </dev/tty; } 2>/dev/null || return 1
+  local reply
+  read -r -p "$1 [y/N] " reply </dev/tty || return 1
+  [[ "$reply" == [Yy]* ]]
+}
+
+# Waits for Grafana's own API, which is later than PMM being up.
+#
+# `./om start pmm` waits on pmm-managed's /v1/server/readyz, and Grafana is a
+# separate supervisord program that provisions its own database. On a fresh /srv
+# it answers well after readyz passes, so the first request during a bootstrap
+# reliably fails - and treating that as "PMM is not running" produced a workspace
+# with an unusable token and a message pointing at the wrong thing.
+GRAFANA_WAIT_SECONDS=120
+grafana_wait() { # sets GRAFANA_ERROR and returns 1 on failure
+  # The wait covers one specific gap - PMM up, Grafana not yet answering - so a
+  # stopped container is not something to wait out. Without this, `./om env` on a
+  # cold workspace blocks for the full timeout before saying the obvious.
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PMM_CONTAINER"; then
+    GRAFANA_ERROR="PMM is not running (start it with ./om start pmm)"
+    return 1
+  fi
+
+  local waited=0 code
+  while :; do
+    # curl prints 000 itself when it never got a response, and exits non-zero as
+    # well - so a `|| echo 000` fallback here appends a second one and reports
+    # "last HTTP 000000".
+    code="$(curl -sk -m 10 -o /dev/null -w '%{http_code}' \
+            -u "$PMM_USER:$PMM_PASSWORD" \
+            "https://localhost:$PMM_HTTPS_PORT/graph/api/serviceaccounts/search?query=sep-local" \
+            2>/dev/null)" || true
+    [[ -n "$code" ]] || code=000
+    case "$code" in
+      200) return 0 ;;
+      # Not something waiting fixes: the admin password has been changed from the
+      # one pmm/.env sets, which happens on any PMM someone has logged into.
+      401|403) GRAFANA_ERROR="Grafana rejected $PMM_USER (HTTP $code); set OM_PMM_USER / OM_PMM_PASSWORD"
+               return 1 ;;
+    esac
+    if (( waited >= GRAFANA_WAIT_SECONDS )); then
+      GRAFANA_ERROR="Grafana's API did not answer within ${waited}s (last HTTP $code)"
+      return 1
+    fi
+    [[ "$waited" == 0 ]] && dim "waiting for Grafana's API (it starts after PMM reports ready)"
+    sleep 3
+    waited=$((waited + 3))
+  done
+}
+
+# Mints a Grafana service account token, or fails with GRAFANA_ERROR saying why.
+#
+# Admin rather than Viewer because the token does two jobs: it backs SEP's Grafana
+# auth provider, which reads users, and it is what PMMSyncer presents when it asks
+# PMM to run management tasks.
+#
+# An existing account of the same name is reused, since Grafana rejects a duplicate
+# name and a workspace gets re-provisioned far more often than a server does. Tokens
+# themselves are append-only here: Grafana will not show an existing token's value
+# again, so a re-run that has lost the value has no choice but to add one.
+#
+# The result comes back in GRAFANA_TOKEN rather than on stdout, so this must not be
+# called from a command substitution. Two reasons, both learned the hard way: a
+# subshell would discard GRAFANA_ERROR, leaving the caller to invent a cause for a
+# failure it cannot see; and any progress line printed while waiting would be
+# captured as part of the token.
+grafana_mint_token() { # sets GRAFANA_TOKEN / GRAFANA_ERROR
+  GRAFANA_ERROR=""
+  GRAFANA_TOKEN=""
+  command -v jq >/dev/null 2>&1 || { GRAFANA_ERROR="jq is not installed"; return 1; }
+  grafana_wait || return 1
+
+  local api="https://localhost:$PMM_HTTPS_PORT/graph/api/serviceaccounts"
+  local -a curl_opts=(-sk -m 15 -u "$PMM_USER:$PMM_PASSWORD" -H 'Content-Type: application/json')
+  local id token
+
+  id="$(curl "${curl_opts[@]}" -X POST "$api" \
+        -d '{"name":"sep-local","role":"Admin","isDisabled":false}' 2>/dev/null \
+        | jq -r '.id // empty')"
+  if [[ -z "$id" ]]; then
+    id="$(curl "${curl_opts[@]}" "$api/search?query=sep-local" 2>/dev/null \
+          | jq -r '[.serviceAccounts[]? | select(.name=="sep-local") | .id][0] // empty')"
+  fi
+  [[ -n "$id" ]] || { GRAFANA_ERROR="could not create or find the sep-local service account"; return 1; }
+
+  # Unique name per mint. Grafana rejects a duplicate token name within an account,
+  # so a fixed one would work exactly once and then fail on every workspace that
+  # ever re-runs this - which is the normal case, since the value of an existing
+  # token cannot be read back and a lost one can only be replaced.
+  token="$(curl "${curl_opts[@]}" -X POST "$api/$id/tokens" \
+           -d "{\"name\":\"om-$(date +%Y%m%d-%H%M%S)\"}" 2>/dev/null | jq -r '.key // empty')"
+  [[ -n "$token" ]] || { GRAFANA_ERROR="the service account exists but Grafana issued no token"; return 1; }
+  GRAFANA_TOKEN="$token"
+}
+
+# Renders pmm/.env as upstream's .env.dev.example with harness/pmm-env.example
+# overlaid, so a key this workspace does not override tracks upstream instead of
+# being pinned to whatever it said the day someone copied the file.
+env_pmm() { # mode: create (skip when present) | refresh (ask first)
+  local mode="$1" out="$PMM_DIR/.env" base="$PMM_DIR/.env.dev.example"
+  [[ -f "$base" ]] || die "pmm/.env.dev.example missing - run: git submodule update --init"
+  [[ -f "$PMM_ENV_TEMPLATE" ]] || die "missing $PMM_ENV_TEMPLATE"
+
+  if [[ -f "$out" ]]; then
+    if [[ "$mode" == create ]]; then
+      dim "pmm/.env exists - left untouched"
+      return 0
+    fi
+    confirm "pmm/.env exists. Overwrite it?" || { dim "pmm/.env left untouched"; return 0; }
+  fi
+
+  # Carried over rather than regenerated, even when the file is being rewritten.
+  # PMM_SEP_POSTGRES_PASSWORD is baked into the `sep` role on the /srv volume at
+  # first start, so inventing a new one leaves SEP presenting a password
+  # PostgreSQL no longer has - and the symptom appears in SEP, not here.
+  local sep_pw sep_token reused=0
+  sep_pw="$(env_value "$out" PMM_SEP_POSTGRES_PASSWORD)"
+  sep_token="$(env_value "$out" PMM_SEP_TOKEN)"
+  [[ -n "$sep_pw" ]] && reused=1 || sep_pw="$(gen_secret 16)"
+  [[ -n "$sep_token" ]] || sep_token="$(gen_secret 32)"
+
+  OM_GENERATE_PMM_SEP_POSTGRES_PASSWORD="$sep_pw" \
+  OM_GENERATE_PMM_SEP_TOKEN="$sep_token" \
+  python3 - "$base" "$PMM_ENV_TEMPLATE" "$out" <<'PY' || die "rendering $out failed"
+import os, re, sys
+
+base_path, overlay_path, out_path = sys.argv[1:4]
+
+# Only KEY=VALUE lines are overrides. A commented key in the overlay is
+# documentation, exactly as it is in upstream's file.
+overrides, order = {}, []
+for line in open(overlay_path, encoding="utf-8"):
+    match = re.match(r"^([A-Z_][A-Z0-9_]*)=(.*)$", line.rstrip("\n"))
+    if not match:
+        continue
+    key, value = match.group(1), match.group(2)
+    if value == "@generate":
+        value = os.environ["OM_GENERATE_" + key]
+    overrides[key] = value
+    order.append(key)
+
+seen, out = set(), []
+for line in open(base_path, encoding="utf-8"):
+    match = re.match(r"^([A-Z_][A-Z0-9_]*)=", line)
+    if match and match.group(1) in overrides:
+        key = match.group(1)
+        seen.add(key)
+        out.append(f"{key}={overrides[key]}\n")
+    else:
+        out.append(line)
+
+# Keys upstream's file has no line for, appended in the overlay's own order so the
+# block reads as a unit rather than as scattered additions.
+extra = [key for key in order if key not in seen]
+if extra:
+    out.append("\n# --- added by ./om env (harness/pmm-env.example) ---\n")
+    out.extend(f"{key}={overrides[key]}\n" for key in extra)
+
+open(out_path, "w", encoding="utf-8").writelines(out)
+PY
+
+  ok "pmm/.env rendered from .env.dev.example + harness/pmm-env.example"
+  if [[ "$reused" == 1 ]]; then
+    dim "kept the existing PMM_SEP_POSTGRES_PASSWORD (it is baked into /srv)"
+  else
+    dim "generated PMM_SEP_POSTGRES_PASSWORD and PMM_SEP_TOKEN"
+  fi
+}
+
+# Renders SEP/.env from harness/sep-env.example, resolving the two placeholders.
+#
+# The Grafana token cannot exist before PMM does, so a cold workspace gets a file
+# with everything else in it and a warning. Re-running after `./om start pmm` fills
+# it in, which is the only ordering that can work.
+env_sep() { # mode: create | refresh
+  local mode="$1" out="$SEP_DIR/.env"
+  [[ -f "$SEP_ENV_TEMPLATE" ]] || die "missing $SEP_ENV_TEMPLATE"
+  [[ -d "$SEP_DIR" ]] || die "SEP/ not found - run: git submodule update --init"
+
+  local existing_token=""
+  if [[ -f "$out" ]]; then
+    existing_token="$(env_value "$out" PMM__API_KEY)"
+  fi
+
+  # A token that is still the placeholder means the file was written on a cold
+  # workspace, before PMM existed to mint one. Finishing that job is the whole
+  # point of re-running, so it happens even in create mode - which otherwise
+  # leaves an existing file alone.
+  local unfinished=0
+  [[ -z "$existing_token" || "$existing_token" == "@grafana-token" ]] && unfinished=1
+
+  if [[ -f "$out" ]]; then
+    if [[ "$mode" == create ]]; then
+      if [[ "$unfinished" == 0 ]]; then
+        dim "SEP/.env exists - left untouched"
+        return 0
+      fi
+      dim "SEP/.env exists but has no Grafana token - completing it"
+    else
+      confirm "SEP/.env exists. Overwrite it?" || { dim "SEP/.env left untouched"; return 0; }
+    fi
+  fi
+
+  local sep_pw internal token
+  sep_pw="$(env_value "$PMM_DIR/.env" PMM_SEP_POSTGRES_PASSWORD)"
+  [[ -n "$sep_pw" ]] || die "PMM_SEP_POSTGRES_PASSWORD is not in pmm/.env - run ./om env first"
+  # Both halves of the same secret: pmm-managed sends it, SEP compares against it.
+  internal="$(env_value "$PMM_DIR/.env" PMM_SEP_TOKEN)"
+  [[ -n "$internal" ]] || die "PMM_SEP_TOKEN is not in pmm/.env - run ./om env first"
+
+  if [[ -n "$existing_token" && "$existing_token" != "@grafana-token" ]]; then
+    token="$existing_token"
+    dim "kept the existing Grafana service account token"
+  elif grafana_mint_token; then
+    token="$GRAFANA_TOKEN"
+    ok "minted a Grafana service account token (sep-local, role Admin)"
+  else
+    token="@grafana-token"
+  fi
+
+  sed -e "s|@sep-password|$sep_pw|g" -e "s|@pmm-sep-token|$internal|g" \
+      -e "s|@grafana-token|$token|g" \
+      "$SEP_ENV_TEMPLATE" > "$out.tmp" || die "rendering $out failed"
+  mv "$out.tmp" "$out"
+
+  if [[ "$token" == "@grafana-token" ]]; then
+    ok "SEP/.env rendered, without the Grafana token"
+    warn "no Grafana token: ${GRAFANA_ERROR:-PMM is not running}"
+    dim "SEP cannot reach PMM until it has one, so nothing that talks to PMM will work:"
+    dim "  ./om discovery sync fails with 401 'Auth method is not service account token'"
+    dim "fix it with ./om env once PMM is up"
+  else
+    ok "SEP/.env rendered from harness/sep-env.example"
+  fi
+}
+
+cmd_env() {
+  local mode=refresh
+  while (($#)); do
+    case "$1" in
+      -y|--yes) OM_YES=1 ;;
+      --create) mode=create ;;
+      *) die "usage: ./om env [-y] [--create]" ;;
+    esac
+    shift
+  done
+
+  info "env: pmm/.env"
+  env_pmm "$mode"
+  echo
+  info "env: SEP/.env"
+  env_sep "$mode"
+}
+
 om_setup_sep() {
   info "SEP: python environment"
   if [[ -x "$SEP_DIR/venv/bin/python" ]]; then
@@ -579,18 +872,6 @@ om_setup_sep() {
   fi
   make -C "$SEP_DIR" venv
   ok "venv ready ($("$SEP_DIR/venv/bin/python" -V 2>&1))"
-
-  info "SEP: .env"
-  # Created empty rather than derived: SEP reads its overrides from here, and the
-  # values that matter are per-machine secrets nothing local can generate.
-  if [[ -f "$SEP_DIR/.env" ]]; then
-    dim ".env exists — left untouched"
-  else
-    : > "$SEP_DIR/.env"
-    ok ".env created (empty)"
-    dim "add PMM__API_KEY=<service account token> here once PMM is running,"
-    dim "plus the SEP__/INVENTORY__/TASKS__ DATABASE__PASSWORD values ./om discovery reads"
-  fi
 
   info "SEP: database migrations"
   make -C "$SEP_DIR" migrate
@@ -613,37 +894,30 @@ om_setup_sep() {
   fi
 }
 
+# PMM_PORT_HTTPS is not corrected here any more.
+#
+# It used to be, and that was a trap: the correction ran at setup while `./om start
+# pmm` is the first thing anyone does, so a .env written by hand went into a
+# container published on 443 and compose interpolates the port at create time, not
+# restart time. harness/pmm-env.example sets it instead, which means it is right
+# before anything is started rather than after.
 om_setup_pmm() {
-  info "PMM: .env"
   local envf="$PMM_DIR/.env"
-  if [[ -f "$envf" ]]; then
-    dim ".env exists — left untouched"
-  else
-    # .env.dev.example pins PMM_SERVER_IMAGE to the dev-container image, which is
-    # what makes the mounted working tree buildable. The release .env.example
-    # would give a stock server with no toolchain inside.
-    cp "$PMM_DIR/.env.dev.example" "$envf"
-    ok ".env created from .env.dev.example (dev-container image)"
-  fi
+  [[ -f "$envf" ]] || die "pmm/.env missing - run ./om env"
 
-  # SEP pins PMM.ENDPOINT to https://127.0.0.1:8443, while PMM's own default is
-  # 443. Align the published port or PMMSyncer cannot reach it.
-  if grep -qE '^PMM_PORT_HTTPS=' "$envf"; then
-    local cur; cur="$(grep -E '^PMM_PORT_HTTPS=' "$envf" | tail -1 | cut -d= -f2)"
-    if [[ "$cur" != "$PMM_HTTPS_PORT" ]]; then
-      sed -i -E "s/^PMM_PORT_HTTPS=.*/PMM_PORT_HTTPS=$PMM_HTTPS_PORT/" "$envf"
-      ok "PMM_PORT_HTTPS $cur -> $PMM_HTTPS_PORT (matches SEP's PMM.ENDPOINT)"
-    else
-      dim "PMM_PORT_HTTPS already $PMM_HTTPS_PORT"
-    fi
-  else
-    echo "PMM_PORT_HTTPS=$PMM_HTTPS_PORT" >> "$envf"
-    ok "PMM_PORT_HTTPS=$PMM_HTTPS_PORT appended"
+  local port; port="$(env_value "$envf" PMM_PORT_HTTPS)"
+  if [[ "$port" != "$PMM_HTTPS_PORT" ]]; then
+    warn "pmm/.env has PMM_PORT_HTTPS=${port:-unset}, not $PMM_HTTPS_PORT"
+    dim "SEP pins PMM.ENDPOINT to https://127.0.0.1:$PMM_HTTPS_PORT; run ./om env to fix it"
   fi
 }
 
 cmd_setup() {
   cmd_doctor || warn "some prerequisites are missing — continuing with what is possible"
+  echo
+  # Before either component: SEP's .env derives its password from PMM's, so the
+  # order is not a preference.
+  cmd_env --create
   echo
   om_setup_sep
   echo
@@ -651,6 +925,7 @@ cmd_setup() {
   echo
   info "Setup complete"
   dim "Next:  ./om start          (pmm + sep)"
+  dim "       ./om env            again, once PMM is up, if the Grafana token is still missing"
   dim "       ./om build pmm      compile the PMM working tree into the server"
   dim "       ./om status"
 }
@@ -811,7 +1086,7 @@ pmm_compose() {
 
 start_pmm() {
   info "pmm: devcontainer (from repo)"
-  [[ -f "$PMM_DIR/.env" ]] || die "pmm/.env missing — run ./om setup first"
+  [[ -f "$PMM_DIR/.env" ]] || die "pmm/.env missing — run ./om env"
   local img
   img="$(grep -E '^PMM_SERVER_IMAGE=' "$PMM_DIR/.env" | tail -1 | cut -d= -f2- || true)"
   if [[ -n "$img" ]] && ! docker image inspect "$img" >/dev/null 2>&1; then
@@ -2474,6 +2749,7 @@ main() {
   render_sep_settings
   case "$cmd" in
     setup)   cmd_setup "$@" ;;
+    env)     cmd_env "$@" ;;
     start)   cmd_start "$@" ;;
     stop)    cmd_stop "$@" ;;
     restart) cmd_restart "$@" ;;

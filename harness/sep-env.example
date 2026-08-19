@@ -1,0 +1,61 @@
+# Template for SEP/.env, written by `./om env`.
+#
+# SEP has no .env.example upstream, so unlike harness/pmm-env.example this is the
+# whole file rather than an overlay. Keep it to what a local workspace actually
+# needs: every key here is one SEP fails without.
+#
+# Do not confuse this with harness/sep.env, which is a rendered artefact - ./om
+# start sep-backend derives it from SEP/.env and it is gitignored.
+#
+# Placeholder values resolved by ./om env rather than read literally:
+#
+#   @sep-password    the PMM_SEP_POSTGRES_PASSWORD written into pmm/.env, so the
+#                    role PMM provisions and the password SEP presents are the
+#                    same string by construction instead of by carefulness
+#
+#   @pmm-sep-token   the PMM_SEP_TOKEN written into pmm/.env, for the same reason
+#
+#   @grafana-token   a Grafana service account token with the Admin role, minted
+#                    against a running PMM. PMM has to be up before this can
+#                    exist, so ./om env leaves it unresolved on a cold workspace
+#                    and fills it in when re-run after ./om start pmm
+#
+# No real secret belongs in this file.
+
+# --- the databases ----------------------------------------------------------
+#
+# All three services live in the one `sep` database inside PMM's embedded
+# PostgreSQL. Host, port, name and user are pinned by harness/sep-settings-overlay.yaml;
+# only the password is a secret, and it is the same secret three times because it is
+# one role.
+SEP__DATABASE__PASSWORD=@sep-password
+INVENTORY__DATABASE__PASSWORD=@sep-password
+TASKS__DATABASE__PASSWORD=@sep-password
+
+# Celery beat stores its schedule separately and takes a whole URI rather than a
+# password, so the same credential appears here a fourth time in a different shape.
+CELERY__BEAT_DBURI=postgresql://sep:@sep-password@127.0.0.1:5432/sep
+
+# --- being reached by PMM ---------------------------------------------------
+#
+# pmm-managed proxies SEP's discovery app, and presents PMM_SEP_TOKEN as a bearer
+# when it does. SEP accepts that token only when it equals SEP_INTERNAL_TOKEN, in
+# which case the caller becomes a synthetic non-admin service principal rather
+# than a Grafana user (app/api/deps.py).
+#
+# Setting it here rather than leaving it derived is the point. SEP falls back to
+# HMAC-SHA256 over SECRET_KEY when this is unset, which is a fine default for
+# SEP talking to itself and useless for anyone who has to *write the same value
+# into pmm/.env* - the derivation is not something a setup script can guess, and
+# a random PMM_SEP_TOKEN has the right shape and fails every request with a 401
+# that says only "Could not validate credentials". SEP supports an explicit value
+# taking precedence, so both sides get it from one generated secret instead.
+SEP_INTERNAL_TOKEN=@pmm-sep-token
+
+# --- reaching PMM -----------------------------------------------------------
+#
+# One token, two consumers: it authenticates SEP's Grafana auth provider and it is
+# what PMMSyncer presents when it queries PMM's inventory. They are the same value
+# on purpose - two tokens would be two things to rotate for no benefit.
+AUTH__PROVIDER__GRAFANA__SERVICE_ACCOUNT_TOKEN=@grafana-token
+PMM__API_KEY=@grafana-token
