@@ -136,6 +136,16 @@ can be installed.
 empty means the whole estate. Conflict is judged **per host**, so a one-host refresh is
 not refused merely because the ten-minute schedule happens to be running.
 
+**Single-flight is enforced in the sweep, not only at the endpoint**, because the
+schedule does not go through the endpoint - Celery beat calls the task directly. With
+the check in the handler alone a scheduled sweep starts on top of one already
+dispatching, both enqueue the same job for the same host, and the Tasks layer refuses
+the duplicate with `409 Identical queue item already running` - recorded against a host
+that is perfectly healthy, moving its failure timestamps for a race rather than a
+fault. A refused sweep records a run with status `skipped` naming what held it, rather
+than returning silently: a ten-minute schedule that quietly does nothing leaves a gap
+in the history that reads exactly like it having fired and found nothing.
+
 ## The data model
 
 SEP's half lives in a dedicated **`pom` schema** inside the existing `sep` database -
