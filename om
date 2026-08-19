@@ -2820,13 +2820,33 @@ disc_cmd_sync() {
   [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
   info "Syncing SEP inventory from PMM"
   dim "run this after rebuilding a cluster, or every service maps as orphaned"
-  ( cd "$SEP_DIR" && "$SEP_DIR/venv/bin/python" - <<'PY'
+  # The exit status says nothing about whether anything synced. SEP's
+  # manage_sync_item catches per-syncer exceptions, logs the traceback, marks the
+  # SyncItem FAILED and returns normally, so the process exits 0 having done
+  # nothing. Trusting it printed "✓ inventory synced" immediately below a 401
+  # traceback - worse than silence, because the next command to fail then looks
+  # like the first thing wrong.
+  local out rc=0
+  out="$( cd "$SEP_DIR" && "$SEP_DIR/venv/bin/python" - <<'PY' 2>&1
 import asyncio, logging, sys
 logging.basicConfig(level=logging.WARNING, stream=sys.stdout)
 from app.sep.apps.inventory.sync import run_scheduled_inventory_sync
 asyncio.run(run_scheduled_inventory_sync("app.sep.sync.syncers.pmm.PMMSyncer"))
 PY
-  ) || die "the sync failed — see the traceback above"
+  )" || rc=$?
+  [[ -n "$out" ]] && printf '%s\n' "$out"
+
+  if (( rc != 0 )) || grep -q "Failed to sync" <<<"$out"; then
+    err "the inventory sync failed - nothing was written"
+    # By far the most common cause on a new workspace, and the message names
+    # neither the file nor the fix.
+    if grep -q "Auth method is not service account token" <<<"$out"; then
+      dim "PMM__API_KEY in SEP/.env is not a Grafana service account token"
+      dim "./om env mints one - it needs PMM running, and Grafana starts a little"
+      dim "after PMM reports ready, so run it once https://localhost:$PMM_HTTPS_PORT loads"
+    fi
+    return 1
+  fi
   ok "inventory synced"
   sep_psql -c "
     select coalesce(cluster, '-') as cluster, count(*) as services
