@@ -210,7 +210,14 @@ that reading one back needs a shape check rather than a type.
 | `scope` | node ids, or SQL **NULL** for a full sweep. Without it a one-host refresh reads as a full sweep that found one host |
 | `nodes` | one outcome record per attempted entity: where it ran, how the host was matched, whether it answered, how long, and the error |
 
-`nodes` carries **outcomes, never observations**. What the probe found belongs to the
+`nodes` is **host-oriented**: one entry per host attempted, each carrying the services
+on it. A flat service list - which it was - cannot show a machine with a PMM client and
+no database, however many times it is probed, and that machine is the case POM most
+exists to describe. One dispatch covers every service on a host, so the host owns the
+timing and the failure and its services carry only what is theirs; previously the
+duration was copied onto each service and read as several measurements when it was one.
+
+It carries **outcomes, never observations**. What the probe found belongs to the
 estate, where it is upserted and stays current; a receipt carrying the attributes too
 would be a second copy that goes stale on the next refresh.
 
