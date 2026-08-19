@@ -152,7 +152,13 @@ bigger win, and belongs to whoever owns the task templates.
 
 ## 8. Process points, not design
 
-Two things that are not about POM but will bite at PR time:
+Three things that are not about POM but will bite at PR time:
+
+- **A flaky UI test.** `AlertStatusTable column filters > shows datetime pickers for
+  Triggered at and no filter for State` in `apps/pmm` fails intermittently under
+  `make test`'s parallel load and passes both in isolation and on a re-run. Nothing to
+  do with POM - it is a datetime-picker test - but it costs a re-run often enough to be
+  worth someone's attention.
 
 - **Sign-off.** PMM's `AGENTS.md` requires `git commit -s`. The POM commits made before
   2026-08-18 do not carry a `Signed-off-by` trailer, though upstream commits on the same

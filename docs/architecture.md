@@ -292,7 +292,7 @@ A PMM page at **`/pmm-ui/pom`**. Four routes, all inside `PomApp`, all reading
 | `/pom` | `/topology` | a table per environment, a row per cluster, unfolding to its services |
 | `/pom/services` | `/topology` + `/inventory/services` | one row per service: what PMM sees over the wire joined to what the probe found on the host |
 | `/pom/hosts` | `/inventory/hosts` | one row per host, including the ones with no database |
-| `/pom/discovery` | `/inventory/runs`, `/inventory/config` | the refresh history, a trigger, and the schedule form |
+| `/pom/discovery` | `/inventory/runs`, `/inventory/config` | two tabs: **Runs** (the refresh history and a trigger) and **Settings**. `?tab=settings` addresses the second, so a link to it is shareable and a reload stays put |
 
 All four are wrapped in `PomPage` - the PMM-admin check without `SepPage`'s token
 exchange. The plugin has **no `@sep/api` dependency**.
@@ -308,6 +308,13 @@ Three things the pages are careful about:
   over a port already in use.
 - **A stale value is shown with its age, not as a dash.** A failing row keeps what it
   last reported; hiding it would throw away the only information anyone has.
+- **Only runtime-changeable settings appear in the configuration form.** `reload ==
+  'hot'` is the filter, which is what excludes `CREDENTIALS_PATH` (deliberately not
+  overridable - it names a file read on every database host and handed to a driver as a
+  URI) and `FASTAPI_ENV` (the framework's, not POM's). A field needing a restart would
+  promise a change it cannot deliver. The app's own `is_advanced` flag groups the
+  timeouts, concurrency and retention behind a collapsed section, so a setting SEP adds
+  later lands in the right place without the UI knowing about it.
 
 ## Reaching it
 
