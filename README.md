@@ -76,12 +76,11 @@ cd openmanager
 git submodule update --init
 ```
 
-Both submodules point at the forks that carry the integration work, pinned to specific
-commits on their `psmdb-openmanager` branches:
+Both submodules are pinned to specific commits on their integration branches:
 
 ```
-pmm  → git@github.com:plebioda/pmm.git   @ psmdb-openmanager
-SEP  → git@github.com:plebioda/SEP.git   @ psmdb-openmanager
+pmm  → git@github.com:percona/pmm.git   @ PMM-15326-pom-inventory
+SEP  → git@github.com:percona/SEP.git   @ PMM-15326-pom-inventory
 ```
 
 They check out **detached** at the pinned commit, which is what you want for a
@@ -89,9 +88,14 @@ reproducible setup. Check the branch out explicitly only if you intend to commit
 one:
 
 ```bash
-(cd pmm && git checkout psmdb-openmanager)
-(cd SEP && git checkout psmdb-openmanager)
+(cd pmm && git checkout PMM-15326-pom-inventory)
+(cd SEP && git checkout PMM-15326-pom-inventory)
 ```
+
+> **Already had a clone before 2026-08-19?** The URLs above used to name personal forks,
+> and git does not re-read `.gitmodules` on its own - an existing checkout keeps fetching
+> from wherever it was first initialised and will not find the current commits. Run
+> `git submodule sync --recursive && git submodule update --init` once.
 
 To move the workspace onto newer submodule commits, pull inside the submodule and commit
 the new pointer here:
@@ -174,6 +178,18 @@ PMM__API_KEY=<glsa_...>
 Grafana is the single active auth provider here: `settings.yaml` nulls the others out, and
 setting their `AUTH__PROVIDER__*` env vars would resurrect the entries it dropped. `./om
 setup` only creates `SEP/.env` when it is absent, and leaves an existing file untouched.
+
+Three things that bite:
+
+- **Write each key once.** python-dotenv takes the **last** occurrence, so a second
+  `PMM__API_KEY` further down silently wins. Every PMM request then comes back empty or
+  unauthorized with nothing else looking wrong. `./om` reads it with `tail -1` for exactly
+  this reason.
+- **All four password values must match `PMM_SEP_POSTGRES_PASSWORD`**, including the one
+  embedded in `CELERY__BEAT_DBURI`. A mismatch there does not surface until `./om setup`
+  step 5, where it reads as a Celery-beat problem rather than a password one.
+- **The same `glsa_…` token goes in both token lines.** They are read by different
+  consumers - the auth provider and `PMMSyncer` - but there is only one token.
 
 ### 4.5 `./om setup`
 
@@ -304,78 +320,105 @@ Full detail — the in-place upgrade loop, bootstrap ordering, and the rough edg
 
 ## 7. Use POM
 
-POM (PSMDB OpenManager) is what the rest of this setup exists to feed. It needs PMM up,
-SEP up and at least one cluster registered. Nothing here needs compiling — but the page
-is part of PMM's UI bundle, so if the sidebar has no SEP apps, run `./om build ui` once
-(§10 has the symptom).
+POM (OpenManager) is what the rest of this setup exists to feed. It needs PMM up, SEP up
+and at least one cluster registered. Nothing here needs compiling - but the pages are part
+of PMM's UI bundle, so if the sidebar has no SEP apps, run `./om build ui` once (§10 has
+the symptom).
 
-POM is split across both products. **pmm-managed** derives the topology document —
-`environments -> clusters -> services` — from PMM's own inventory and VictoriaMetrics, in
-about a tenth of a second. **SEP's `pom_discovery` app** (`SEP/app/sep/apps/pom_discovery`)
-does the half that needs a process on a database host: it sweeps the estate over Nomad
-every 10 minutes for the facts no metric carries — the installed binary version above all
-— and PMM pulls them. So there is a command group per side.
+POM is split across both products, and the split is worth holding in your head before you
+read any of its output:
+
+- **pmm-managed** derives the topology document - `environments -> clusters -> services` -
+  from PMM's own inventory and VictoriaMetrics, in about a tenth of a second. It never
+  touches a database host.
+- **SEP's `pom_discovery` app** (`SEP/app/sep/apps/pom_discovery`) does the half that needs
+  a process *on* a host: every 10 minutes it dispatches a Nomad job per host and upserts
+  what it finds into an estate of `pom.host` and `pom.service` rows. That takes tens of
+  seconds.
+- **pmm-managed proxies that estate** at `/v1/pom/inventory/*`, so every POM page in the
+  browser reads PMM's own origin and none of them talks to SEP directly.
 
 ```bash
 ./om start pmm                  # 1. PMM first, always
 ./om start clusters             # 2. all four topologies (or name one)
 ./om start sep                  # 3. SEP backend
 ./om discovery sync             # 4. pull PMM's inventory into SEP
-./om discovery run              # 5. sweep the hosts for on-host facts
-./om pom topology               # 6. the topology document, flattened
+./om discovery run              # 5. sweep the hosts
+./om discovery estate           # 6. what the sweep found
 ```
 
 Step 4 matters and is easy to skip: SEP holds its own copy of PMM's inventory, and a
-cluster started after the last sync is invisible to the sweep until you refresh it.
-Every service would then come back orphaned — mapped to no executor host.
+cluster started after the last sync is invisible to the sweep until you refresh it. Every
+service comes back orphaned - mapped to no executor host - and on the Services page the
+probe columns read "not in the inventory yet".
 
-Step 5 is the only slow one: a sweep dispatches a Nomad job per host and takes tens of
-seconds. Step 6 never waits for it — the document is served from what the last completed
-sweep stored.
+Step 5 is the only slow one. Step 6 never waits for it: the estate is upserted, so a row
+answers with what it last reported and how old that is, even if the newest sweep never
+reached it.
 
-In the browser it is at **https://localhost:8443/pmm-ui/pom**, three pages under
-*PSMDB OpenManager*:
+### The pages
 
-- **Overview** — a table per environment, a row per cluster; unfold a cluster for its
-  services.
-- **Topology** — one row per service, with every field the snapshot stores.
-- **Discovery** — SEP's sweeps and a button to run one; unfold a sweep for a row per
-  service, showing where it was probed, whether it answered, how long its host took, and
-  every fact it returned.
+In the browser at **https://localhost:8443/pmm-ui/pom**, four entries under *OpenManager*:
 
-Two conventions in the output are worth knowing before you read it as a fault:
+| Page | Shows |
+| --- | --- |
+| **Overview** | a table per environment, a row per cluster; unfold one for its services |
+| **Services** | one row per service - PMM's view over the wire **joined to** what the probe found on the host |
+| **Hosts** | one row per host, **including hosts with no database on them** |
+| **Discovery** | two tabs: *Runs* (refresh history, and a button) and *Settings* (the app's configuration) |
 
+Four conventions in that output are worth knowing before you read any of it as a fault:
+
+- **`version` and `installed_version` are deliberately two columns.** The first is what the
+  running mongod reports over the wire; the second is what the package database on the host
+  says. They disagree exactly when a package has been upgraded and the process not
+  restarted - which is a state POM exists to find.
+- **"Is there a database here" has three answers, not two.** PMM cannot tell a bare
+  pmm-client host from an arbiter - same node type, same agents, no services - so the Hosts
+  page reports *Monitored*, *Unregistered mongod*, or *No database*. The middle one is a
+  host running a mongod that PMM has no service for, and calling it empty would invite an
+  install over a port already in use.
+- **"Nothing can run here" also has three answers**: *Not onboarded*, *Agent down*, and
+  *Driver unhealthy*. They need three different people to fix them.
 - **`cpu_usage_percent` and `connections_free_percent` are `-1` when not measured**, never
   null and never `0` — zero CPU is a real reading, so the sentinel keeps "idle" and
-  "unknown" apart.
-- **`state`, `replication_lag_seconds` and `oplog_window_seconds` are null when they do
-  not apply.** A router and a standalone have no replica set and no oplog at all, which is
-  a different statement from "we could not measure it".
+  "unknown" apart. `state`, `replication_lag_seconds` and `oplog_window_seconds` are null
+  when they do not *apply*: a router and a standalone have no replica set and no oplog at
+  all, which is a different statement from "we could not measure it".
 
-The rest of the inspector, every subcommand defaulting to the most recent run. One group
-per side of the split — `pom` is PMM's document, `discovery` is SEP's sweeps:
+### The inspector
+
+One command group per side of the split - `pom` is PMM's document, `discovery` is SEP's
+estate:
 
 ```bash
 ./om pom                # overview: the document, plus a row per service
-./om pom topology       # the document, flattened
 ./om pom raw            # the document as stored JSON — pipe it to jq
-./om pom runs           # collection history, newest first
-./om pom run            # rebuild the document now
-./om pom sql | api      # pmm-managed's tables (pom_runs, pom_snapshots) / /v1/pom
+./om pom runs           # collection history (PMM's own, ~130 ms each)
+./om pom run            # rebuild the document now - does NOT probe anything
+./om pom sql | api      # pmm-managed's tables / any /v1/pom path
 
-./om discovery          # the last sweep: age, counts, what it found
-./om discovery facts    # the facts it stored, per service
-./om discovery runs     # sweep history, newest first
+./om discovery          # how much of the estate is probed, failing, unreachable
+./om discovery estate   # hosts and services, straight from the tables
+./om discovery facts    # what was observed per service, through SEP's API
+./om discovery config   # the app's settings and where each value came from
+./om discovery runs     # refresh history, newest first
 ./om discovery run      # queue a sweep (tens of seconds)
 ./om discovery sync     # refresh SEP's copy of PMM's inventory
-./om discovery sql | api  # SEP's table (pom_discovery_run) / the app's API
-./om discovery token    # bearer token for SEP's /api/docs Authorize button, and for curl
+./om discovery sql <q>  # SQL against the pom schema: host, service, discovery_run
+./om discovery api <p>  # any /api/apps/pom_discovery path
+./om discovery token    # bearer for SEP's /api/docs Authorize button, and for curl
 ```
 
-The APIs behind all of it, one per side: `GET /v1/pom/topology` from pmm-managed
-(authorised by the Grafana session), and `GET/POST /api/apps/pom_discovery/runs` plus
-`/facts` from SEP. [`docs/architecture.md`](docs/architecture.md) has the full surface and
-who calls what.
+`estate` reads the tables and `facts` reads the API on purpose: they should never
+disagree, so a disagreement is a serialisation bug rather than two views of different
+things. `./om pom api inventory/hosts` is the third route - the same rows as the UI sees
+them, through PMM's proxy.
+
+The full API surface, the `pom` schema with its freshness columns, and who calls what are
+in [`docs/architecture.md`](docs/architecture.md). The decisions still open - naming,
+authorization, retention - are in
+[`docs/pom-open-questions.md`](docs/pom-open-questions.md).
 
 ---
 
