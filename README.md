@@ -73,8 +73,12 @@ built on first use.
 ```bash
 git clone <this-repo> openmanager
 cd openmanager
-git submodule update --init
+./om bootstrap
 ```
+
+`./om bootstrap` initialises the submodules itself, so `git submodule update --init` is
+only needed if you want them checked out before reading anything else. Section 4 is what
+bootstrap does.
 
 Both submodules are pinned to specific commits on their integration branches:
 
@@ -109,19 +113,42 @@ git add SEP && git commit -m "Bump SEP"
 
 ## 4. First-time setup
 
-Four commands, in this order:
+```bash
+./om bootstrap
+```
+
+That is all of it: submodules, both `.env` files, PMM, SEP's venv and migrations, then
+the rest of the stack. First run pulls several GB. It is idempotent, so it is equally
+the command for putting a drifted workspace back rather than only for a fresh clone.
+
+When it finishes, PMM is at **https://localhost:8443** with **admin / admin**.
+
+Everything below is what it does and why the order is what it is. You need it if a step
+fails, or if you would rather drive the steps yourself:
 
 ```bash
 ./om env          # write pmm/.env and SEP/.env
 ./om start pmm    # first start pulls several GB
 ./om env          # again: mints the Grafana token, which needs PMM running
 ./om setup        # venv, migrations, frontend deps
+./om start        # sep-backend, sep-frontend, and any remembered clusters
 ```
 
-**The order is not a preference.** SEP's migrations run against PostgreSQL *inside the
-PMM container*, so PMM has to be configured and running before `./om setup` reaches them.
-And the Grafana service account token cannot exist before Grafana does, which is why
-`./om env` is run twice rather than once.
+**The order is not a preference**, and neither half of it is guessable from the command
+names.
+
+`pmm/.env` has to be right before PMM is **created**, not merely before it is restarted:
+compose interpolates the published port at create time, so a container made against a
+wrong file stays wrong through every restart and only a recreate fixes it.
+
+PMM has to be running before `./om setup`, because SEP's migrations run against the
+PostgreSQL *inside the PMM container*. In the other order they fail with a connection
+error that reads as a SEP problem.
+
+`./om env` appears twice and is not redundant: the first run cannot mint a Grafana
+service account token because Grafana does not exist yet, and `./om setup` re-runs
+`./om env --create` as its second step to finish that one outstanding job. No ordering
+avoids the two passes, since the token depends on the thing the token configures.
 
 ### 4.1 `./om env`
 

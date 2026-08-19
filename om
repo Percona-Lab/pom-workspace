@@ -6,11 +6,16 @@
 # PMM's own devcontainer, so `om build pmm` compiles your Go changes), and the
 # PSMDB clusters from psmdb/compose.yaml.
 #
+#   ./om bootstrap          a fresh clone to a running stack: submodules, both
+#                           .env files, PMM, SEP's venv and migrations, then
+#                           everything else. Idempotent, so it is also the way
+#                           back when a workspace has drifted.
 #   ./om env                write pmm/.env and SEP/.env from the harness templates,
 #                           generating the secrets they share (-y to skip the
 #                           overwrite prompt). Run it again after ./om start pmm if
 #                           the Grafana token could not be minted the first time.
-#   ./om setup              one-time bootstrap (idempotent, safe to re-run)
+#   ./om setup              just the SEP half of the above: venv, migrations, deps
+#                           (idempotent; ./om bootstrap calls it at the right moment)
 #   ./om start [comp...]    start components (no args: all, plus the clusters
 #                           that were up when you last ran a bare ./om stop)
 #   ./om stop [comp...]     stop components (no args: all, clusters included)
@@ -928,6 +933,86 @@ cmd_setup() {
   dim "       ./om env            again, once PMM is up, if the Grafana token is still missing"
   dim "       ./om build pmm      compile the PMM working tree into the server"
   dim "       ./om status"
+}
+
+# --- bootstrap --------------------------------------------------------------
+#
+# Everything a fresh clone needs, in the one order that works.
+#
+# Two of the orderings are forced, and neither is guessable from the commands'
+# names - which is the entire reason this exists rather than four lines of README
+# that people follow out of order once and then debug for an afternoon:
+#
+#   pmm/.env has to be right *before* PMM is created, not before it is restarted.
+#   Compose interpolates the published port when the container is created, so a
+#   container made against a wrong file stays wrong through every restart and only
+#   a recreate fixes it.
+#
+#   PMM has to be running before `./om setup`, because SEP's migrations run
+#   against the PostgreSQL inside the PMM container. In the other order they fail
+#   with a connection error that looks like a SEP problem.
+#
+# `./om env` looks like it runs twice and does not: the cold run cannot mint a
+# Grafana service account token because Grafana does not exist yet, and `./om
+# setup` re-runs `./om env --create`, which finishes that one outstanding job. No
+# ordering avoids the two passes - the token depends on the thing the token
+# configures.
+#
+# Idempotent all the way through. Existing .env files, an already-running PMM and
+# an up-to-date venv are all left as they are, so this doubles as the "put it back
+# the way it should be" command rather than being a one-shot.
+cmd_bootstrap() {
+  info "bootstrap: PMM, SEP, and the dotenv files they share"
+  dim "safe to re-run - each step leaves existing state alone"
+  echo
+
+  ensure_submodules
+  echo
+
+  info "1/4  dotenv files"
+  cmd_env --create
+  echo
+
+  # Before setup, and with the .env files already correct, so the container is
+  # created against the ports and flags it will keep.
+  info "2/4  PMM"
+  cmd_start pmm
+  echo
+
+  # Runs ./om env --create again as its second step, which is where the Grafana
+  # token gets minted now that there is a Grafana to mint it against.
+  info "3/4  SEP: venv, migrations, frontend"
+  cmd_setup
+  echo
+
+  info "4/4  the rest of the stack"
+  cmd_start
+  echo
+
+  ok "bootstrap complete"
+  dim "PMM:  https://localhost:$PMM_HTTPS_PORT  (admin/admin)"
+  dim "next: ./om build pmm     compile the PMM working tree into the server"
+  dim "      ./om start <cluster>   standalone | replicaset-cluster | sharded-cluster | ..."
+}
+
+# A fresh clone has empty submodule directories and every later step then fails in
+# its own unrelated-looking way. Tested by file rather than by directory, because
+# a `git submodule update` that failed partway leaves the directories behind.
+ensure_submodules() {
+  [[ -f "$PMM_DIR/.env.dev.example" && -f "$SEP_DIR/settings.yaml" ]] && return 0
+  info "submodules: pmm/ and SEP/ are not checked out"
+  ( cd "$ROOT" && git submodule update --init ) \
+    || die "git submodule update --init failed - check your access to percona/pmm and percona/SEP"
+  ok "submodules initialised"
+
+  # main() renders the settings file before dispatching to any command, and on a
+  # fresh clone that render is a no-op: SEP/settings.yaml does not exist yet, and
+  # it returns rather than failing. Everything downstream reads SETTINGS_FILE, so
+  # without a second render the migrations build settings from pydantic defaults
+  # and die on a missing CELERY.broker_url - a message naming neither the
+  # submodule that was missing nor the file that was never written.
+  render_sep_settings
+  ok "settings rendered, now that SEP/ is present"
 }
 
 # ---------------------------------------------------------------------------
@@ -2784,6 +2869,7 @@ main() {
   # bootstrap and the inventory sync all build settings in their own processes.
   render_sep_settings
   case "$cmd" in
+    bootstrap) cmd_bootstrap "$@" ;;
     setup)   cmd_setup "$@" ;;
     env)     cmd_env "$@" ;;
     start)   cmd_start "$@" ;;
