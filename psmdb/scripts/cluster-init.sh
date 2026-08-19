@@ -131,6 +131,33 @@ create_root_user() {
         log "${MONGO_ROOT_USER} already exists"
         return 0
     fi
+
+    # createUser needs a primary, and the localhost exception that authorises it
+    # exists only on the machine the shell runs on - so this can only ever be done
+    # here, on this node, while this node is primary. Nothing can be delegated:
+    # without a user there is no auth, and without auth rs.reconfig and
+    # replSetStepUp are both refused, so a set that reaches this state cannot vote
+    # its way out of it.
+    #
+    # initiate_replset pins this member's priority precisely so that cannot
+    # happen. It still can on a set initiated by an older build of this script,
+    # whose config has every member at the default priority and whose data volume
+    # has outlived the container - and there the only way out is a human running
+    # createUser on whichever member won. Saying so beats looping.
+    if ! msh --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true; then
+        local primary
+        primary="$(msh --eval 'rs.hello().primary' 2>/dev/null | tr -d '\r' || true)"
+        log "FATAL: ${MONGO_ROOT_USER} does not exist and this member is not primary"
+        log "  primary is: ${primary:-unknown}"
+        log "  this set was initiated without a pinned priority, so recovery is manual."
+        log "  Either wipe it and let this script initiate it again:"
+        log "    docker compose --profile <profile> down -v"
+        log "  or create the user on the primary yourself:"
+        log "    docker exec ${primary%%:*} mongosh admin --quiet --port ${MONGO_PORT} \\"
+        log "      --eval 'db.createUser({user:\"${MONGO_ROOT_USER}\", pwd:\"<password>\", roles:[{role:\"root\",db:\"admin\"},{role:\"userAdminAnyDatabase\",db:\"admin\"},{role:\"clusterAdmin\",db:\"admin\"}]})'"
+        return 1
+    fi
+
     log "creating ${MONGO_ROOT_USER} via the localhost exception"
     msh admin --eval "db.createUser({
         user: \"${MONGO_ROOT_USER}\",
