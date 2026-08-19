@@ -53,17 +53,40 @@ wait_local_server() {
 
 # Build the rs.initiate() member array from RS_MEMBERS. Priority 0 on arbiters is
 # implicit — arbiterOnly members cannot be primary — so only the flag is set.
+#
+# This member gets a higher priority than the rest, which is not a preference but
+# a correctness requirement. The root user can only be created through MongoDB's
+# localhost exception, and the localhost exception only exists on the machine the
+# shell runs on - so the user has to be created *here*, which means this member
+# has to be the primary. With every member at the default priority the election
+# is a genuine race that the initiator usually but not always wins, and losing it
+# is silent and permanent: initiate_replset waits for itself forever, no user is
+# ever created, and every node in the set sits in "waiting for the root user"
+# while the replica set itself looks perfectly healthy. Observed on
+# replicaset-cluster, where node02 won an election node00 had initiated.
 members_json() {
-    local id=0 out="" entry host_port kind
+    local id=0 out="" entry host_port kind priority me matched=0
+    me="$(hostname):${MONGO_PORT}"
     IFS=',' read -ra entries <<< "$RS_MEMBERS"
     for entry in "${entries[@]}"; do
         host_port="${entry%%:arbiter}"
         kind=""
-        [ "$entry" != "$host_port" ] && kind=', arbiterOnly: true'
+        priority=""
+        if [ "$entry" != "$host_port" ]; then
+            kind=', arbiterOnly: true'
+        elif [ "$host_port" = "$me" ]; then
+            # 2 rather than 1: strictly greater than every other member is what
+            # makes the outcome deterministic rather than merely likely.
+            priority=', priority: 2'
+            matched=1
+        fi
         [ -n "$out" ] && out="${out}, "
-        out="${out}{ _id: ${id}, host: \"${host_port}\"${kind} }"
+        out="${out}{ _id: ${id}, host: \"${host_port}\"${kind}${priority} }"
         id=$((id + 1))
     done
+    # Worth saying out loud rather than silently going back to a coin toss: it
+    # means RS_MEMBERS does not name this container, which is a compose error.
+    [ "$matched" = 1 ] || log "WARNING: ${me} is not in RS_MEMBERS; the election is a race again"
     printf '[%s]' "$out"
 }
 
@@ -83,9 +106,23 @@ initiate_replset() {
 
     # The user can only be created on the primary, and the election takes a
     # moment after initiate returns.
+    #
+    # Bounded, because the unbounded version is what turned a lost election into
+    # a container that logs the same line every two seconds until someone reads
+    # rs.status() by hand. members_json now pins the priority so this should not
+    # happen, which is exactly why it needs to fail loudly if it ever does again.
+    local waited=0
     until msh --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true; do
-        log "waiting to become primary ..."
+        if [ "$waited" -ge 120 ]; then
+            log "FATAL: still not primary after ${waited}s"
+            log "  primary is: $(msh --eval 'rs.hello().primary' 2>/dev/null || echo unknown)"
+            log "  the root user can only be created here, so no node in ${REPLSET}"
+            log "  will ever register with PMM. Check the priorities in rs.conf()."
+            return 1
+        fi
+        log "waiting to become primary ... (${waited}s)"
         sleep 2
+        waited=$((waited + 2))
     done
 }
 
