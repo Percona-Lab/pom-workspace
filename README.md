@@ -451,9 +451,7 @@ things. `./om pom api inventory/hosts` is the third route - the same rows as the
 them, through PMM's proxy.
 
 The full API surface, the `pom` schema with its freshness columns, and who calls what are
-in [`docs/architecture.md`](docs/architecture.md). The decisions still open - naming,
-authorization, retention - are in
-[`docs/pom-open-questions.md`](docs/pom-open-questions.md).
+in [`docs/architecture.md`](docs/architecture.md).
 
 ---
 

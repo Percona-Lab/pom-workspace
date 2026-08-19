@@ -21,8 +21,7 @@ name in *italics* the first time it appears is explained in
 > serving the last sweep's output, pmm-managed **proxies** that estate at
 > `/v1/pom/inventory/*`, and the PMM UI gained Services, Hosts and Discovery pages that
 > reach it through PMM's own origin - so no POM page in the browser talks to SEP any
-> more. The decisions still open are in
-> [`pom-open-questions.md`](pom-open-questions.md).
+> more.
 
 > **What changed since 2026-08-10** — one thing, and it is structural: **POM was split
 > across the two products.** Deriving the MongoDB topology moved into pmm-managed, which

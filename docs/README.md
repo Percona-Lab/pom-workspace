@@ -10,7 +10,6 @@ someone who has not worked on PMM or SEP before.
 | [topology.md](topology.md) | **Start here.** What the two products are, what runs on your machine, what talks to what, and how a job actually gets executed. Concepts and data flows. Plain-English first, detail after. |
 | [`../psmdb/README.md`](../psmdb/README.md) | The **database nodes** — four MongoDB topologies as Compose profiles, one container per node, each carrying an executor client. The in-place upgrade loop, bootstrap ordering, and the rough edges. Lives next to the code rather than here because it documents one directory. |
 | [architecture.md](architecture.md) | **POM specifically** — how the PSMDB Open Manager works today: what pmm-managed derives, what the SEP app probes, the `pom` schema and its freshness columns, both API surfaces with their authorization, and the four UI pages. Expected to change. |
-| [pom-open-questions.md](pom-open-questions.md) | **POM's open decisions** — what was settled provisionally and needs confirming (authorization, the app's name), and what was deliberately deferred (pagination, retention, sweep cost). One entry per decision, each saying who needs to answer. |
 | [glossary.md](glossary.md) | Every proper noun and piece of jargon in one place — VictoriaMetrics, Nomad, `raw_exec`, syncers, and the rest. |
 
 `topology.md` tells you *what the pieces are*, and its Part 10 is the reference layer —

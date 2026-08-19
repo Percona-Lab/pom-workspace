@@ -6,10 +6,8 @@
 `ui/packages/plugins/pom/`), `SEP/` @ `PMM-15326-pom-inventory`
 (`app/sep/apps/pom_discovery/`, `app/sep/pom/`). Verified against a running stack.
 
-> **This will change.** It describes the shape rather than the reasoning; the reasoning
-> and the decisions still open are in
-> [`pom-open-questions.md`](pom-open-questions.md). For the system this sits inside,
-> see [`topology.md`](topology.md).
+> **This will change.** It describes the shape rather than the reasoning. For the system
+> this sits inside, see [`topology.md`](topology.md).
 
 ---
 
@@ -362,8 +360,8 @@ things.
 
 - **No VM write-back.** POM reads VictoriaMetrics and writes nothing to it.
 - **No `pom` database.** A schema inside `sep`; the contract between the halves is HTTP.
-- **No pagination**, anywhere. Correct at this sandbox's 20 hosts and wrong at a real
-  estate's thousands - see [`pom-open-questions.md`](pom-open-questions.md).
+- **No pagination**, except `GET /runs`. Correct at this sandbox's 20 hosts and wrong at
+  a real estate's thousands.
 - **No browser-side SEP bearer.** Removed with the Discovery page's move onto the proxy.
 - **`pom_worker` / `pom_api` are gone** - the previous, SEP-only implementation, retired
   2026-08-12.
