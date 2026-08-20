@@ -68,7 +68,7 @@
 #   ./om topology runs [n]  collection runs, with each source's verdict
 #   ./om topology run       trigger a collection (fast; does NOT probe)
 #   ./om topology sql <q>   psql against om_topology_runs / om_topology_snapshots
-#   ./om topology api <p>   any /v1/om path, e.g. `api topology/runs -X POST -d {}`
+#   ./om topology api <p>   any /v1/om path, e.g. `api topology/runs:collect -X POST -d {}`
 #                           or `api inventory/hosts` for the proxied estate
 #
 # OM inventory in SEP (schema om: host, service, inventory_run;
@@ -2363,7 +2363,7 @@ pmm_psql() {
 }
 
 # GETs (or otherwise calls) a path under pmm-managed's OM API. Extra arguments go
-# straight to curl, so a write is `om api topology/runs -X POST -d '{}'`.
+# straight to curl, so a write is `om api topology/runs:collect -X POST -d '{}'`.
 pmm_api() {
   local path="${1#/}"; shift || true
   curl -sk -m 30 -H "Authorization: Bearer $(om_pmm_key)" \
@@ -2408,8 +2408,13 @@ run, origin = snap["run_id"], d.get("origin_node")
 print("  generated %s  observed %s  stale=%s" % (gen, obs, stale))
 print("  run %s  origin %s" % (run, origin))
 print("  %d service(s): %d up, %d down  |  %d cluster(s) in %d environment(s)" % (
-    s["services_total"], s["services_up"], s["services_down"], s["clusters"], s["environments"]))
-print("  roles: " + ", ".join("%s=%d" % kv for kv in sorted(s["by_process_role"].items())))
+    s["total_services"], s["up_services"], s["down_services"], s["clusters"], s["environments"]))
+def short(v):
+    for prefix in ("PROCESS_ROLE_",):
+        if isinstance(v, str) and v.startswith(prefix):
+            return v[len(prefix):].lower()
+    return v
+print("  roles: " + ", ".join("%s=%d" % (short(k), n) for k, n in sorted(s["process_role_counts"].items())))
 '
   echo
   topology_cmd_services
@@ -2429,15 +2434,29 @@ def g(v, dash="-"):
     return dash if v is None else str(v)
 def num(v):
     return "-" if v is None or v == -1 else f"{float(v):.0f}"
+def short(v):
+    """Strip a proto enum name down to its meaningful tail for display.
+
+    The wire carries SERVICE_STATUS_UP because protojson serialises enums by name and
+    buf requires the type prefix on every value. Fine for a machine, useless in an
+    aligned column, so the prefix comes off here rather than being absent there.
+    """
+    if not isinstance(v, str) or "_" not in v:
+        return v
+    for prefix in ("SERVICE_STATUS_", "PROCESS_ROLE_", "RUN_STATUS_",
+                   "SOURCE_STATUS_", "EXECUTOR_RESOLUTION_", "SETTING_RELOAD_"):
+        if v.startswith(prefix):
+            return v[len(prefix):].lower()
+    return v
 hdr = ("SERVICE", "CLUSTER", "ROLE", "STATE", "STATUS", "VERSION", "INSTALLED", "CPU%", "FREE%", "LAG", "OPLOG")
 w = [max(len(h), *(len(x) for x in col)) for h, col in zip(hdr, zip(*[
-    (s["service_name"], cl, s["process_role"], g(s["state"]), s["status"], g(s["version"]),
+    (s["service_name"], cl, short(s["process_role"]), g(s["state"]), short(s["status"]), g(s["version"]),
      g(s.get("installed_version")), num(s["cpu_usage_percent"]), num(s["connections_free_percent"]),
      num(s["replication_lag_seconds"]), num(s["oplog_window_seconds"]))
     for _, cl, s in rows]))]
 print("  " + "  ".join(h.ljust(n) for h, n in zip(hdr, w)))
 for _, cl, s in rows:
-    cells = (s["service_name"], cl, s["process_role"], g(s["state"]), s["status"], g(s["version"]),
+    cells = (s["service_name"], cl, short(s["process_role"]), g(s["state"]), short(s["status"]), g(s["version"]),
              g(s.get("installed_version")), num(s["cpu_usage_percent"]), num(s["connections_free_percent"]),
              num(s["replication_lag_seconds"]), num(s["oplog_window_seconds"]))
     print("  " + "  ".join(c.ljust(n) for c, n in zip(cells, w)))
@@ -2455,10 +2474,15 @@ if not runs:
     sys.exit("  no runs recorded yet — trigger one with ./om topology run")
 for r in runs:
     c = r["counts"]
-    src = " ".join("%s=%s" % (x["source"], x["status"]) for x in r.get("sources") or [])
+    def short(v):
+        for prefix in ("RUN_STATUS_", "SOURCE_STATUS_"):
+            if isinstance(v, str) and v.startswith(prefix):
+                return v[len(prefix):].lower()
+        return v
+    src = " ".join("%s=%s" % (x["source"], short(x["status"])) for x in r.get("sources") or [])
     print("  %s  %-8s total=%-3d up=%-3d stale=%-3d %s" % (
-        r["started_at"][11:19], r["status"], c["services_total"],
-        c["probes_ok"], c["services_stale"], src))
+        r["start_time"][11:19], short(r["status"]), c["total_services"],
+        c["successful_probes"], c["stale_services"], src))
     for e in r.get("errors") or []:
         print("      ! [%s] %s: %s" % (e["scope"], e["code"], e["message"][:96]))
 '
@@ -2469,7 +2493,7 @@ topology_cmd_run() {
   # Synchronous on the PMM side: inventory is a local read and VictoriaMetrics is on
   # localhost, so this answers with a terminal status rather than an id to poll. It
   # does NOT probe -- on-host facts come from the inventory sweep, ./om inventory run.
-  local body; body="$(pmm_api topology/runs -X POST -d '{}')"
+  local body; body="$(pmm_api topology/runs:collect -X POST -d '{}')"
   printf '%s\n' "$body" | json_out
   echo
   topology_cmd_runs 1
