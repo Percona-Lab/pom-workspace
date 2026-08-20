@@ -53,9 +53,9 @@ PMM_PORT_HTTPS=8443
 PMM_PORT_CH_TCP=9900
 PMM_PORT_CH_HTTP=8923
 
-# --- what POM needs turned on -----------------------------------------------
+# --- what OM needs turned on -----------------------------------------------
 #
-# Nomad is how SEP's pom_discovery reaches hosts at all: no Nomad, no probes, and
+# Nomad is how SEP's om_inventory reaches hosts at all: no Nomad, no probes, and
 # the estate stays empty however often a sweep runs.
 PMM_ENABLE_NOMAD=1
 
@@ -75,7 +75,7 @@ PMM_PUBLIC_ADDRESS=pmm-server
 
 # --- reaching SEP -----------------------------------------------------------
 #
-# pmm-managed proxies SEP's discovery app at /v1/pom/inventory/*. host.docker.internal
+# pmm-managed proxies SEP's inventory app at /v1/om/inventory/*. host.docker.internal
 # is supplied by harness/pmm-compose.override.yml, so this points at a SEP backend
 # running natively on the host (./om start sep-backend).
 PMM_SEP_URL=http://host.docker.internal:8000

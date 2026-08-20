@@ -2,7 +2,7 @@
 #
 # Everything the workspace needs from the PMM container that PMM itself has no
 # reason to carry. Keeping it here means the pmm checkout stays a clean branch of
-# POM code, which is also how the shipped integration works: SEP's
+# OM code, which is also how the shipped integration works: SEP's
 # sidecar/pmm-fb/compose.yaml supplies its own overlay rather than patching PMM.
 #
 # Relative paths resolve against the project directory, which is pmm/ because om

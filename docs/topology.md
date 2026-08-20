@@ -6,7 +6,7 @@ PMM-15293 + PMM-15238; `docker-compose.dev.yml`, `.env`,
 `build/ansible/roles/{supervisord,nginx}/files/*`, `managed/services/supervisord/*`,
 `ui/apps/pmm/*`), `SEP/` @ `psmdb-openmanager` (`6f89d1a3`) (`app/main.py`,
 `settings.yaml`, `app/tasks/execution/**`, `app/sep/sync/syncers/pmm.py`,
-`app/sep/apps/pom_discovery/**`), the [`psmdb/`](../psmdb/) cluster stack
+`app/sep/apps/om_inventory/**`), the [`psmdb/`](../psmdb/) cluster stack
 (`compose.yaml`, `Dockerfile`, `scripts/*`), plus the workspace's own [`om`](../om). Live
 state cross-checked against a running stack (`./om status`, `docker ps`,
 `GET /nomad/v1/nodes`).
@@ -16,19 +16,19 @@ will know what is running and why. Parts 3 onward add detail, one layer at a tim
 name in *italics* the first time it appears is explained in
 [`glossary.md`](glossary.md).
 
-> **What changed since 2026-08-12** - POM grew an **inventory of its own**. The
-> `pom_discovery` app now keeps upserted `pom.host` and `pom.service` tables rather than
+> **What changed since 2026-08-12** - OM grew an **inventory of its own**. The
+> `om_inventory` app now keeps upserted `om.host` and `om.service` tables rather than
 > serving the last sweep's output, pmm-managed **proxies** that estate at
-> `/v1/pom/inventory/*`, and the PMM UI gained Services, Hosts and Discovery pages that
-> reach it through PMM's own origin - so no POM page in the browser talks to SEP any
+> `/v1/om/inventory/*`, and the PMM UI gained Services, Hosts and Inventory pages that
+> reach it through PMM's own origin - so no OM page in the browser talks to SEP any
 > more.
 
-> **What changed since 2026-08-10** — one thing, and it is structural: **POM was split
+> **What changed since 2026-08-10** — one thing, and it is structural: **OM was split
 > across the two products.** Deriving the MongoDB topology moved into pmm-managed, which
 > already owns both inputs; SEP kept only the work that needs a process on a database
-> host, as the `pom_discovery` app. `pom_worker` and `pom_api` were deleted. The whole of
-> it is in [`architecture.md`](architecture.md); this doc carries the parts that touch the
-> rest of the system.
+> host, as the `om_inventory` app. The whole of it is in
+> [`architecture.md`](architecture.md); this doc carries the parts that touch the rest of
+> the system.
 
 > **What changed in the 2026-08-10 revision (from 2026-08-03)** — four things, and they
 > are all structural:
@@ -247,7 +247,7 @@ have no `cluster` string and no `/root/.mongodb_uri`. Started individually -
 `./om start pmm-client-node01` - because each node carries its own compose profile too.
 
 **The `cluster` column is not cosmetic.** SEP's inventory has no cluster *entity*, only a
-cluster *string* per service, set by `pmm-admin add mongodb --cluster=`. POM groups
+cluster *string* per service, set by `pmm-admin add mongodb --cluster=`. OM groups
 services into clusters by matching that string (falling back to the replica set), so
 members of one topology must share it or the topology silently fragments.
 
@@ -261,7 +261,7 @@ members of one topology must share it or the topology silently fragments.
   8443. Reach a node with `docker exec`.
 - **Readiness means registered, not started.** `./om start <profile>` waits until every
   node has `/root/.mongodb_uri` — the credentials file both `backup_mongo` and
-  `pom_discovery`'s probe payload read by default. A node whose `pmm-agent` has not connected is not yet a
+  `om_inventory`'s probe payload read by default. A node whose `pmm-agent` has not connected is not yet a
   usable execution host.
 - **Bootstrap runs *on* a node**, because MongoDB's localhost exception is the only way to
   create the first user under keyfile auth, and it really is localhost-only. One member
@@ -358,7 +358,7 @@ gets you the whole product, and why the URL path decides which program answers:
 | `/pmm-ui`, `/` | static files | the React frontend from `pmm/ui` — which now contains the SEP UI |
 | `/v1/` | pmm-managed `:7772` | the main REST API — inventory, settings, backups |
 | `/v1/qan` | qan-api2 `:9922` | query analytics API |
-| `/prometheus/api/v1`, `/victoriametrics/` | vmproxy `:8430` | metric queries, filtered per user — POM's PromQL among them; `/import/prometheus` is the write path |
+| `/prometheus/api/v1`, `/victoriametrics/` | vmproxy `:8430` | metric queries, filtered per user — OM's PromQL among them; `/import/prometheus` is the write path |
 | `/prometheus/rules`, `/prometheus/alerts` | vmalert `:8880` | rule and alert state |
 | `/nomad/` | nomad server `:4646` | **on**, via `PMM_ENABLE_NOMAD=1` — this is SEP's executor endpoint |
 | `/api`, `/sep_app`, `/files`, `/stream-logs`, `/execution-events` | `host.docker.internal:8000` | **SEP**, running natively on the host. `auth_request off`, dev only |
@@ -412,7 +412,7 @@ flowchart LR
     VM --> GRAF["Grafana / PMM UI"]
     CH --> GRAF
     VM --> VMA["vmalert"]
-    VM -.->|"PromQL, read-only"| POM["pmm-managed services/pom<br/>derives the MongoDB topology"]
+    VM -.->|"PromQL, read-only"| OM["pmm-managed services/om<br/>derives the MongoDB topology"]
 ```
 
 - **Metrics** — numbers over time. `vmagent` scrapes the exporters and pushes into
@@ -421,11 +421,11 @@ flowchart LR
   pmm-agent, relayed through pmm-managed to qan-api2, stored in ClickHouse. ClickHouse is
   a *column store*, which is the right shape for "group millions of queries by
   fingerprint"; VictoriaMetrics would be the wrong tool, and vice versa.
-- **A third reader**: POM queries VictoriaMetrics from inside pmm-managed to derive the
+- **A third reader**: OM queries VictoriaMetrics from inside pmm-managed to derive the
   MongoDB topology — see [`architecture.md`](architecture.md). It only reads. SEP *can*
   write to VM directly (`/prometheus/api/v1/import/prometheus` with the PMM credentials it
   holds), and the `.prom` textfile route the backup payloads use is the other write path,
-  but nothing in POM uses either today.
+  but nothing in OM uses either today.
 
 ## How agents connect
 
@@ -543,14 +543,14 @@ needs no code**. The React shell fetches `/api/apps/<name>/schema` and renders t
 from it, so a brand-new app appears in the sidebar with no rebuild. Only the `base`
 flavor (`custom_ui=True`) needs a real React component.
 
-**`pom_discovery`** — not a UI app at all: `sidebar=False`, no page, registered so its
+**`om_inventory`** — not a UI app at all: `sidebar=False`, no page, registered so its
 Celery task is discoverable and it can be switched off. It is the clearest example of the
 current execution shape, and of the split that shape now serves.
 
-POM's *derivation* lives in pmm-managed - it reads PMM's own inventory and
+OM's *derivation* lives in pmm-managed - it reads PMM's own inventory and
 VictoriaMetrics, and reconstructing the MongoDB topology is a gap in PMM rather than a
 SEP feature. What is left in SEP is the half that genuinely needs a process on a database
-host. `pom_discovery` is that half:
+host. `om_inventory` is that half:
 
 1. enumerate **hosts** from SEP's inventory nodes, crossed with the executor list - not
    from services, because a host with no database has no service to be found through, and
@@ -560,9 +560,9 @@ host. `pom_discovery` is that half:
 3. dispatch the probe payload **once per executor host** via the pre-seeded system
    `run-python` task, and collect NDJSON back over the task-log chunk store rather than
    the 16 KB result file;
-4. **upsert** what it found into `pom.host` and `pom.service`, keyed on PMM's own node
+4. **upsert** what it found into `om.host` and `om.service`, keyed on PMM's own node
    and service ids - the only keys the consumer can join on;
-5. serve the estate at `GET /api/apps/pom_discovery/{hosts,services}`, which **never
+5. serve the estate at `GET /api/apps/om_inventory/{hosts,services}`, which **never
    probes**: it answers from stored rows, each carrying its own age.
 
 That last point is the load-bearing one. A sweep dispatches Nomad jobs and takes tens of
@@ -580,18 +580,14 @@ as against the running one - their divergence is the upgraded-but-not-restarted 
 the config path, the command line, the OS pair, whether the host can reach Percona's
 repository, and any mongod running that PMM has no service for.
 
-`pom_discovery` reads its `credentials_path` from the `/root/.mongodb_uri` that
+`om_inventory` reads its `credentials_path` from the `/root/.mongodb_uri` that
 `register.sh` writes, the same file `backup_mongo` uses.
 
 It also carries the executor-mapping and Nomad fan-out machinery (`mapping.py`,
-`dispatch.py`, `payload/`), inherited when `pom_worker` was retired. The upgrade and
-restart apps will want exactly those, so expect them to move to a shared home once there
-is a second caller.
+`dispatch.py`, `payload/`). The upgrade and restart apps will want exactly those, so
+expect them to move to a shared home once there is a second caller.
 
-> `pom_worker` and `pom_api` — the earlier, SEP-only POM — were **deleted on 2026-08-12**
-> once the pmm-managed implementation held parity. Their tables (`pom_run`, `pom_node`,
-> `pom_snapshot`) went with them. `GET /facts` followed on **2026-08-17**, replaced by
-> the estate above.
+> `GET /facts` was retired on **2026-08-17**, replaced by the estate above.
 
 The full picture, including the document's conventions and the traps behind them, is in
 [`architecture.md`](architecture.md).
@@ -611,7 +607,7 @@ the cross-repo one, and the whole reason these two repos share a workspace.
 ## Celery — the background clock
 
 *Celery* runs the scheduled work: syncers, periodic maintenance, and jobs like
-`pom_discovery`'s probe sweep. One trap worth knowing up front: on a fresh checkout the backend **will
+`om_inventory`'s probe sweep. One trap worth knowing up front: on a fresh checkout the backend **will
 not start** until Celery's beat scheduler has created its own tables once. `./om setup`
 does that for you; the reasoning is in
 [`../notes/sep-dev-quickstart.md`](../notes/sep-dev-quickstart.md) §3.3b.
@@ -865,7 +861,7 @@ As configured by this workspace's `pmm/.env` and `om`:
 | vmagent | VictoriaMetrics | metrics push |
 | SEP `PMMSyncer` | PMM `/v1/inventory` | REST + Bearer service account token |
 | SEP tasks app | PMM `/nomad` on `:8443` | REST over HTTPS, credentials in the URL — register, dispatch, poll, stream logs |
-| pmm-managed `services/pom` | SEP `/api/apps/pom_discovery/facts` | REST + Bearer, pulls on-host facts; `PMM_SEP_URL` |
+| pmm-managed `services/om` | SEP `/api/apps/om_inventory/facts` | REST + Bearer, pulls on-host facts; `PMM_SEP_URL` |
 | SEP (all three services + beat) | PMM's embedded PostgreSQL `:5432` | database `sep`, role `sep` |
 | SEP core app | Grafana in pmm-server | validates a `pmm_session` cookie, maps the org role |
 | PMM nginx | SEP `:8000` | proxies `/api`, `/sep_app`, `/files`, `/stream-logs`, `/execution-events` via `host.docker.internal` |
@@ -890,7 +886,7 @@ As configured by this workspace's `pmm/.env` and `om`:
 | `SEP/settings.yaml` | apps, syncers, and the `development` block that points SEP at PMM's Postgres and Nomad |
 | `SEP/app/api/routes/oauth.py` | `/session/exchange` — the PMM session → SEP bearer swap |
 | `SEP/app/sep/sync/syncers/pmm.py` | the SEP→PMM inventory pull |
-| `SEP/app/sep/apps/pom_discovery/{service,dispatch,mapping}.py` | the current end-to-end execution example |
+| `SEP/app/sep/apps/om_inventory/{service,dispatch,mapping}.py` | the current end-to-end execution example |
 | `SEP/app/tasks/execution/executors/nomad/models.py` | job register, dispatch, log streaming |
 
 ## Known drift

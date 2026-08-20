@@ -127,7 +127,7 @@ When acting as an AI coding agent in this workspace:
 
 **Never mix infrastructure, deployment or local-harness changes into a feature commit.**
 They go in their own commit, and the message has to justify them. A reviewer reading a
-POM commit should not have to decide whether an nginx location or a compose mount is
+OM commit should not have to decide whether an nginx location or a compose mount is
 part of the feature.
 
 This covers anything that changes *how the software is run* rather than what it does:

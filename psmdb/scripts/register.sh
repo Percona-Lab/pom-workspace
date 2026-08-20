@@ -7,7 +7,7 @@
 #
 #   --cluster=$PMM_CLUSTER   SEP's inventory has no cluster entity; it carries a
 #                            cluster *string* per service, and that string comes
-#                            from this flag. pom_worker groups a run's services
+#                            from this flag. pmm-managed groups a run's services
 #                            into cluster documents by matching it, so nodes that
 #                            should be one cluster must pass the same value or the
 #                            topology silently fragments.
@@ -15,7 +15,7 @@
 #   /root/.mongodb_uri       the node-side credentials file. SEP never ships
 #                            credentials with a job — payloads read a path on the
 #                            host (backup_mongo's pbm_creds_common.py, and
-#                            pom_worker's probe payload, both default here).
+#                            om_inventory's probe payload, both default here).
 #                            $HOME is /root because the Nomad client inherits
 #                            pmm-agent's user, which is root in this container.
 #

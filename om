@@ -27,10 +27,10 @@
 #                           (./om start pmm rebuilds both automatically when the
 #                           container is serving the image's stale binary/bundle,
 #                           which a container recreate always leaves it doing)
-#   ./om pom [sub]          POM in PMM: topology documents (see below)
-#   ./om discovery [sub]    POM's estate in SEP: hosts, services, sweeps (see below)
+#   ./om topology [sub]     OM in PMM: topology documents (see below)
+#   ./om inventory [sub]    OM's estate in SEP: hosts, services, sweeps (see below)
 #   ./om sep-api <app> <p>  call any SEP app's API
-#   ./om inventory [view]   PMM's inventory as JSON on stdout, nodes/services/
+#   ./om pmm-inventory      PMM's inventory as JSON on stdout, nodes/services/
 #                           agents joined into one document. Views: tree
 #                           (default), nodes, services, agents, raw
 #   ./om urls [comp...]     every URI a component serves (vmui, Swagger, ...)
@@ -44,48 +44,48 @@
 #                           server image (several GB to pull again).
 #   ./om doctor             check prerequisites only
 #
-# POM is split across both products. pmm-managed derives the topology document from
-# PMM's own inventory and VictoriaMetrics; SEP's pom_discovery app probes every host
+# OM is split across both products. pmm-managed derives the topology document from
+# PMM's own inventory and VictoriaMetrics; SEP's om_inventory app probes every host
 # over Nomad -- database or not -- and keeps an upserted estate of what it found.
-# pmm-managed reads that estate, and also proxies it at /v1/pom/inventory/* so the UI
+# pmm-managed reads that estate, and also proxies it at /v1/om/inventory/* so the UI
 # reaches it through PMM's own origin.
 #
 # There is a command group per side, and each reaches both its store and its API. The
 # estate is therefore reachable two ways on purpose:
 #
-#   ./om discovery estate     straight from the tables
-#   ./om discovery facts      through SEP's own API
-#   ./om pom api inventory/hosts   through PMM's proxy, as the UI sees it
+#   ./om inventory estate     straight from the tables
+#   ./om inventory facts      through SEP's own API
+#   ./om topology api inventory/hosts   through PMM's proxy, as the UI sees it
 #
 # They should never disagree, so a disagreement is a serialisation bug rather than
 # three views of different things.
 #
-# POM in PMM (tables pom_runs / pom_snapshots, API /v1/pom):
+# OM in PMM (tables om_topology_runs / om_topology_snapshots, API /v1/om):
 #
-#   ./om pom                overview: the document, plus a row per service
-#   ./om pom topology       just the per-service table
-#   ./om pom raw            the document as JSON
-#   ./om pom runs [n]       collection runs, with each source's verdict
-#   ./om pom run            trigger a collection (fast; does NOT probe)
-#   ./om pom sql <query>    psql against pom_runs / pom_snapshots
-#   ./om pom api <path>     any /v1/pom path, e.g. `api discovery/runs -X POST -d {}`
+#   ./om topology           overview: the document, plus a row per service
+#   ./om topology services  just the per-service table
+#   ./om topology raw       the document as JSON
+#   ./om topology runs [n]  collection runs, with each source's verdict
+#   ./om topology run       trigger a collection (fast; does NOT probe)
+#   ./om topology sql <q>   psql against om_topology_runs / om_topology_snapshots
+#   ./om topology api <p>   any /v1/om path, e.g. `api topology/runs -X POST -d {}`
 #                           or `api inventory/hosts` for the proxied estate
 #
-# POM discovery in SEP (schema pom: host, service, discovery_run;
-#                      API /api/apps/pom_discovery):
+# OM inventory in SEP (schema om: host, service, inventory_run;
+#                      API /api/apps/om_inventory):
 #
-#   ./om discovery          overview: how much of the estate is probed and failing
-#   ./om discovery estate [f] the hosts and services POM holds; [f] filters
-#   ./om discovery facts [f] what POM observed, per service; [f] filters
-#   ./om discovery config    the app's settings, and where each value comes from
-#   ./om discovery config <k> <v>   change one; `-` as the value reverts it
-#   ./om discovery runs [n] sweeps, newest first
-#   ./om discovery run      queue a sweep (Nomad jobs; tens of seconds)
-#   ./om discovery sync     refresh SEP inventory from PMM (after a rebuild)
-#   ./om discovery sql <q>  psql against the pom schema
-#   ./om discovery api <p>  any /api/apps/pom_discovery path, e.g.
+#   ./om inventory          overview: how much of the estate is probed and failing
+#   ./om inventory estate [f] the hosts and services OM holds; [f] filters
+#   ./om inventory facts [f] what OM observed, per service; [f] filters
+#   ./om inventory config    the app's settings, and where each value comes from
+#   ./om inventory config <k> <v>   change one; `-` as the value reverts it
+#   ./om inventory runs [n] sweeps, newest first
+#   ./om inventory run      queue a sweep (Nomad jobs; tens of seconds)
+#   ./om inventory sync     refresh SEP inventory from PMM (after a rebuild)
+#   ./om inventory sql <q>  psql against the om schema
+#   ./om inventory api <p>  any /api/apps/om_inventory path, e.g.
 #                           `api hosts?has_service=false`, `api hosts/<id> -X DELETE`
-#   ./om discovery token    bearer token for /api/docs Authorize and for curl
+#   ./om inventory token    bearer token for /api/docs Authorize and for curl
 #
 # SEP's data lives in PMM's embedded PostgreSQL by default. Set OM_SEP_DB_DIR to a
 # directory to keep it in SQLite files there instead, which is how a second
@@ -121,7 +121,7 @@ STATE_DIR="$ROOT/.om"
 # SEP's own settings.yaml deep-merged with this workspace's development overrides,
 # written to harness/ and handed to SEP as SETTINGS_FILE (PreEnvSettings reads it,
 # app/core/config.py). That keeps the SEP checkout at upstream's file, so its branch
-# carries POM code alone, exactly as harness/pmm.conf does for pmm.
+# carries OM code alone, exactly as harness/pmm.conf does for pmm.
 #
 # Rendered from SEP's current settings.yaml on every run rather than snapshotted, so
 # an upstream change to any setting this workspace does not override is picked up
@@ -848,7 +848,7 @@ env_sep() { # mode: create | refresh
     ok "SEP/.env rendered, without the Grafana token"
     warn "no Grafana token: ${GRAFANA_ERROR:-PMM is not running}"
     dim "SEP cannot reach PMM until it has one, so nothing that talks to PMM will work:"
-    dim "  ./om discovery sync fails with 401 'Auth method is not service account token'"
+    dim "  ./om inventory sync fails with 401 'Auth method is not service account token'"
     dim "fix it with ./om env once PMM is up"
   else
     ok "SEP/.env rendered from harness/sep-env.example"
@@ -1690,7 +1690,7 @@ reset_data() {
   # On the default backend SEP's data is inside PMM's /srv, so reset_pmm_data below
   # is what clears it and there is nothing to do here.
   #
-  # This used to drop the `pom` and `public` schemas over psql instead, on the
+  # This used to drop the `om` and `public` schemas over psql instead, on the
   # reasoning that the `sep` database itself is provisioned by PMM's postgres-sep
   # and should outlive a reset. That became unreachable the moment this tier
   # started removing pmm-data: cmd_reset stops everything before calling us, so
@@ -1918,7 +1918,7 @@ cmd_build() {
 }
 
 # ---------------------------------------------------------------------------
-# inventory — PMM's inventory as JSON on stdout
+# pmm-inventory — PMM's inventory as JSON on stdout
 # ---------------------------------------------------------------------------
 #
 # pmm-managed splits the inventory over three endpoints, and each one answers
@@ -1927,7 +1927,7 @@ cmd_build() {
 # of the three joins to the others either: a service points at a node_id, an
 # exporter points at a service_id *and* a pmm_agent_id, and only the pmm_agent
 # itself knows which node it runs on. Doing that stitching here is the whole
-# point of the command — `./om inventory` emits one document you can jq in a
+# point of the command — `./om pmm-inventory` emits one document you can jq in a
 # single pass instead of three curls and a manual join.
 #
 # Everything on stdout is JSON and nothing else, so this is safe to pipe.
@@ -1995,12 +1995,12 @@ JQ_INVENTORY_TREE="$JQ_FLATTEN"'
     }
   }'
 
-cmd_inventory() {
+cmd_pmm_inventory() {
   command -v jq >/dev/null 2>&1 || die "jq not found — install jq"
   local what="${1:-tree}"
   case "$what" in
     tree|nodes|services|agents|raw) ;;
-    *) die "usage: ./om inventory [tree|nodes|services|agents|raw]" ;;
+    *) die "usage: ./om pmm-inventory [tree|nodes|services|agents|raw]" ;;
   esac
 
   # One endpoint is enough for the flat views; only the tree needs the join.
@@ -2054,7 +2054,7 @@ component_uris() { # comp -> "label<TAB>uri" lines
         "VMAlert rules"   "$pmm/prometheus/rules" \
         "VMAlert alerts"  "$pmm/prometheus/alerts" \
         "Swagger UI"      "$pmm/swagger/" \
-        "PostgreSQL"      "postgres://$POM_DB_USER@$POM_DB_HOST:$POM_DB_PORT/$POM_DB_NAME" \
+        "PostgreSQL"      "postgres://$SEP_DB_USER@$SEP_DB_HOST:$SEP_DB_PORT/$SEP_DB_NAME" \
         "Delve (headless)" "127.0.0.1:2345"
       ;;
     sep-backend)
@@ -2107,7 +2107,7 @@ cmd_urls() {
   done
   echo
   dim "PMM and Grafana: admin/admin — the same credentials cover vmui and Swagger"
-  dim "SEP /api/docs: Authorize with \`./om discovery token\` to run requests from the page"
+  dim "SEP /api/docs: Authorize with \`./om inventory token\` to run requests from the page"
 }
 
 # ---------------------------------------------------------------------------
@@ -2250,20 +2250,20 @@ cmd_logs() {
 }
 
 # ---------------------------------------------------------------------------
-# pom (POM: inspect a run across Postgres, VictoriaMetrics and Tasks)
+# OM (inspect a run across Postgres, VictoriaMetrics and Tasks)
 # ---------------------------------------------------------------------------
 
 # SEP's three databases all point at PMM's embedded PostgreSQL, so this is the
-# one connection for inventory, tasks and POM's own tables alike.
-POM_DB_HOST=127.0.0.1
-POM_DB_PORT=5432
-POM_DB_NAME=sep
-POM_DB_USER=sep
+# one connection for inventory, tasks and OM's own tables alike.
+SEP_DB_HOST=127.0.0.1
+SEP_DB_PORT=5432
+SEP_DB_NAME=sep
+SEP_DB_USER=sep
 
 
 # Reads the SEP database password from SEP/.env. `head -1`: several *__DATABASE__
 # PASSWORD keys are set (SEP__, INVENTORY__, TASKS__) and they share one value.
-pom_db_password() {
+sep_db_password() {
   [[ -f "$SEP_DIR/.env" ]] || die "SEP/.env missing — run ./om setup first"
   grep -oP '(?<=DATABASE__PASSWORD=).*' "$SEP_DIR/.env" | head -1
 }
@@ -2272,7 +2272,7 @@ pom_db_password() {
 # one PMM__API_KEY line and python-dotenv takes the last one. Taking the first (or
 # worse, grepping without picking one) yields a key SEP is not using, and every
 # request silently comes back empty or unauthorized.
-pom_pmm_key() {
+om_pmm_key() {
   [[ -f "$SEP_DIR/.env" ]] || die "SEP/.env missing — run ./om setup first"
   grep -oP '(?<=PMM__API_KEY=).*' "$SEP_DIR/.env" | tail -1
 }
@@ -2287,15 +2287,15 @@ sep_token() {
 }
 
 # ---------------------------------------------------------------------------
-# the four ways to reach POM's data
+# the four ways to reach OM's data
 # ---------------------------------------------------------------------------
 #
-# POM is split across both products, so there are two stores and two APIs:
+# OM is split across both products, so there are two stores and two APIs:
 #
-#   sep_psql   SEP's database      pom.host/service/discovery_run - what the probe saw
-#   pmm_psql   pmm-managed's       pom_runs/pom_snapshots — the topology documents
-#   pmm_api    /v1/pom             what the UI reads
-#   sep_api    /api/apps/<app>     any SEP app, discovery being the first
+#   sep_psql   SEP's database      om.host/service/inventory_run - what the probe saw
+#   pmm_psql   pmm-managed's       om_topology_runs/_snapshots — the topology documents
+#   pmm_api    /v1/om              what the UI reads
+#   sep_api    /api/apps/<app>     any SEP app, om_inventory being the first
 #
 # Both psql helpers run inside the pmm-server container rather than over the
 # published port: the databases live there, the socket needs no password, and it
@@ -2309,29 +2309,29 @@ sep_data_location() {
     printf '%s/*.db (OM_SEP_DB_DIR)' "$SEP_DB_DIR"
   else
     printf 'postgres://%s@%s:%s/%s' \
-      "$POM_DB_USER" "$POM_DB_HOST" "$POM_DB_PORT" "$POM_DB_NAME"
+      "$SEP_DB_USER" "$SEP_DB_HOST" "$SEP_DB_PORT" "$SEP_DB_NAME"
   fi
 }
 
 
 sep_psql() {
-  docker exec -i "$PMM_CONTAINER" psql "postgres://${POM_DB_USER}@127.0.0.1/${POM_DB_NAME}" "$@" \
+  docker exec -i "$PMM_CONTAINER" psql "postgres://${SEP_DB_USER}@127.0.0.1/${SEP_DB_NAME}" "$@" \
     || die "cannot reach SEP's database in $PMM_CONTAINER — is pmm running?"
 }
 
 # The SQLite file SEP's own tables live in, when OM_SEP_DB_DIR selects that backend.
-# POM's tables are SEP's, so this is the file they are in; inventory and tasks keep
+# OM's tables are SEP's, so this is the file they are in; inventory and tasks keep
 # their own, which is also why `service` here cannot collide with inventory's.
 sep_sqlite_file() { printf '%s/sep.db' "$SEP_DB_DIR"; }
 
-# How POM's tables are addressed, which is not the same on both backends.
+# How OM's tables are addressed, which is not the same on both backends.
 #
 # The models declare a *symbolic* schema that the engine translates per bind: to
-# `pom` on PostgreSQL, and to the default schema on SQLite, which has no schemas.
-# So the same table is `pom.host` in one and plain `host` in the other, and a query
+# `om` on PostgreSQL, and to the default schema on SQLite, which has no schemas.
+# So the same table is `om.host` in one and plain `host` in the other, and a query
 # written for one is a syntax error against the other.
-pom_table() {
-  if [[ -n "$SEP_DB_DIR" ]]; then printf '%s' "$1"; else printf 'pom.%s' "$1"; fi
+om_table() {
+  if [[ -n "$SEP_DB_DIR" ]]; then printf '%s' "$1"; else printf 'om.%s' "$1"; fi
 }
 
 # Run one query against SEP's database, whichever backend it is on, and print rows
@@ -2362,12 +2362,12 @@ pmm_psql() {
     || die "cannot reach pmm-managed's database in $PMM_CONTAINER — is pmm running?"
 }
 
-# GETs (or otherwise calls) a path under pmm-managed's POM API. Extra arguments go
-# straight to curl, so a write is `pom api discovery/runs -X POST -d '{}'`.
+# GETs (or otherwise calls) a path under pmm-managed's OM API. Extra arguments go
+# straight to curl, so a write is `om api topology/runs -X POST -d '{}'`.
 pmm_api() {
   local path="${1#/}"; shift || true
-  curl -sk -m 30 -H "Authorization: Bearer $(pom_pmm_key)" \
-    "https://127.0.0.1:${PMM_HTTPS_PORT}/v1/pom/${path}" "$@"
+  curl -sk -m 30 -H "Authorization: Bearer $(om_pmm_key)" \
+    "https://127.0.0.1:${PMM_HTTPS_PORT}/v1/om/${path}" "$@"
 }
 
 # The same for any SEP app's API. `app` is the module name as registered in
@@ -2391,17 +2391,17 @@ except ValueError:
 }
 
 # ---------------------------------------------------------------------------
-# pom — the PMM side: topology documents derived from inventory + VictoriaMetrics
+# topology — the PMM side: documents derived from PMM's inventory + VictoriaMetrics
 # ---------------------------------------------------------------------------
 
-pom_cmd_show() {
-  info "POM topology (pmm-managed)"
+topology_cmd_show() {
+  info "OM topology (pmm-managed)"
   pmm_api topology | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
 except ValueError:
-    sys.exit("  could not read /v1/pom/topology — is pmm-managed up with the POM service?")
+    sys.exit("  could not read /v1/om/topology — is pmm-managed up with the OM service?")
 s, snap = d["summary"], d["snapshot"]
 gen, obs, stale = snap["generated_at"], snap["observed_at"], snap["stale"]
 run, origin = snap["run_id"], d.get("origin_node")
@@ -2412,12 +2412,12 @@ print("  %d service(s): %d up, %d down  |  %d cluster(s) in %d environment(s)" %
 print("  roles: " + ", ".join("%s=%d" % kv for kv in sorted(s["by_process_role"].items())))
 '
   echo
-  pom_cmd_topology
+  topology_cmd_services
 }
 
 # One row per service, which is what you actually want to look at: the document is
 # nested environment -> cluster -> service and unreadable as raw JSON at any size.
-pom_cmd_topology() {
+topology_cmd_services() {
   pmm_api topology | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
@@ -2444,15 +2444,15 @@ for _, cl, s in rows:
 '
 }
 
-pom_cmd_raw() { pmm_api topology | json_out; }
+topology_cmd_raw() { pmm_api topology | json_out; }
 
-pom_cmd_runs() {
-  info "POM collection runs (pmm-managed)"
-  pmm_api "discovery/runs?limit=${1:-15}" | python3 -c '
+topology_cmd_runs() {
+  info "OM collection runs (pmm-managed)"
+  pmm_api "topology/runs?limit=${1:-15}" | python3 -c '
 import json, sys
 runs = json.load(sys.stdin).get("runs") or []
 if not runs:
-    sys.exit("  no runs recorded yet — trigger one with ./om pom run")
+    sys.exit("  no runs recorded yet — trigger one with ./om topology run")
 for r in runs:
     c = r["counts"]
     src = " ".join("%s=%s" % (x["source"], x["status"]) for x in r.get("sources") or [])
@@ -2464,59 +2464,59 @@ for r in runs:
 '
 }
 
-pom_cmd_run() {
-  info "Triggering a POM collection"
+topology_cmd_run() {
+  info "Triggering a OM collection"
   # Synchronous on the PMM side: inventory is a local read and VictoriaMetrics is on
   # localhost, so this answers with a terminal status rather than an id to poll. It
-  # does NOT probe -- on-host facts come from the discovery sweep, ./om discovery run.
-  local body; body="$(pmm_api discovery/runs -X POST -d '{}')"
+  # does NOT probe -- on-host facts come from the inventory sweep, ./om inventory run.
+  local body; body="$(pmm_api topology/runs -X POST -d '{}')"
   printf '%s\n' "$body" | json_out
   echo
-  pom_cmd_runs 1
+  topology_cmd_runs 1
 }
 
-pom_cmd_sql() {
-  [[ $# -gt 0 ]] || die "usage: ./om pom sql <query>   (tables: pom_runs, pom_snapshots)"
+topology_cmd_sql() {
+  [[ $# -gt 0 ]] || die "usage: ./om topology sql <query>   (tables: om_topology_runs, om_topology_snapshots)"
   pmm_psql -c "$*"
 }
 
-pom_cmd_api() {
-  [[ $# -gt 0 ]] || die "usage: ./om pom api <path> [curl args]   e.g. ./om pom api topology"
+topology_cmd_api() {
+  [[ $# -gt 0 ]] || die "usage: ./om topology api <path> [curl args]   e.g. ./om topology api topology"
   local path="$1"; shift
   pmm_api "$path" "$@" | json_out
 }
 
-cmd_pom() {
+cmd_topology() {
   local sub="${1:-show}"; shift || true
   case "$sub" in
-    show)     pom_cmd_show "$@" ;;
-    topology) pom_cmd_topology "$@" ;;
-    raw)      pom_cmd_raw "$@" ;;
-    runs)     pom_cmd_runs "$@" ;;
-    run)      pom_cmd_run "$@" ;;
-    sql)      pom_cmd_sql "$@" ;;
-    api)      pom_cmd_api "$@" ;;
-    *) die "unknown pom subcommand '$sub' (show|topology|raw|runs|run|sql|api)" ;;
+    show)     topology_cmd_show "$@" ;;
+    services) topology_cmd_services "$@" ;;
+    raw)      topology_cmd_raw "$@" ;;
+    runs)     topology_cmd_runs "$@" ;;
+    run)      topology_cmd_run "$@" ;;
+    sql)      topology_cmd_sql "$@" ;;
+    api)      topology_cmd_api "$@" ;;
+    *) die "unknown topology subcommand '$sub' (show|services|raw|runs|run|sql|api)" ;;
   esac
 }
 
 # ---------------------------------------------------------------------------
-# discovery — the SEP side: on-host facts no metric carries
+# inventory — the SEP side: on-host facts no metric carries
 # ---------------------------------------------------------------------------
 
-disc_cmd_show() {
-  info "POM discovery (SEP app pom_discovery)"
-  sep_api pom_discovery hosts | python3 -c '
+inv_cmd_show() {
+  info "OM inventory (SEP app om_inventory)"
+  sep_api om_inventory hosts | python3 -c '
 import json, sys
 from collections import Counter
 try:
     hosts = json.load(sys.stdin)
 except ValueError:
-    sys.exit("  could not read the app - is sep-backend up and pom_discovery enabled?")
+    sys.exit("  could not read the app - is sep-backend up and om_inventory enabled?")
 if not isinstance(hosts, list):
     sys.exit("  unexpected answer from /hosts: %s" % str(hosts)[:200])
 if not hosts:
-    sys.exit("  no host rows - has a sweep run? ./om discovery run")
+    sys.exit("  no host rows - has a sweep run? ./om inventory run")
 
 services = [s for h in hosts for s in h["services"]]
 probed = [h for h in hosts if h["last_success_at"]]
@@ -2546,15 +2546,15 @@ if fields:
 # `estate`: the same rows as PMM sees them, through the same endpoint, so a
 # disagreement between this and the sql view is a serialisation bug worth finding.
 # The optional argument matches the name or any observed value.
-disc_cmd_facts() {
-  sep_api pom_discovery services | FILTER="${1:-}" python3 -c '
+inv_cmd_facts() {
+  sep_api om_inventory services | FILTER="${1:-}" python3 -c '
 import json, os, sys
 
 services = json.load(sys.stdin)
 if not isinstance(services, list):
     sys.exit("  unexpected answer from /services: %s" % str(services)[:200])
 if not services:
-    sys.exit("  no service rows - has a sweep run? ./om discovery run")
+    sys.exit("  no service rows - has a sweep run? ./om inventory run")
 
 needle = os.environ.get("FILTER", "").lower()
 shown = 0
@@ -2581,7 +2581,7 @@ if not shown:
 
 # The app's settings, read and written over its own /config.
 #
-# Not `./om discovery sql "select * from settingoverride"`: that shows the rows that
+# Not `./om inventory sql "select * from settingoverride"`: that shows the rows that
 # *override* the YAML and nothing else, so a value the deployment configured looks
 # identical to one that was never configured at all. The endpoint reports both, which
 # is the question worth asking -- "why is it sweeping every 10 minutes" is answered by
@@ -2590,12 +2590,12 @@ if not shown:
 # The key set is not symmetric between reading and writing: SCHEDULE is listed as
 # SCHEDULE__every and SCHEDULE__period, but only the parent key accepts null, which is
 # how the sweep is turned off. Both spellings are passed straight through.
-disc_cmd_config() {
+inv_cmd_config() {
   local key="${1:-}" value="${2:-}"
 
   if [[ -z "$key" ]]; then
-    info "POM discovery configuration"
-    sep_api pom_discovery config | python3 -c '
+    info "OM inventory configuration"
+    sep_api om_inventory config | python3 -c '
 import json, sys
 try:
     rows = json.load(sys.stdin)
@@ -2610,17 +2610,17 @@ for row in rows:
     advanced = "  (advanced)" if row["is_advanced"] else ""
     print("  %-22s %-20s %s%s" % (row["key"], row["value"], origin, advanced))
 print()
-print("  change one with: ./om discovery config <key> <value>")
-print("  revert one with: ./om discovery config <key> -")
+print("  change one with: ./om inventory config <key> <value>")
+print("  revert one with: ./om inventory config <key> -")
 '
     return
   fi
 
-  [[ -n "$value" ]] || die "usage: ./om discovery config <key> <value>   ('-' reverts)"
+  [[ -n "$value" ]] || die "usage: ./om inventory config <key> <value>   ('-' reverts)"
 
   if [[ "$value" == "-" ]]; then
     dim "reverting $key to the deployed value"
-    sep_api pom_discovery "config/$key" -X DELETE -o /dev/null -w '%{http_code}\n'
+    sep_api om_inventory "config/$key" -X DELETE -o /dev/null -w '%{http_code}\n'
     return
   fi
 
@@ -2636,18 +2636,18 @@ except ValueError:
     parsed = raw
 print(json.dumps({os.environ["KEY"]: parsed}))
 ')"
-  sep_api pom_discovery config -X PATCH \
+  sep_api om_inventory config -X PATCH \
     -H 'Content-Type: application/json' -d "$body" | json_out
 }
 
 
-disc_cmd_runs() {
+inv_cmd_runs() {
   info "Probe sweeps (SEP)"
-  sep_api pom_discovery "runs?limit=${1:-15}" | python3 -c '
+  sep_api om_inventory "runs?limit=${1:-15}" | python3 -c '
 import json, sys
 runs = json.load(sys.stdin)
 if not runs:
-    sys.exit("  no sweeps recorded yet — trigger one with ./om discovery run")
+    sys.exit("  no sweeps recorded yet — trigger one with ./om inventory run")
 for r in runs:
     c = r["counts"]
     print("  %s  %-8s resolved=%-3d answered=%-3d orphaned=%-3d facts=%d" % (
@@ -2658,22 +2658,22 @@ for r in runs:
 '
 }
 
-disc_cmd_run() {
+inv_cmd_run() {
   info "Queueing a probe sweep"
   dim "dispatches a Nomad job per executor host; tens of seconds, not instant"
-  sep_api pom_discovery runs -X POST | json_out
+  sep_api om_inventory runs -X POST | json_out
   echo
-  dim "watch it with: ./om discovery runs"
+  dim "watch it with: ./om inventory runs"
 }
 
-# The estate as POM currently holds it: one line per host, its services indented
+# The estate as OM currently holds it: one line per host, its services indented
 # under it, and anything running that PMM has no service for called out.
 #
 # Reads the tables rather than the API on purpose. The API is what a consumer sees;
 # this is for the question the API cannot answer -- "is the row actually there, and
 # what does it say" -- which is the one you have when a sweep looks right and a page
 # looks wrong.
-disc_cmd_estate() {
+inv_cmd_estate() {
   local filter="${1:-}"
   # Two plain selects rather than one shaped query. Everything that made the shaped
   # version readable -- to_char, ::text, string_agg, jsonb_array_length -- is
@@ -2686,11 +2686,11 @@ disc_cmd_estate() {
            coalesce(cast(h.last_success_at as text), ''),
            coalesce(cast(h.observed as text), '{}'),
            coalesce(h.consecutive_failures, 0)
-    from $(pom_table host) h order by h.name;")"
+    from $(om_table host) h order by h.name;")"
   services="$(sep_query "
     select s.node_id, coalesce(s.name, '?'), coalesce(cast(s.port as text), '?'),
            coalesce(cast(s.last_success_at as text), '')
-    from $(pom_table service) s order by s.name;")"
+    from $(om_table service) s order by s.name;")"
 
   FILTER="$filter" SERVICES="$services" python3 -c '
 import json, os, sys
@@ -2763,16 +2763,16 @@ for line in sys.stdin:
         print("      (no MongoDB service registered here)")
 
 if not rows:
-    sys.exit("  no host rows - has a sweep run? ./om discovery run")
+    sys.exit("  no host rows - has a sweep run? ./om inventory run")
 if not shown:
     sys.exit("  nothing matched %r" % needle)
 ' <<< "$hosts"
 }
 
 
-disc_cmd_sql() {
-  [[ $# -gt 0 ]] || die "usage: ./om discovery sql <query>
-    tables: $(pom_table host), $(pom_table service), $(pom_table discovery_run)"
+inv_cmd_sql() {
+  [[ $# -gt 0 ]] || die "usage: ./om inventory sql <query>
+    tables: $(om_table host), $(om_table service), $(om_table inventory_run)"
   if [[ -z "$SEP_DB_DIR" ]]; then
     sep_psql -c "$*"
     return
@@ -2802,17 +2802,17 @@ SQLITE
 }
 
 # Any path under the app's API. Extra arguments go straight to curl, so a write is
-# `discovery api hosts/<node_id> -X DELETE`.
+# `inventory api hosts/<node_id> -X DELETE`.
 #
 # The status line is printed as well as the body, because the useful writes here have
 # no body: a successful DELETE is `204` and nothing else, which json_out can only
 # render as "(empty response)" -- indistinguishable from a request that failed
 # silently. Reporting the code makes 204 and 404 tell their own story.
-disc_cmd_api() {
-  [[ $# -gt 0 ]] || die "usage: ./om discovery api <path> [curl args]   e.g. ./om discovery api hosts"
+inv_cmd_api() {
+  [[ $# -gt 0 ]] || die "usage: ./om inventory api <path> [curl args]   e.g. ./om inventory api hosts"
   local path="$1"; shift
   local response status body
-  response="$(sep_api pom_discovery "$path" -w $'\n%{http_code}' "$@")"
+  response="$(sep_api om_inventory "$path" -w $'\n%{http_code}' "$@")"
   status="${response##*$'\n'}"
   body="${response%$'\n'*}"
 
@@ -2823,7 +2823,7 @@ disc_cmd_api() {
   esac
 }
 
-disc_cmd_sync() {
+inv_cmd_sync() {
   [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
   info "Syncing SEP inventory from PMM"
   dim "run this after rebuilding a cluster, or every service maps as orphaned"
@@ -2860,26 +2860,26 @@ PY
     from service where type = 'MONGODB' group by 1 order by 1"
 }
 
-cmd_discovery() {
+cmd_inventory() {
   local sub="${1:-show}"; shift || true
   case "$sub" in
-    show)  disc_cmd_show "$@" ;;
-    estate) disc_cmd_estate "$@" ;;
-    config) disc_cmd_config "$@" ;;
-    facts) disc_cmd_facts "$@" ;;
-    runs)  disc_cmd_runs "$@" ;;
-    run)   disc_cmd_run "$@" ;;
-    sync)  disc_cmd_sync "$@" ;;
-    sql)   disc_cmd_sql "$@" ;;
-    api)   disc_cmd_api "$@" ;;
+    show)  inv_cmd_show "$@" ;;
+    estate) inv_cmd_estate "$@" ;;
+    config) inv_cmd_config "$@" ;;
+    facts) inv_cmd_facts "$@" ;;
+    runs)  inv_cmd_runs "$@" ;;
+    run)   inv_cmd_run "$@" ;;
+    sync)  inv_cmd_sync "$@" ;;
+    sql)   inv_cmd_sql "$@" ;;
+    api)   inv_cmd_api "$@" ;;
     token) sep_token ;;
-    *) die "unknown discovery subcommand '$sub' (show|estate|facts|config|runs|run|sync|sql|api|token)" ;;
+    *) die "unknown inventory subcommand '$sub' (show|estate|facts|config|runs|run|sync|sql|api|token)" ;;
   esac
 }
 
-# Any SEP app's API, for the apps that come after discovery.
+# Any SEP app's API, for the apps that come after om_inventory.
 cmd_sep_api() {
-  [[ $# -ge 2 ]] || die "usage: ./om sep-api <app> <path> [curl args]   e.g. ./om sep-api pom_discovery facts"
+  [[ $# -ge 2 ]] || die "usage: ./om sep-api <app> <path> [curl args]   e.g. ./om sep-api om_inventory facts"
   local app="$1" path="$2"; shift 2
   sep_api "$app" "$path" "$@" | json_out
 }
@@ -3000,13 +3000,13 @@ main() {
     status)  cmd_status ;;
     logs)    cmd_logs "$@" ;;
     build)   cmd_build "$@" ;;
-    pom)     cmd_pom "$@" ;;
-    discovery) cmd_discovery "$@" ;;
+    topology) cmd_topology "$@" ;;
+    inventory) cmd_inventory "$@" ;;
     sep-api) cmd_sep_api "$@" ;;
     ports)   cmd_ports ;;
     urls|uris) cmd_urls "$@" ;;
     hosts)   cmd_hosts "$@" ;;
-    inventory) cmd_inventory "$@" ;;
+    pmm-inventory) cmd_pmm_inventory "$@" ;;
     reset)   cmd_reset "$@" ;;
     doctor)  cmd_doctor ;;
     ""|-h|--help|help) usage ;;

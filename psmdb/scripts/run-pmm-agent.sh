@@ -53,7 +53,7 @@ pmm-agent setup \
 # one-shot ran days ago and will not run again, so the node comes back healthy with
 # its MongoDB service gone, and nothing says so. Observed exactly that way: a
 # supervisorctl restart of this program to recover a Nomad client left a monitored
-# database unmonitored, and the only thing that noticed was POM reporting a mongod it
+# database unmonitored, and the only thing that noticed was OM reporting a mongod it
 # had no service for.
 #
 # So re-assert registration whenever this program starts. Both names are tried

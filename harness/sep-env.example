@@ -38,7 +38,7 @@ CELERY__BEAT_DBURI=postgresql://sep:@sep-password@127.0.0.1:5432/sep
 
 # --- being reached by PMM ---------------------------------------------------
 #
-# pmm-managed proxies SEP's discovery app, and presents PMM_SEP_TOKEN as a bearer
+# pmm-managed proxies SEP's inventory app, and presents PMM_SEP_TOKEN as a bearer
 # when it does. SEP accepts that token only when it equals SEP_INTERNAL_TOKEN, in
 # which case the caller becomes a synthetic non-admin service principal rather
 # than a Grafana user (app/api/deps.py).

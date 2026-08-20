@@ -311,14 +311,14 @@ and register with PMM, rather than just reporting "started".
 ```bash
 ./om status                          # per-topology container counts
 ./om logs replicaset-cluster -f
-./om inventory                       # PMM's nodes/services/agents joined into one JSON doc
+./om pmm-inventory                       # PMM's nodes/services/agents joined into one JSON doc
 ./om stop replicaset-cluster         # containers down, data volumes kept
 cd psmdb && docker compose --profile replicaset-cluster down -v   # wipe data too
 ```
 
 **Nothing is published to the host** — deliberately, since PMM already contends for 8443
 and 9000. Reach a node with `docker exec`; `/root/.mongodb_uri` inside each container holds
-its credentials, and is the same file SEP's `backup_mongo` and `pom_discovery` payloads read:
+its credentials, and is the same file SEP's `backup_mongo` and `om_inventory` payloads read:
 
 ```bash
 docker exec -it replicaset-cluster-node00 sh -c 'mongosh "$(cat /root/.mongodb_uri)"'
@@ -353,33 +353,33 @@ Full detail — the in-place upgrade loop, bootstrap ordering, and the rough edg
 
 ---
 
-## 7. Use POM
+## 7. Use OM
 
-POM (OpenManager) is what the rest of this setup exists to feed. It needs PMM up, SEP up
+OM (OpenManager) is what the rest of this setup exists to feed. It needs PMM up, SEP up
 and at least one cluster registered. Nothing here needs compiling - but the pages are part
 of PMM's UI bundle, so if the sidebar has no SEP apps, run `./om build ui` once (§10 has
 the symptom).
 
-POM is split across both products, and the split is worth holding in your head before you
+OM is split across both products, and the split is worth holding in your head before you
 read any of its output:
 
 - **pmm-managed** derives the topology document - `environments -> clusters -> services` -
   from PMM's own inventory and VictoriaMetrics, in about a tenth of a second. It never
   touches a database host.
-- **SEP's `pom_discovery` app** (`SEP/app/sep/apps/pom_discovery`) does the half that needs
+- **SEP's `om_inventory` app** (`SEP/app/sep/apps/om_inventory`) does the half that needs
   a process *on* a host: every 10 minutes it dispatches a Nomad job per host and upserts
-  what it finds into an estate of `pom.host` and `pom.service` rows. That takes tens of
+  what it finds into an estate of `om.host` and `om.service` rows. That takes tens of
   seconds.
-- **pmm-managed proxies that estate** at `/v1/pom/inventory/*`, so every POM page in the
+- **pmm-managed proxies that estate** at `/v1/om/inventory/*`, so every OM page in the
   browser reads PMM's own origin and none of them talks to SEP directly.
 
 ```bash
 ./om start pmm                  # 1. PMM first, always
 ./om start clusters             # 2. all four topologies (or name one)
 ./om start sep                  # 3. SEP backend
-./om discovery sync             # 4. pull PMM's inventory into SEP
-./om discovery run              # 5. sweep the hosts
-./om discovery estate           # 6. what the sweep found
+./om inventory sync             # 4. pull PMM's inventory into SEP
+./om inventory run              # 5. sweep the hosts
+./om inventory estate           # 6. what the sweep found
 ```
 
 Step 4 matters and is easy to skip: SEP holds its own copy of PMM's inventory, and a
@@ -393,21 +393,21 @@ reached it.
 
 ### The pages
 
-In the browser at **https://localhost:8443/pmm-ui/pom**, four entries under *OpenManager*:
+In the browser at **https://localhost:8443/pmm-ui/om**, four entries under *OpenManager*:
 
 | Page | Shows |
 | --- | --- |
 | **Overview** | a table per environment, a row per cluster; unfold one for its services |
 | **Services** | one row per service - PMM's view over the wire **joined to** what the probe found on the host |
 | **Hosts** | one row per host, **including hosts with no database on them** |
-| **Discovery** | two tabs: *Runs* (refresh history, and a button) and *Settings* (the app's configuration) |
+| **Inventory** | two tabs: *Runs* (refresh history, and a button) and *Settings* (the app's configuration) |
 
 Four conventions in that output are worth knowing before you read any of it as a fault:
 
 - **`version` and `installed_version` are deliberately two columns.** The first is what the
   running mongod reports over the wire; the second is what the package database on the host
   says. They disagree exactly when a package has been upgraded and the process not
-  restarted - which is a state POM exists to find.
+  restarted - which is a state OM exists to find.
 - **"Is there a database here" has three answers, not two.** PMM cannot tell a bare
   pmm-client host from an arbiter - same node type, same agents, no services - so the Hosts
   page reports *Monitored*, *Unregistered mongod*, or *No database*. The middle one is a
@@ -423,34 +423,34 @@ Four conventions in that output are worth knowing before you read any of it as a
 
 ### The inspector
 
-One command group per side of the split - `pom` is PMM's document, `discovery` is SEP's
+One command group per side of the split - `topology` is PMM's document, `inventory` is SEP's
 estate:
 
 ```bash
-./om pom                # overview: the document, plus a row per service
-./om pom raw            # the document as stored JSON — pipe it to jq
-./om pom runs           # collection history (PMM's own, ~130 ms each)
-./om pom run            # rebuild the document now - does NOT probe anything
-./om pom sql | api      # pmm-managed's tables / any /v1/pom path
+./om topology                # overview: the document, plus a row per service
+./om topology raw            # the document as stored JSON — pipe it to jq
+./om topology runs           # collection history (PMM's own, ~130 ms each)
+./om topology run            # rebuild the document now - does NOT probe anything
+./om topology sql | api      # pmm-managed's tables / any /v1/om path
 
-./om discovery          # how much of the estate is probed, failing, unreachable
-./om discovery estate   # hosts and services, straight from the tables
-./om discovery facts    # what was observed per service, through SEP's API
-./om discovery config   # the app's settings and where each value came from
-./om discovery runs     # refresh history, newest first
-./om discovery run      # queue a sweep (tens of seconds)
-./om discovery sync     # refresh SEP's copy of PMM's inventory
-./om discovery sql <q>  # SQL against the pom schema: host, service, discovery_run
-./om discovery api <p>  # any /api/apps/pom_discovery path
-./om discovery token    # bearer for SEP's /api/docs Authorize button, and for curl
+./om inventory          # how much of the estate is probed, failing, unreachable
+./om inventory estate   # hosts and services, straight from the tables
+./om inventory facts    # what was observed per service, through SEP's API
+./om inventory config   # the app's settings and where each value came from
+./om inventory runs     # refresh history, newest first
+./om inventory run      # queue a sweep (tens of seconds)
+./om inventory sync     # refresh SEP's copy of PMM's inventory
+./om inventory sql <q>  # SQL against the om schema: host, service, inventory_run
+./om inventory api <p>  # any /api/apps/om_inventory path
+./om inventory token    # bearer for SEP's /api/docs Authorize button, and for curl
 ```
 
 `estate` reads the tables and `facts` reads the API on purpose: they should never
 disagree, so a disagreement is a serialisation bug rather than two views of different
-things. `./om pom api inventory/hosts` is the third route - the same rows as the UI sees
+things. `./om topology api inventory/hosts` is the third route - the same rows as the UI sees
 them, through PMM's proxy.
 
-The full API surface, the `pom` schema with its freshness columns, and who calls what are
+The full API surface, the `om` schema with its freshness columns, and who calls what are
 in [`docs/architecture.md`](docs/architecture.md).
 
 ---
@@ -472,7 +472,7 @@ command. Recreating the container resets the UI to the image's copy.
 
 SEP needs no build step: the backend reloads and the frontend runs under Vite.
 
-After a rebuild that changes inventory, refresh SEP's copy with `./om pom sync`.
+After a rebuild that changes inventory, refresh SEP's copy with `./om topology sync`.
 
 ## 9. Ports
 
@@ -543,7 +543,7 @@ passes. Confirm with `docker exec pmm-server tail -50 /srv/logs/clickhouse-serve
 If it says `Setting changeable_in_readonly for max_execution_time is not allowed`, the
 image has outrun the checkout: `users.xml` comes from the image and
 `dev/clickhouse-config.xml` from your branch, and the two no longer agree. `./om env`
-pins the image by digest for this reason - if you overrode the pin, put it back. POM
+pins the image by digest for this reason - if you overrode the pin, put it back. OM
 itself is unaffected, since it reads PostgreSQL and VictoriaMetrics.
 
 **`container pmm-server exited (1)` within a second, with no supervisord output** - the

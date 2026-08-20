@@ -86,7 +86,7 @@ Nothing is published to the host — deliberately, since omtest1 and PMM already
 contend for 9000 and 8443. Reach a node with `docker exec`.
 
 The `cluster` column is not cosmetic. SEP's inventory has no cluster entity, only
-a cluster *string* per service, set by `pmm-admin add mongodb --cluster=`. `pom_worker`
+a cluster *string* per service, set by `pmm-admin add mongodb --cluster=`. pmm-managed
 groups a run's services into cluster documents by matching it, so members of one
 topology must share the value or the topology silently fragments.
 
@@ -154,7 +154,7 @@ GET /v1/inventory/services
 
 Credentials follow SEP's host-side model: `register.sh` writes
 `/root/.mongodb_uri` in each container, which is the default `credentials_path`
-for both `backup_mongo`'s payloads and `pom_worker`'s probe. Nothing ships a
+for both `backup_mongo`'s payloads and `om_inventory`'s probe. Nothing ships a
 credential with a job. `/root` because the Nomad client inherits pmm-agent's
 user, which is root here.
 
@@ -195,12 +195,12 @@ Everything is idempotent — containers get recreated onto existing data volumes
   `register.sh` is a supervisord one-shot that ran at container start, so nothing
   added the service back: the node returned healthy, its mongod kept running, and
   PMM simply stopped knowing there was a database on it. Nothing surfaced that -
-  it was found only because POM reported a mongod it had no service for.
+  it was found only because OM reported a mongod it had no service for.
   `run-pmm-agent.sh` now re-asserts registration on every start, so a
   `supervisorctl restart pmm-agent` is safe again. If you meet a node in the old
   state, `supervisorctl start register` inside it puts the service back.
 - **Restarting `pmm-agent` gives the node a new PMM node id**, because `--force`
-  replaces rather than updates it. Anything keyed on that id - POM's `pom.host`,
+  replaces rather than updates it. Anything keyed on that id - OM's `om.host`,
   for one - gains a row and keeps the old one. Harmless here, worth knowing before
   you conclude an estate has twice the hosts it does.
 - **Ubuntu, not RHEL.** Chosen for `apt`. The same Dockerfile works on
