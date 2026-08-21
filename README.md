@@ -324,10 +324,38 @@ its credentials, and is the same file SEP's `backup_mongo` and `om_inventory` pa
 docker exec -it replicaset-cluster-node00 sh -c 'mongosh "$(cat /root/.mongodb_uri)"'
 ```
 
-One recurring gotcha: restarting PMM's compose stack destroys and recreates `pmm_default`
-with a fresh network id, stranding cluster containers created before the restart
-(`network …not found` on start). `./om start <profile>` detects this and recreates the
-containers; data volumes are kept.
+One recurring gotcha: a PMM compose stack that is torn down destroys and recreates
+`pmm_default` with a fresh network id, stranding cluster containers created before that
+(`network …not found` on start). `./om stop pmm` stops the container instead of removing
+it, so the ordinary cycle strands nothing; a stack that really is recreated (a reset, an
+image bump) still does, and `./om start <profile>` detects it and recreates the
+containers. Data volumes and PMM identity are kept either way - see below.
+
+### A node keeps the identity it has
+
+A node registers with PMM once, the first time it has none, and keeps it through every
+`./om stop`/`./om start` and every container recreate: its agent id and service token live
+on the `agent-state` volume, and [`psmdb/scripts/run-pmm-agent.sh`](psmdb/scripts/run-pmm-agent.sh)
+registers only when there is nothing usable there.
+
+That matters because `pmm-agent setup --force` does not refresh a registration, it
+*replaces* it: pmm-managed removes the node it holds under that name - with its services,
+its nomad-agent and its metrics history - and creates a new one with new ids. Everything
+keyed on the old ids is then stale, and nothing prunes it: OM's estate holds hosts under
+PMM's node id and only forgets one when told to. Every stop/start cycle used to do exactly
+that, quietly, to the whole estate.
+
+So a new identity is a command of its own:
+
+```bash
+./om reregister sharded-cluster      # every node of one topology
+./om reregister pmm-client-node01    # one host
+./om reregister                      # every running sandbox node
+./om inventory sync                  # afterwards, or every service maps as orphaned
+```
+
+A node that has lost its identity while PMM still holds its name refuses to start rather
+than taking the name over on its own. `docker logs <node>` says so, and names the command.
 
 ### Hosts with a PMM client and no database
 

@@ -20,6 +20,11 @@
 #                           that were up when you last ran a bare ./om stop)
 #   ./om stop [comp...]     stop components (no args: all, clusters included)
 #   ./om restart [comp...]  stop then start
+#   ./om reregister [comp...]
+#                           give sandbox nodes brand-new identities in PMM. The
+#                           explicit, destructive counterpart to start/stop/restart,
+#                           which keep the identity a node already has (see
+#                           psmdb/scripts/run-pmm-agent.sh)
 #   ./om status             what is running, and on which ports
 #   ./om logs <comp> [-f]   show logs
 #   ./om build pmm          compile the PMM working tree into the running server
@@ -1230,10 +1235,20 @@ start_pmm() {
 }
 
 stop_pmm() {
-  info "pmm: devcontainer down"
-  # Same file pair as the start, so compose tears down what it brought up.
-  pmm_compose down --remove-orphans
-  ok "pmm stopped"
+  info "pmm: devcontainer stopped"
+  # `stop`, not `down`. `down` removes pmm_default, and a Docker network's *id* is
+  # recorded on every container attached to it: a recreated network is what makes
+  # psmdb_stale_network true, and that recreates every sandbox node on the next
+  # start. Recreating a node used to cost it its PMM identity, so a plain stop/start
+  # cycle re-registered the whole estate under new ids and orphaned the old one.
+  # psmdb/compose.yaml now keeps identity on a volume, and this keeps the network
+  # and the container, so the cycle changes nothing on either side.
+  #
+  # The container is worth keeping for its own sake too: `./om start pmm` starts the
+  # same one back up with its /srv, rather than provisioning a new one. `./om reset`
+  # is what removes them.
+  pmm_compose stop
+  ok "pmm stopped (container kept; ./om reset removes it and its /srv)"
 }
 
 start_sep_backend() {
@@ -1651,6 +1666,8 @@ stop_sandbox_node() {
   else
     ok "$profile stopped (containers kept; data volumes intact)"
     dim "wipe its data with: cd psmdb && docker compose --profile $profile down -v"
+    dim "which also drops the shared agent-state volume if no other node is holding"
+    dim "it, and these nodes then need ./om reregister to take their names back"
   fi
 }
 
@@ -1738,6 +1755,15 @@ reset_pmm_data() {
     warn "$PMM_CONTAINER is running; kept its /srv volume"
     dim "to clear it: ./om stop pmm && ./om reset data"
     return 0
+  fi
+
+  # A *stopped* container still holds the volume open, and since stop_pmm leaves it
+  # stopped rather than removing it, that is the normal state by the time a reset
+  # gets here. Without this the removal below fails and reports "something still has
+  # it open" about a container the reset itself stopped a second earlier.
+  if docker ps -a --format '{{.Names}}' | grep -qx "$PMM_CONTAINER" \
+     && docker rm -f "$PMM_CONTAINER" >/dev/null 2>&1; then
+    ok "removed the stopped $PMM_CONTAINER, which held /srv open"
   fi
 
   if docker volume rm pmm-data >/dev/null 2>&1; then
@@ -3004,6 +3030,102 @@ cmd_restart() {
   cmd_start "$@"
 }
 
+# ---------------------------------------------------------------------------
+# reregister - hand a sandbox node a new identity in PMM, deliberately
+# ---------------------------------------------------------------------------
+#
+# Nothing else in om does this, which is the point. A node registers once, when it
+# first has no identity, and keeps it through every restart and every container
+# recreate: its agent id and service token live on psmdb/compose.yaml's agent-state
+# volume, and psmdb/scripts/run-pmm-agent.sh registers only when there is nothing
+# usable there. That is what makes `./om stop && ./om start` a no-op for PMM's
+# inventory, and it is why the counterpart has to be a command of its own.
+#
+# The counterpart is not a refresh. `pmm-agent setup --force` makes pmm-managed
+# *remove* the node it finds under the same name - with its services, its
+# nomad-agent and its metrics history - and create a new one with new ids. Whatever
+# held the old ids is then pointing at nothing, most visibly SEP's OM estate, which
+# keys hosts by PMM's node id and prunes nothing on its own.
+#
+# So: use it when a host should be a new machine as far as PMM is concerned, and
+# when a node refuses to start because PMM already holds its name.
+
+# The running containers one target names: an exact container name, so a single node
+# can be named, or else a profile, matched the same `^profile(-|$)` way `./om start`
+# counts its nodes - which covers `pmm-client` and `sharded-cluster` alike.
+reregister_containers() {
+  local target="$1" names
+  names="$(docker ps --format '{{.Names}}' | grep -Fx "$target" || true)"
+  [[ -n "$names" ]] || names="$(docker ps --format '{{.Names}}' | grep -E "^$target(-|\$)" || true)"
+  printf '%s\n' "$names" | grep -v '^[[:space:]]*$' || true
+}
+
+# The agent id a container currently claims, read from the config file on its
+# agent-state volume. "Did it re-register" is then answered by the thing that
+# actually changes, rather than by a log line that says it tried.
+reregister_agent_id() {
+  docker exec "$1" sh -c \
+    'sed -n "s/^id:[[:space:]]*//p" "/srv/agent-state/$(hostname)/pmm-agent.yaml" 2>/dev/null | tr -d "\"" | head -1' \
+    2>/dev/null | tr -d '\r'
+}
+
+cmd_reregister() {
+  local targets=("$@")
+  if [[ ${#targets[@]} -eq 0 ]]; then
+    targets=("${NODE_PROFILES[@]}")
+    dim "no target named, so every running sandbox node"
+  fi
+
+  local names=() t n
+  for t in "${targets[@]}"; do
+    while IFS= read -r n; do [[ -n "$n" ]] && names+=("$n"); done < <(reregister_containers "$t")
+  done
+  [[ ${#names[@]} -gt 0 ]] || die "no running sandbox node matched: ${targets[*]}"
+
+  warn "re-registering ${#names[@]} node(s): ${names[*]}"
+  dim "each gets a new node id and agent id; PMM drops the node it currently holds"
+  dim "under that name, and its services, nomad-agent and metrics history with it"
+  dim "OM's estate keeps the rows that named the old ids:"
+  dim "  ./om inventory estate                          what it holds"
+  dim "  ./om inventory api hosts/<node_id> -X DELETE   forget one"
+
+  local c old new i
+  for c in "${names[@]}"; do
+    old="$(reregister_agent_id "$c")"
+    # The marker rather than a flag, because run-pmm-agent.sh is started by
+    # supervisord and there is nothing to pass a flag to. It is consumed by the one
+    # run that acts on it, so a failed setup cannot leave a node re-registering on
+    # every restart from then on.
+    if ! docker exec "$c" touch /run/om-reregister >/dev/null 2>&1; then
+      err "$c: could not write the re-registration marker"; continue
+    fi
+    # stop-then-start rather than `restart`: a node that refused to register left
+    # pmm-agent in supervisord's FATAL state, which is the main reason to run this
+    # command at all - and `supervisorctl restart` fails on the stop half of a
+    # program that is not running.
+    docker exec "$c" supervisorctl stop pmm-agent >/dev/null 2>&1 || true
+    if ! docker exec "$c" supervisorctl start pmm-agent >/dev/null 2>&1; then
+      err "$c: could not start pmm-agent"; continue
+    fi
+    # Waiting on the id, not on the restart: the restart only proves the program
+    # began, and registration is the part that can still fail against PMM.
+    new="$old"
+    for (( i = 0; i < 24; i++ )); do
+      sleep 5
+      new="$(reregister_agent_id "$c")"
+      [[ -n "$new" && "$new" != "$old" ]] && break
+    done
+    if [[ -n "$new" && "$new" != "$old" ]]; then
+      ok "$c: now agent $new (was ${old:-none})"
+    else
+      warn "$c: no new agent id after 120s - docker logs --tail 50 $c"
+    fi
+  done
+
+  echo
+  dim "then ./om inventory sync, or every service maps as orphaned"
+}
+
 # Prints the header comment block as the help text: from the first line of the
 # block to the blank line that ends it, so it stays right as the block grows.
 usage() { sed -n '3,/^$/p' "${BASH_SOURCE[0]}" | sed "s/^# \{0,1\}//"; }
@@ -3021,6 +3143,7 @@ main() {
     start)   cmd_start "$@" ;;
     stop)    cmd_stop "$@" ;;
     restart) cmd_restart "$@" ;;
+    reregister) cmd_reregister "$@" ;;
     status)  cmd_status ;;
     logs)    cmd_logs "$@" ;;
     build)   cmd_build "$@" ;;

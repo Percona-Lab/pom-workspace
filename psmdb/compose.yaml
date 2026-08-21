@@ -35,6 +35,25 @@ name: psmdb-sandbox
 x-keyfile-mount: &keyfile-mount ./secrets/keyfile:/srv/secrets/keyfile:ro
 x-cgroup-mount: &cgroup-mount /sys/fs/cgroup:/sys/fs/cgroup:rw
 
+# Where a node keeps *who it is* in PMM: its pmm-agent config, which carries the
+# agent id and service token, and its Nomad client data directory, which carries
+# the Nomad node id. See scripts/run-pmm-agent.sh.
+#
+# On a volume rather than the container filesystem because a recreated container
+# is the same host - same hostname, same data volume - and re-registering it would
+# mint new ids, replace the node in PMM and orphan every row keyed on the old
+# ones. Recreation happens for ordinary reasons (an image rebuild, a PMM restart
+# that takes pmm_default's network id with it), so identity has to outlive it.
+#
+# One volume for every node, namespaced per hostname inside it: identity is a
+# property of the node, but a mount per node would be another declaration each
+# time this file grows a host, and the script's path is hostname-scoped either
+# way. Docker refuses to remove a volume that a running container holds, so a
+# `--profile x down -v` cannot pull it out from under the other topologies; with
+# nothing running it does remove it, and every node then refuses to start until
+# `./om reregister` says the old estate may be discarded.
+x-agent-state-mount: &agent-state-mount agent-state:/srv/agent-state
+
 x-node: &node
   image: openmanager/psmdb-node:7.0
   restart: unless-stopped
@@ -61,6 +80,7 @@ x-node: &node
   volumes:
     - *keyfile-mount
     - *cgroup-mount
+    - *agent-state-mount
   environment: &node-env
     ROLE: mongod
     PMM_SERVER: pmm-server:8443
@@ -95,6 +115,7 @@ x-client-node: &client-node
     - seccomp:unconfined
   volumes:
     - *cgroup-mount
+    - *agent-state-mount
   environment: &client-node-env
     ROLE: client
     PMM_SERVER: pmm-server:8443
@@ -184,6 +205,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - standalone-node00-data:/var/lib/mongo
     environment:
       <<: *node-env
@@ -202,6 +224,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - replicaset-single-node00-data:/var/lib/mongo
     environment:
       <<: *node-env
@@ -222,6 +245,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - replicaset-cluster-node00-data:/var/lib/mongo
     environment:
       <<: *replicaset-cluster-env
@@ -235,6 +259,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - replicaset-cluster-node01-data:/var/lib/mongo
     environment: *replicaset-cluster-env
 
@@ -246,6 +271,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - replicaset-cluster-node02-data:/var/lib/mongo
     environment: *replicaset-cluster-env
 
@@ -261,6 +287,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - sharded-cluster-cfg00-data:/var/lib/mongo
     environment:
       <<: *sharded-cluster-cfg-env
@@ -274,6 +301,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - sharded-cluster-cfg01-data:/var/lib/mongo
     environment: *sharded-cluster-cfg-env
 
@@ -285,6 +313,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - sharded-cluster-cfg02-data:/var/lib/mongo
     environment: *sharded-cluster-cfg-env
 
@@ -296,6 +325,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - sharded-cluster-shard00svr0-data:/var/lib/mongo
     environment:
       <<: *sharded-cluster-shard00-env
@@ -309,6 +339,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - sharded-cluster-shard00svr1-data:/var/lib/mongo
     environment: *sharded-cluster-shard00-env
 
@@ -321,6 +352,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - sharded-cluster-shard00arb0-data:/var/lib/mongo
     environment:
       <<: *sharded-cluster-shard00-env
@@ -334,6 +366,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - sharded-cluster-shard01svr0-data:/var/lib/mongo
     environment:
       <<: *sharded-cluster-shard01-env
@@ -347,6 +380,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - sharded-cluster-shard01svr1-data:/var/lib/mongo
     environment: *sharded-cluster-shard01-env
 
@@ -358,6 +392,7 @@ services:
     volumes:
       - *keyfile-mount
       - *cgroup-mount
+      - *agent-state-mount
       - sharded-cluster-shard01arb0-data:/var/lib/mongo
     environment:
       <<: *sharded-cluster-shard01-env
@@ -433,6 +468,10 @@ networks:
     external: true
 
 volumes:
+  # Every node's PMM identity, one directory per hostname - see
+  # x-agent-state-mount above. Removing it is `./om reset data`, which also wipes
+  # PMM's own /srv, so the two forget each other in the same breath.
+  agent-state:
   minio-data:
   standalone-node00-data:
   replicaset-single-node00-data:
