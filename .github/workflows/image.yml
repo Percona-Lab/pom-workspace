@@ -1,0 +1,99 @@
+# Build and publish the workspace image.
+#
+# This is the foundation every other workflow stands on: the image that
+# .devcontainer/devcontainer.json opens locally is the image jobs pull here, so
+# "works on my machine" and "works in CI" are the same claim.
+#
+# Published to ghcr.io/<owner>/openmanager-dev. GHCR packages start private and
+# inherit the repository's visibility rules; the GITHUB_TOKEN below can push
+# because of `permissions: packages: write`, and pulls from other workflows in
+# this repository work with the same token. To pull it from your laptop:
+#
+#   echo $GH_TOKEN | docker login ghcr.io -u <you> --password-stdin
+#   docker pull ghcr.io/<owner>/openmanager-dev:latest
+
+name: image
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - .devcontainer/**
+      - .github/workflows/image.yml
+  pull_request:
+    paths:
+      - .devcontainer/**
+      - .github/workflows/image.yml
+  workflow_dispatch:
+  # Rebuild weekly so the apt and npm layers pick up security updates even when
+  # nothing in .devcontainer/ changes.
+  schedule:
+    - cron: "0 4 * * 1"
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Pull requests build but do not publish: a fork's PR has no write access
+      # to the registry, and an unreviewed Dockerfile should not become :latest.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/openmanager-dev
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+            type=ref,event=pr
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .devcontainer
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Proves the image is usable before anything depends on it: the inner
+      # daemon has to come up, and every tool om checks for has to be present.
+      # Cheap, and it turns a broken base image into a failure here rather than
+      # a confusing failure in an agent job three days later.
+      - name: Smoke test
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          docker run --rm --privileged \
+            ghcr.io/${{ github.repository_owner }}/openmanager-dev:sha-${{ github.sha }} \
+            bash -lc '
+              set -euo pipefail
+              docker info >/dev/null
+              echo "docker  $(docker --version)"
+              echo "compose $(docker compose version --short)"
+              echo "node    $(node --version)"
+              echo "pnpm    $(pnpm --version)"
+              echo "python  $(python3 --version)"
+              echo "go      $(go version)"
+              echo "gh      $(gh --version | head -1)"
+              echo "claude  $(claude --version)"
+              test "$(id -un)" = vscode
+              echo "running as $(id -un), not root - required by claude --dangerously-skip-permissions"
+            '

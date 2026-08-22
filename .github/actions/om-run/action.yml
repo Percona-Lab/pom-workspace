@@ -1,0 +1,112 @@
+name: Run in the OpenManager workspace
+description: >
+  Execute a command inside the OpenManager workspace image, with the checkout
+  mounted and the inner Docker daemon started. The same image the dev container
+  uses, so a command that works locally works here.
+
+inputs:
+  run:
+    description: Shell script to execute inside the container (bash, `set -euo pipefail` already applied).
+    required: true
+  image:
+    description: Workspace image. Defaults to the one .github/workflows/image.yml publishes.
+    required: false
+    default: ""
+  docker:
+    description: >
+      Start the inner Docker daemon, and run the container privileged. Set to
+      'false' for jobs that only lint, test or edit code - they need neither, and
+      an unprivileged container is one less thing to reason about.
+    required: false
+    default: "true"
+  forward-env:
+    description: >
+      Space-separated names of extra environment variables to forward into the
+      container, on top of the credentials this action already forwards.
+    required: false
+    default: ""
+  workdir:
+    description: Directory inside the container to run from.
+    required: false
+    default: /workspaces/openmanager
+
+runs:
+  using: composite
+  steps:
+    - name: Run
+      shell: bash
+      env:
+        # Passed through the environment rather than interpolated into the
+        # script body: `${{ inputs.run }}` inline would let anything that
+        # reaches this input - an issue comment, a branch name - end the quoting
+        # and run its own commands on the runner.
+        OM_RUN: ${{ inputs.run }}
+        OM_IMAGE: ${{ inputs.image }}
+        OM_DOCKER: ${{ inputs.docker }}
+        OM_FORWARD_ENV: ${{ inputs.forward-env }}
+        OM_WORKDIR: ${{ inputs.workdir }}
+        OM_DEFAULT_IMAGE: ghcr.io/${{ github.repository_owner }}/openmanager-dev:latest
+      run: |
+        set -euo pipefail
+
+        image="${OM_IMAGE:-}"
+        [[ -n "$image" ]] || image="$OM_DEFAULT_IMAGE"
+
+        script="$RUNNER_TEMP/om-run.sh"
+        {
+          echo '#!/usr/bin/env bash'
+          echo 'set -euo pipefail'
+          printf '%s\n' "$OM_RUN"
+        } > "$script"
+        chmod +x "$script"
+
+        args=(
+          --rm
+          --init
+          --shm-size=2g
+          -v "${{ github.workspace }}:/workspaces/openmanager"
+          -v "$script:/tmp/om-run.sh:ro"
+          -w "$OM_WORKDIR"
+          -e CI=true
+          -e GITHUB_ACTIONS=true
+        )
+
+        # Credentials. Named without values so Docker copies whatever the job
+        # exported; a secret that was never set simply does not arrive, which is
+        # what we want - an empty-but-set token reads as "configured" to some
+        # tools and produces a much worse error than an absent one.
+        # `if`, not `[[ ... ]] && ...`: under `set -e` a loop whose last command
+        # is a false test exits the step, so an unset trailing variable would
+        # fail the job for no reason.
+        for v in GH_TOKEN GITHUB_TOKEN \
+                 ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN \
+                 ANTHROPIC_BASE_URL ANTHROPIC_MODEL \
+                 OPENAI_API_KEY GEMINI_API_KEY \
+                 $OM_FORWARD_ENV; do
+          if [[ -n "${!v:-}" ]]; then
+            args+=(-e "$v")
+            echo "forwarding $v"
+          fi
+        done
+
+        if [[ "$OM_DOCKER" == "true" ]]; then
+          # Required by the inner daemon, and the reason this is worth doing at
+          # all: everything the job starts lives and dies inside this container.
+          args+=(--privileged -e OM_START_DOCKER=1)
+        else
+          args+=(-e OM_START_DOCKER=0)
+        fi
+
+        echo "::group::docker run $image"
+        docker run "${args[@]}" "$image" /tmp/om-run.sh
+        echo "::endgroup::"
+
+    # The container ran as uid 1000 (`vscode`) and took ownership of the mounted
+    # checkout to do it. The runner is a different uid, so without this every
+    # later step - committing, uploading artifacts, even actions/checkout's own
+    # cleanup - fails on permissions. `always()` because a failed agent run
+    # still leaves the tree chowned.
+    - name: Return the checkout to the runner
+      if: always()
+      shell: bash
+      run: sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true

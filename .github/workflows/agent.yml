@@ -1,0 +1,217 @@
+# Run a coding agent against this workspace, on GitHub.
+#
+# Same image, same permission model as the dev container: the agent runs with
+# permissions bypassed, unprivileged, inside a container whose Docker daemon is
+# its own. On a hosted runner the blast radius is one throwaway VM.
+#
+# Two ways in:
+#   * Actions -> agent -> Run workflow, and type the task
+#   * comment `/agent <task>` on an issue or PR (repository members only)
+#
+# Secrets it wants (Settings -> Secrets and variables -> Actions):
+#
+#   WORKSPACE_TOKEN         PAT with `contents: read` on plebioda/pmm and
+#                           plebioda/SEP. The built-in GITHUB_TOKEN is scoped to
+#                           this repository alone and cannot clone the submodules.
+#                           Give it `contents: write` + `pull-requests: write`
+#                           too if you want agent branches pushed from here.
+#   ANTHROPIC_API_KEY       API-billed Claude access, or
+#   CLAUDE_CODE_OAUTH_TOKEN subscription-billed access (`claude setup-token`).
+#                           Set one. If both are set, the API key wins.
+#   OPENAI_API_KEY          optional, for the `custom` agent path
+#   GEMINI_API_KEY          optional, likewise
+#
+# For plain "review this PR" or "answer this issue" automation, prefer
+# anthropics/claude-code-action - it is maintained and handles the GitHub side
+# properly. This workflow is for the case that action cannot cover: an agent that
+# needs the whole OpenManager toolchain, both submodules, and a Docker daemon.
+
+name: agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: What the agent should do
+        required: true
+        type: string
+      base:
+        description: Branch to start from
+        required: false
+        default: master
+        type: string
+      agent:
+        description: Which agent to run
+        required: false
+        default: claude
+        type: choice
+        options: [claude, custom]
+      model:
+        description: Model override (blank = the account default)
+        required: false
+        default: ""
+        type: string
+      custom_command:
+        description: Shell command to run when agent = custom. The task is in $OM_TASK.
+        required: false
+        default: ""
+        type: string
+      docker:
+        description: Start the inner Docker daemon (needed only if the task runs ./om)
+        required: false
+        default: false
+        type: boolean
+      open_pr:
+        description: Push the result to a branch and open a draft PR
+        required: false
+        default: true
+        type: boolean
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: agent-${{ github.event.issue.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    # Comment-triggered runs are gated on write access. Without this, anybody who
+    # can comment on a public issue can spend your Claude credits and run
+    # arbitrary code with a token in the environment.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (startsWith(github.event.comment.body, '/agent ') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      # write so the PR step still works when WORKSPACE_TOKEN is absent and the
+      # job falls back to GITHUB_TOKEN. The `if:` above is what keeps that from
+      # being an open door.
+      contents: write
+      packages: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Resolve the request
+        id: req
+        env:
+          EVENT: ${{ github.event_name }}
+          DISPATCH_TASK: ${{ inputs.task }}
+          DISPATCH_BASE: ${{ inputs.base }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            task="$DISPATCH_TASK"
+            base="$DISPATCH_BASE"
+          else
+            task="${COMMENT_BODY#/agent }"
+            base="${{ github.event.repository.default_branch }}"
+          fi
+          # Multi-line safe, and never interpolated into a shell command later.
+          {
+            echo "task<<OM_EOF"
+            printf '%s\n' "$task"
+            echo "OM_EOF"
+            echo "base=$base"
+            echo "branch=agent/${{ github.run_id }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/om-checkout
+        with:
+          token: ${{ secrets.WORKSPACE_TOKEN || secrets.GITHUB_TOKEN }}
+          ref: ${{ steps.req.outputs.base }}
+          fetch-depth: 0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run the agent
+        uses: ./.github/actions/om-run
+        with:
+          docker: ${{ inputs.docker == true && 'true' || 'false' }}
+          forward-env: OM_TASK OM_MODEL OM_AGENT OM_CUSTOM_COMMAND
+          run: |
+            git config --global user.name  "openmanager-agent"
+            git config --global user.email "openmanager-agent@users.noreply.github.com"
+
+            case "${OM_AGENT:-claude}" in
+              claude)
+                # --dangerously-skip-permissions is the point of the container:
+                # nothing here outlives the job, and the agent is unprivileged
+                # inside it (the flag refuses to run as root, which is why
+                # entrypoint.sh drops to `vscode`).
+                model_args=()
+                [[ -n "${OM_MODEL:-}" ]] && model_args=(--model "$OM_MODEL")
+                claude --print "$OM_TASK" \
+                  --dangerously-skip-permissions \
+                  --output-format text \
+                  "${model_args[@]}"
+                ;;
+              custom)
+                [[ -n "${OM_CUSTOM_COMMAND:-}" ]] || {
+                  echo "agent=custom needs custom_command" >&2; exit 2; }
+                bash -c "$OM_CUSTOM_COMMAND"
+                ;;
+              *)
+                echo "unknown agent: $OM_AGENT" >&2; exit 2 ;;
+            esac
+        env:
+          OM_TASK: ${{ steps.req.outputs.task }}
+          OM_MODEL: ${{ inputs.model }}
+          OM_AGENT: ${{ inputs.agent || 'claude' }}
+          OM_CUSTOM_COMMAND: ${{ inputs.custom_command }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GH_TOKEN: ${{ secrets.WORKSPACE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Show what changed
+        id: diff
+        run: |
+          set -euo pipefail
+          git add -A
+          # Submodule pointers only. An agent that edited pmm/ or SEP/ has to
+          # land those commits in their own repositories; recording a moved
+          # gitlink here would point at objects nobody can fetch.
+          git reset -q -- pmm SEP 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "The agent made no changes to the superproject."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --cached --stat | tee "$RUNNER_TEMP/diffstat.txt"
+          fi
+          if ! git -C pmm diff --quiet || ! git -C SEP diff --quiet; then
+            echo "::warning::The agent modified pmm/ or SEP/. Those changes are NOT committed here - review the job's working tree or re-run the task against the submodule's own repository."
+          fi
+
+      - name: Open a draft PR
+        if: steps.diff.outputs.changed == 'true' && (github.event_name != 'workflow_dispatch' || inputs.open_pr)
+        env:
+          GH_TOKEN: ${{ secrets.WORKSPACE_TOKEN || secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.req.outputs.branch }}
+          BASE: ${{ steps.req.outputs.base }}
+          OM_TASK: ${{ steps.req.outputs.task }}
+        run: |
+          set -euo pipefail
+          git checkout -b "$BRANCH"
+          git commit -q -F - <<EOF
+          agent: $(printf '%s' "$OM_TASK" | head -c 60)
+
+          Produced by the agent workflow, run ${{ github.run_id }}.
+          Task:
+
+          $OM_TASK
+          EOF
+          git push -q origin "$BRANCH"
+          gh pr create --draft --base "$BASE" --head "$BRANCH" \
+            --title "agent: $(printf '%s' "$OM_TASK" | head -c 60)" \
+            --body "$(printf 'Task\n\n%s\n\nRun: %s\n\nUnreviewed agent output. Read every line.\n' \
+                      "$OM_TASK" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")"

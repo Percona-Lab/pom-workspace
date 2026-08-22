@@ -1,0 +1,55 @@
+name: Check out the OpenManager workspace
+description: >
+  Check out this repository together with the pmm/ and SEP/ submodules.
+  Separate from actions/checkout's own `submodules:` option because .gitmodules
+  points at git@github.com: URLs, which no GitHub-hosted runner can resolve
+  without a deploy key.
+
+inputs:
+  token:
+    description: >
+      Token with read access to the submodule repositories. The default
+      GITHUB_TOKEN is scoped to this repository alone and cannot clone
+      plebioda/pmm or plebioda/SEP - supply a PAT (or a GitHub App token) with
+      `contents: read` on both.
+    required: true
+  ref:
+    description: Ref to check out. Defaults to the triggering ref.
+    required: false
+    default: ""
+  submodules:
+    description: Set to 'false' to skip pmm/ and SEP/ entirely - much faster for jobs that do not need them.
+    required: false
+    default: "true"
+  fetch-depth:
+    description: Superproject history depth. 0 for the full history (needed to push branches or diff against a base).
+    required: false
+    default: "1"
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        token: ${{ inputs.token }}
+        fetch-depth: ${{ inputs.fetch-depth }}
+        submodules: false
+
+    - name: Fetch submodules over HTTPS
+      if: inputs.submodules == 'true'
+      shell: bash
+      env:
+        OM_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        # .gitmodules stays as it is - rewriting it in the working tree would
+        # show up as a diff in every job that inspects `git status`, and would
+        # leak into any commit an agent job makes. insteadOf lives in the
+        # runner's global config and touches no tracked file.
+        # --add on both: they share a config key, so a plain `git config` would
+        # make the second line replace the first rather than join it.
+        git config --global --add url."https://x-access-token:${OM_TOKEN}@github.com/".insteadOf "git@github.com:"
+        git config --global --add url."https://x-access-token:${OM_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
+        git submodule update --init --depth 1 --recursive
+        git submodule status

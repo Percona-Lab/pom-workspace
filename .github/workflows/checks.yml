@@ -1,0 +1,107 @@
+# Ordinary CI for the workspace, and the template for any non-agent job.
+#
+# Note what each job asks for. `docker: false` runs the container unprivileged
+# with no inner daemon, which is most jobs - linting and unit tests need neither.
+# Only the stack job needs the daemon, and that one is manual: PMM, ClickHouse,
+# VictoriaMetrics and a PSMDB topology do not fit a standard hosted runner
+# comfortably. See docs/ci-agents.md for what does and does not fit.
+
+name: checks
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: Also boot the full stack (needs a large or self-hosted runner)
+        type: boolean
+        default: false
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  om:
+    name: om
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: ./.github/actions/om-checkout
+        with:
+          token: ${{ secrets.WORKSPACE_TOKEN || secrets.GITHUB_TOKEN }}
+          submodules: "false"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/om-run
+        with:
+          docker: "false"
+          run: |
+            bash -n om
+            bash -n .devcontainer/post-create.sh
+            bash -n .devcontainer/start-docker.sh
+            bash -n .devcontainer/entrypoint.sh
+            echo "om and the container scripts parse"
+
+  sep:
+    name: SEP lint + test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: ./.github/actions/om-checkout
+        with:
+          token: ${{ secrets.WORKSPACE_TOKEN || secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/om-run
+        with:
+          docker: "false"
+          workdir: /workspaces/openmanager/SEP
+          run: |
+            make venv
+            make lint
+            make test
+
+  stack:
+    name: full stack
+    if: github.event_name == 'workflow_dispatch' && inputs.stack
+    # Swap for a larger or self-hosted runner. A standard hosted runner has
+    # 4 vCPU / 16 GB / ~14 GB free disk, and the images alone are ~15-20 GB.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: ./.github/actions/om-checkout
+        with:
+          token: ${{ secrets.WORKSPACE_TOKEN || secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+      - uses: ./.github/actions/om-run
+        with:
+          docker: "true"
+          run: |
+            ./om doctor
+            ./om setup
+            ./om start pmm sep replicaset-single
+            ./om status
