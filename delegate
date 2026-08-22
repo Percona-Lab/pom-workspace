@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+#
+# delegate — hand a plan to an agent running in a container.
+#
+# Writes a plan as markdown, then runs Claude Code against this workspace inside
+# the container image .devcontainer builds, with permissions bypassed and nobody
+# to ask. The container has its own Docker daemon, so the agent can boot PMM and
+# SEP with ./om and test its own work, and nothing it does reaches your machine
+# outside this directory.
+#
+#   ./delegate plans/my-plan.md              implement the plan, no stack
+#   ./delegate plans/my-plan.md --stack      boot pmm + sep first, so it can test
+#   ./delegate plans/my-plan.md --stack --publish --keep
+#                                            ...and leave it up for you to poke at
+#
+#   ./delegate --list                        every run, newest first
+#   ./delegate --logs <run>                  follow (or replay) a run's output
+#   ./delegate --attach <run>                shell into a --keep container
+#   ./delegate --stop <run>                  kill a run
+#   ./delegate --shell                       interactive container, same setup
+#
+# Each run leaves .om/agent/<run-id>/ behind: the plan it was given, the full
+# log, the diff it produced, and the report it wrote about its own work.
+#
+# AUTHENTICATION
+#
+# Needs a credential that can be shared with a container. Your interactive login
+# is not one: those OAuth tokens rotate when they refresh, so a container using a
+# copy of them logs one of you out within hours. Do this once:
+#
+#   claude setup-token                      # on the host, then
+#   export CLAUDE_CODE_OAUTH_TOKEN=<token>  # in the shell you run ./delegate from
+#
+# An ANTHROPIC_API_KEY works too, as does a one-off `claude login` inside
+# `./delegate --shell` - the home volume keeps that login for later runs.
+#
+# WHAT IS AND IS NOT PROTECTED
+#
+# Protected: everything on your machine outside this directory, your Docker
+# daemon, and your ~/.claude (mounted read-only, copied out of, never into).
+#
+# Not protected: this working tree. The agent edits it directly, because that is
+# the job. `delegate` refuses to start on a dirty tree, records the commit you
+# started from, and prints the one command that undoes everything - but if you
+# have uncommitted work you care about, commit it first.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENT_DIR="$ROOT/.om/agent"
+IMAGE="${OM_AGENT_IMAGE:-openmanager-dev:local}"
+BRIEF="$ROOT/harness/agent-brief.md"
+
+C_RESET=$'\033[0m'; C_BLUE=$'\033[1;34m'; C_GREEN=$'\033[1;32m'
+C_YELLOW=$'\033[1;33m'; C_RED=$'\033[1;31m'; C_DIM=$'\033[2m'
+
+info() { printf '%s==>%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+ok()   { printf '%s  ✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s  !%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+dim()  { printf '%s    %s%s\n' "$C_DIM" "$*" "$C_RESET"; }
+die()  { printf '%s  ✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Options
+# ---------------------------------------------------------------------------
+PLAN=""
+STACK=0            # boot pmm + sep before handing over
+CLUSTERS=""        # extra psmdb profiles to start
+PUBLISH=0          # map the stack's ports onto the host
+KEEP=0             # leave the container alive when the agent finishes
+DETACH=0           # do not follow the log
+BRANCH=""          # create and switch to this branch first
+MODEL=""
+TIMEOUT_MIN=180
+JSON=0
+ALLOW_DIRTY=0
+REBUILD=0
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^#\s\?//; $d'; exit "${1:-0}"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --list)    ACTION=list; shift ;;
+    --logs)    ACTION=logs;   RUN_ARG="${2:-}"; shift 2 ;;
+    --attach)  ACTION=attach; RUN_ARG="${2:-}"; shift 2 ;;
+    --stop)    ACTION=stop;   RUN_ARG="${2:-}"; shift 2 ;;
+    --shell)   ACTION=shell; shift ;;
+    --stack)   STACK=1; shift ;;
+    --clusters) CLUSTERS="${2:?--clusters needs a list}"; STACK=1; shift 2 ;;
+    --publish) PUBLISH=1; shift ;;
+    --keep)    KEEP=1; shift ;;
+    --detach)  DETACH=1; shift ;;
+    --branch)  BRANCH="${2:?--branch needs a name}"; shift 2 ;;
+    --model)   MODEL="${2:?--model needs an id}"; shift 2 ;;
+    --timeout) TIMEOUT_MIN="${2:?--timeout needs minutes}"; shift 2 ;;
+    --json)    JSON=1; shift ;;
+    --dirty)   ALLOW_DIRTY=1; shift ;;
+    --rebuild) REBUILD=1; shift ;;
+    -h|--help) usage 0 ;;
+    -*)        die "unknown option: $1  (--help)" ;;
+    *)         [[ -z "$PLAN" ]] || die "one plan at a time (got '$PLAN' and '$1')"; PLAN="$1"; shift ;;
+  esac
+done
+ACTION="${ACTION:-run}"
+
+# ---------------------------------------------------------------------------
+# Image
+# ---------------------------------------------------------------------------
+ensure_image() {
+  if [[ "$REBUILD" == 1 ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    info "building $IMAGE from .devcontainer"
+    docker build -t "$IMAGE" "$ROOT/.devcontainer" \
+      || die "image build failed"
+  fi
+}
+
+# Resolve a run id from a prefix, or take the newest.
+resolve_run() {
+  local want="${1:-}"
+  if [[ -z "$want" || "$want" == "last" ]]; then
+    ls -1 "$AGENT_DIR" 2>/dev/null | sort | tail -1
+    return
+  fi
+  ls -1 "$AGENT_DIR" 2>/dev/null | grep -- "$want" | sort | tail -1
+}
+
+# ---------------------------------------------------------------------------
+# Sub-commands that are not a run
+# ---------------------------------------------------------------------------
+case "$ACTION" in
+  list)
+    [[ -d "$AGENT_DIR" ]] || { echo "no runs yet"; exit 0; }
+    printf '%-22s %-9s %-9s %s\n' RUN STATE EXIT PLAN
+    for d in $(ls -1 "$AGENT_DIR" | sort -r); do
+      state=stopped; exit_code="-"
+      if docker inspect -f '{{.State.Running}}' "om-agent-$d" 2>/dev/null | grep -q true; then
+        state=running
+      elif [[ -f "$AGENT_DIR/$d/exit" ]]; then
+        exit_code="$(cat "$AGENT_DIR/$d/exit")"
+        [[ "$exit_code" == 0 ]] && state=done || state=failed
+      fi
+      printf '%-22s %-9s %-9s %s\n' "$d" "$state" "$exit_code" \
+        "$(head -1 "$AGENT_DIR/$d/plan-source" 2>/dev/null || echo '?')"
+    done
+    exit 0 ;;
+  logs)
+    run="$(resolve_run "${RUN_ARG:-}")"; [[ -n "$run" ]] || die "no such run"
+    if docker inspect -f '{{.State.Running}}' "om-agent-$run" 2>/dev/null | grep -q true; then
+      exec docker logs -f "om-agent-$run"
+    fi
+    exec less -R "$AGENT_DIR/$run/log.txt" ;;
+  attach)
+    run="$(resolve_run "${RUN_ARG:-}")"; [[ -n "$run" ]] || die "no such run"
+    exec docker exec -it -u vscode -w "$ROOT" "om-agent-$run" bash ;;
+  stop)
+    run="$(resolve_run "${RUN_ARG:-}")"; [[ -n "$run" ]] || die "no such run"
+    docker rm -f "om-agent-$run" >/dev/null && ok "stopped om-agent-$run"
+    exit 0 ;;
+  shell)
+    ensure_image
+    info "interactive container - same image, daemon and mounts as a delegated run"
+    exec docker run --rm -it --privileged --init --shm-size=2g \
+      -v "$ROOT:$ROOT" -w "$ROOT" \
+      -v openmanager-agent-dind:/var/lib/docker \
+      -v openmanager-agent-home:/home/vscode \
+      -v "$HOME/.claude:/host-claude:ro" \
+      -v "$HOME/.claude.json:/host-claude.json:ro" \
+      -e "OM_WORKSPACE=$ROOT" -e OM_CHOWN_WORKSPACE=0 \
+      -e "OM_UID=$(id -u)" -e "OM_GID=$(id -g)" \
+      -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" \
+      -e "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}" \
+      "$IMAGE" bash -lc 'seed-claude.sh; exec bash' ;;
+esac
+
+# ---------------------------------------------------------------------------
+# A run
+# ---------------------------------------------------------------------------
+[[ -n "$PLAN" ]] || usage 1
+[[ -f "$PLAN" ]] || die "no such plan: $PLAN"
+[[ -f "$BRIEF" ]] || die "missing $BRIEF"
+
+# The agent edits this tree, so the run has to start from a state you can get
+# back to. The reason is concrete: the undo this prints at the end is `git reset
+# --hard <start-ref>`, and running that with uncommitted work in the tree
+# destroys it.
+#
+# Submodule pointers are excluded. They are near-permanently ahead in this
+# workspace - that is what a superproject of two feature branches looks like -
+# and the runner records each submodule's own diff separately anyway.
+DIRTY_BACKUP=""
+dirty="$(git -C "$ROOT" status --porcelain --untracked-files=no --ignore-submodules=all)"
+if [[ -n "$dirty" ]]; then
+  if [[ "$ALLOW_DIRTY" != 1 ]]; then
+    warn "the working tree has uncommitted changes:"
+    printf '%s\n' "$dirty" | head -10 | sed 's/^/      /'
+    die "commit or stash first, or pass --dirty to accept it"
+  fi
+  # --dirty was asked for. Take a recoverable snapshot of the tracked changes so
+  # the undo command is not a one-way door. `stash create` builds the commit
+  # objects without touching the working tree, so the agent still sees the
+  # changes exactly as they are. Untracked files are not in it.
+  DIRTY_BACKUP="$(git -C "$ROOT" stash create 2>/dev/null || true)"
+  warn "starting dirty - the undo command will discard these changes"
+  [[ -n "$DIRTY_BACKUP" ]] && dim "recover them with: git stash apply $DIRTY_BACKUP"
+fi
+
+# Authentication, checked before anything expensive happens.
+#
+# Not by copying your ~/.claude credentials in - those OAuth tokens rotate on
+# refresh, so a container sharing them logs one of the two of you out within
+# hours. It needs a credential meant to be shared. See .devcontainer/seed-claude.sh.
+if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}" ]]; then
+  warn "no CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY in the environment"
+  dim "the run will fall back to a login stored in the container's own volume,"
+  dim "and fail if there is none. To set one up:"
+  dim "  claude setup-token && export CLAUDE_CODE_OAUTH_TOKEN=<the token>"
+  dim "or log in once inside the container:  ./delegate --shell"
+  echo
+fi
+
+ensure_image
+
+RUN_ID="$(date +%Y%m%d-%H%M%S)"
+RUN_DIR="$AGENT_DIR/$RUN_ID"
+CONTAINER="om-agent-$RUN_ID"
+mkdir -p "$RUN_DIR"
+
+START_REF="$(git -C "$ROOT" rev-parse HEAD)"
+cp "$PLAN" "$RUN_DIR/plan.md"
+printf '%s\n' "$PLAN" > "$RUN_DIR/plan-source"
+printf '%s\n' "$START_REF" > "$RUN_DIR/start-ref"
+
+# The prompt: standing instructions, then the plan. One file, so the log records
+# exactly what the agent was told.
+{
+  cat "$BRIEF"
+  printf '\n\n---\n\n# The plan\n\n'
+  cat "$PLAN"
+} > "$RUN_DIR/prompt.md"
+
+# The script the container runs. Generated per run and left in the run directory,
+# so a failed run can be read afterwards and understood, or re-run by hand.
+#
+# Split in two on purpose. run.sh pipes body.sh through tee, rather than body.sh
+# redirecting itself into a process substitution: a `tee` started that way is
+# still a child when the shell exits, and the last lines of a run - which is
+# where the interesting part usually is - can be lost. A pipeline cannot lose
+# them, because the shell waits for tee.
+cat > "$RUN_DIR/run.sh" <<RUNNER
+#!/usr/bin/env bash
+"$RUN_DIR/body.sh" 2>&1 | tee -a "$RUN_DIR/log.txt"
+exit \${PIPESTATUS[0]}
+RUNNER
+chmod +x "$RUN_DIR/run.sh"
+
+cat > "$RUN_DIR/body.sh" <<RUNNER
+#!/usr/bin/env bash
+set -uo pipefail
+
+RUN_DIR="$RUN_DIR"
+export OM_AGENT_REPORT="$RUN_DIR/report.md"
+export OM_AGENT_RUN_ID="$RUN_ID"
+
+cd "$ROOT"
+# Hard stop if this fails: it exits 78 when there is no way to authenticate, and
+# carrying on from there just produces a confusing "Not logged in" from claude.
+# The exit file is written here too, so --list reports a code rather than a "?".
+seed-claude.sh || { rc=\$?; echo "\$rc" > "$RUN_DIR/exit"; exit \$rc; }
+git config --global --add safe.directory "$ROOT" 2>/dev/null || true
+git config --global --add safe.directory "$ROOT/pmm" 2>/dev/null || true
+git config --global --add safe.directory "$ROOT/SEP" 2>/dev/null || true
+git config --global user.name  "\$(git config user.name  || echo openmanager-agent)"
+git config --global user.email "\$(git config user.email || echo agent@localhost)"
+RUNNER
+
+if [[ -n "$BRANCH" ]]; then
+  cat >> "$RUN_DIR/body.sh" <<RUNNER
+echo "==> branch: $BRANCH"
+git switch -c "$BRANCH" || git switch "$BRANCH" || exit 1
+RUNNER
+fi
+
+if [[ "$STACK" == 1 ]]; then
+  cat >> "$RUN_DIR/body.sh" <<RUNNER
+echo "==> booting the stack (first run in a fresh volume pulls several GB)"
+./om setup            || echo "!! om setup returned \$? - continuing"
+./om start pmm sep ${CLUSTERS} || echo "!! om start returned \$? - continuing"
+./om status           || true
+RUNNER
+fi
+
+claude_args=(--print --dangerously-skip-permissions)
+[[ -n "$MODEL" ]] && claude_args+=(--model "$MODEL")
+if [[ "$JSON" == 1 ]]; then
+  claude_args+=(--output-format stream-json --verbose)
+else
+  claude_args+=(--output-format text)
+fi
+
+cat >> "$RUN_DIR/body.sh" <<RUNNER
+echo "==> handing the plan to the agent"
+claude ${claude_args[*]} "\$(cat '$RUN_DIR/prompt.md')"
+agent_exit=\$?
+echo "==> agent finished with exit \$agent_exit"
+
+# The diff, for review. Recorded here rather than on the host because the agent
+# may have committed, in which case the interesting comparison is against the
+# commit the run started from.
+git -C "$ROOT" --no-pager log --oneline "$START_REF"..HEAD > "$RUN_DIR/commits.txt" 2>/dev/null || true
+git -C "$ROOT" diff "$START_REF" > "$RUN_DIR/diff.patch" 2>/dev/null || true
+for sub in pmm SEP; do
+  git -C "$ROOT/\$sub" --no-pager log --oneline -20 > "$RUN_DIR/commits-\$sub.txt" 2>/dev/null || true
+  git -C "$ROOT/\$sub" diff HEAD > "$RUN_DIR/diff-\$sub.patch" 2>/dev/null || true
+done
+
+echo "\$agent_exit" > "$RUN_DIR/exit"
+RUNNER
+
+if [[ "$KEEP" == 1 ]]; then
+  cat >> "$RUN_DIR/body.sh" <<'RUNNER'
+echo "==> --keep: the container and its stack stay up. Attach with:"
+echo "    ./delegate --attach $OM_AGENT_RUN_ID"
+sleep infinity
+RUNNER
+else
+  echo 'exit $agent_exit' >> "$RUN_DIR/body.sh"
+fi
+chmod +x "$RUN_DIR/body.sh"
+
+# ---------------------------------------------------------------------------
+# Launch
+# ---------------------------------------------------------------------------
+args=(
+  -d --name "$CONTAINER"
+  --privileged --init --shm-size=2g
+  --stop-timeout 30
+  # Mounted at its own path so SEP/venv and the node_modules trees, which bake in
+  # absolute paths, work identically inside and outside the container.
+  -v "$ROOT:$ROOT" -w "$ROOT"
+  # Inner Docker's storage, kept between runs: without it every run re-pulls PMM.
+  -v openmanager-agent-dind:/var/lib/docker
+  # The agent's whole home, kept between runs. Not just ~/.claude: the trust
+  # flag and the account identity live in ~/.claude.json, one level up, and a
+  # volume that covers only ~/.claude leaves Claude Code reporting a missing
+  # config file next to a backup of it every single run.
+  -v openmanager-agent-home:/home/vscode
+  -e "OM_WORKSPACE=$ROOT"
+  # Never chown: this is the caller's real checkout. The uid is matched instead.
+  -e OM_CHOWN_WORKSPACE=0
+  -e "OM_UID=$(id -u)" -e "OM_GID=$(id -g)"
+)
+
+# Both halves of your Claude config, read-only. ~/.claude has the credentials
+# and the global CLAUDE.md; ~/.claude.json has the account identity and the
+# per-directory trust flag, which lives outside ~/.claude and is easy to forget.
+[[ -d "$HOME/.claude" ]] && args+=(-v "$HOME/.claude:/host-claude:ro")
+[[ -f "$HOME/.claude.json" ]] && args+=(-v "$HOME/.claude.json:/host-claude.json:ro")
+
+for v in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL \
+         OPENAI_API_KEY GEMINI_API_KEY GH_TOKEN; do
+  if [[ -n "${!v:-}" ]]; then args+=(-e "$v=${!v}"); fi
+done
+
+if [[ "$PUBLISH" == 1 ]]; then
+  for p in 8443 8000 5174 5173; do
+    if (command -v ss >/dev/null && ss -ltn 2>/dev/null | grep -q ":$p ") ; then
+      warn "port $p is busy on this machine - not publishing it"
+    else
+      args+=(-p "$p:$p")
+    fi
+  done
+fi
+
+info "run $RUN_ID"
+dim "plan     $PLAN"
+dim "image    $IMAGE"
+dim "from     $START_REF"
+dim "stack    $([[ "$STACK" == 1 ]] && echo "pmm sep ${CLUSTERS}" || echo "not started")"
+dim "timeout  ${TIMEOUT_MIN}m"
+
+docker run "${args[@]}" "$IMAGE" \
+  timeout "${TIMEOUT_MIN}m" "$RUN_DIR/run.sh" >/dev/null \
+  || die "could not start $CONTAINER"
+
+ok "started $CONTAINER"
+
+if [[ "$DETACH" == 1 ]]; then
+  echo
+  dim "follow it with:  ./delegate --logs $RUN_ID"
+  exit 0
+fi
+
+# The container writes log.txt itself, so Ctrl-C here detaches from the run
+# rather than losing it. The container keeps going; --logs picks it back up.
+echo
+docker logs -f "$CONTAINER" 2>&1 || true
+
+echo
+exit_code="$(cat "$RUN_DIR/exit" 2>/dev/null || echo "?")"
+if [[ "$exit_code" == 0 ]]; then ok "agent finished cleanly"
+else warn "agent exit: $exit_code"; fi
+
+[[ -s "$RUN_DIR/commits.txt" ]] && { info "commits"; sed 's/^/      /' "$RUN_DIR/commits.txt"; }
+[[ -s "$RUN_DIR/report.md" ]] && { info "report"; dim "$RUN_DIR/report.md"; } \
+  || warn "no report written - read $RUN_DIR/log.txt"
+
+echo
+info "review"
+dim "report   $RUN_DIR/report.md"
+dim "log      $RUN_DIR/log.txt"
+dim "diff     $RUN_DIR/diff.patch"
+dim "undo     git reset --hard $START_REF"
+[[ -n "$DIRTY_BACKUP" ]] && dim "         (then: git stash apply $DIRTY_BACKUP)"
+[[ "$KEEP" == 1 ]] && dim "attach   ./delegate --attach $RUN_ID"
