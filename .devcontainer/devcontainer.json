@@ -1,0 +1,132 @@
+// OpenManager dev container.
+//
+// Runs the whole workspace - `./om`, SEP natively, PMM and the PSMDB clusters in
+// Docker - inside one container that owns its own Docker daemon. Nothing this
+// container starts is visible to the host daemon, and nothing outside the
+// workspace bind mount is visible to the container.
+//
+// The image is the same one CI uses (.devcontainer/Dockerfile, published to
+// GHCR by .github/workflows/image.yml), so a job that passes here passes there.
+// That is why there are no devcontainer "features": features exist only for the
+// devcontainer builder, and a `docker build` of this Dockerfile has to come out
+// complete. Docker, Node and gh are installed in the Dockerfile instead.
+//
+// Read docs/devcontainer.md before the first build; the first `./om setup` in
+// here re-pulls every image into the inner daemon (several GB).
+{
+	"name": "OpenManager (PMM + SEP + PSMDB)",
+
+	"build": {
+		"dockerfile": "Dockerfile",
+		"context": "."
+	},
+
+	// Required by the inner Docker daemon. This is what makes the container
+	// disposable: `docker compose up` inside here cannot touch the host's
+	// containers, images, volumes or networks, and bind mounts resolve against
+	// this container's filesystem - which is what pmm/docker-compose.dev.yml and
+	// psmdb/compose.yaml assume.
+	//
+	// --init reaps the processes om leaves behind (uvicorn, celery, vite) when
+	// you kill a shell.
+	"runArgs": [
+		"--privileged",
+		"--init",
+		"--shm-size=2g",
+		"--name=openmanager-dev"
+	],
+
+	// Mounted at its own host path, not under /workspaces. This is not cosmetic:
+	// SEP/venv bakes absolute paths into every shebang and into bin/activate, and
+	// pnpm's node_modules are full of absolute symlinks. Mount the tree anywhere
+	// else and the host's venv is broken inside the container and the container's
+	// is broken outside it, so every switch costs a `make venv`. Same path
+	// everywhere means one venv serves both.
+	"workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind,consistency=cached",
+	"workspaceFolder": "${localWorkspaceFolder}",
+
+	"mounts": [
+		// Inner Docker's storage. A named volume, not a bind: overlay2 refuses to
+		// run on top of an overlay bind mount, and this way `Rebuild Container`
+		// does not throw away every image you pulled.
+		"source=openmanager-dind,target=/var/lib/docker,type=volume",
+
+		// The whole home directory, so a rebuild keeps you logged in and keeps
+		// your caches. It covers /home/vscode rather than just ~/.claude because
+		// Claude Code splits its state across both: credentials and history in
+		// ~/.claude, but the account identity and the per-directory trust flag in
+		// ~/.claude.json, one level up. A volume over only ~/.claude loses the
+		// second half on every container recreate.
+		"source=openmanager-home,target=/home/vscode,type=volume",
+
+		// Read-only view of the host's Claude config, used once by post-create to
+		// seed the volume above: credentials and the global CLAUDE.md from
+		// ~/.claude, plus the account identity and the per-directory trust flag
+		// from ~/.claude.json, which lives outside ~/.claude. Read-only, so
+		// nothing in here can write back. Delete both lines if you would rather
+		// run `claude login` inside the container by hand.
+		"source=${localEnv:HOME}/.claude,target=/host-claude,type=bind,readonly",
+		"source=${localEnv:HOME}/.claude.json,target=/host-claude.json,type=bind,readonly"
+	],
+
+	"remoteUser": "vscode",
+	"updateRemoteUserUID": true,
+
+	// The image's ENTRYPOINT is for CI and plain `docker run`; the dev container
+	// overrides the command, so dockerd is started here instead. Same script
+	// either way, and it is idempotent, so a container restart is free.
+	"overrideCommand": true,
+	"postStartCommand": "sudo /usr/local/bin/start-docker.sh",
+	"postCreateCommand": "bash .devcontainer/post-create.sh",
+
+	// The same credential names CI uses, so a command you debug here runs
+	// unchanged in a workflow. Each resolves to an empty string when it is unset
+	// on your machine - harmless, but if a tool misreads "set but empty" as "set",
+	// delete its line rather than exporting a dummy value.
+	"remoteEnv": {
+		"ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
+		"CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}",
+		"OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}",
+		"GEMINI_API_KEY": "${localEnv:GEMINI_API_KEY}",
+		"GH_TOKEN": "${localEnv:GH_TOKEN}"
+	},
+
+	// Everything ./om ports lists. VS Code tunnels these to the same port
+	// numbers on your machine, so the URLs in ./om status keep working in the
+	// host browser.
+	"forwardPorts": [8000, 5174, 8443, 5173, 9090, 9000, 8123, 5432],
+	"portsAttributes": {
+		"8000": { "label": "SEP backend" },
+		"5174": { "label": "SEP frontend" },
+		"8443": { "label": "PMM server (https)" },
+		"5173": { "label": "PMM Vite HMR" },
+		"9090": { "label": "VictoriaMetrics" },
+		"9000": { "label": "ClickHouse native" },
+		"8123": { "label": "ClickHouse HTTP" },
+		"5432": { "label": "PMM PostgreSQL" }
+	},
+
+	"shutdownAction": "stopContainer",
+
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"golang.go",
+				"ms-python.python",
+				"ms-python.vscode-pylance",
+				"charliermarsh.ruff",
+				"esbenp.prettier-vscode",
+				"dbaeumer.vscode-eslint",
+				"oxc.oxc-vscode",
+				"anthropic.claude-code",
+				"ms-azuretools.vscode-docker",
+				"redhat.vscode-yaml",
+				"ms-vscode.makefile-tools"
+			],
+			"settings": {
+				"terminal.integrated.defaultProfile.linux": "bash",
+				"go.gopath": "/home/vscode/go"
+			}
+		}
+	}
+}
