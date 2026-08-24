@@ -100,12 +100,11 @@ Every source emits flat **facts** keyed by `(service, field)`. The merge picks a
 per field from a **declared precedence table**, never from call order, and keeps each
 field's source and observation time.
 
-**It reads the estate, not the last sweep.** The probe source used to pull `GET /facts`,
-which served whatever the most recent completed sweep collected - so a service that
-sweep failed to reach contributed nothing, and PMM lost every probe field for it until
-some later sweep succeeded. A host that went unreachable looked like a host with
-nothing installed on it. The estate is upserted, so the same service still answers with
-what it last reported and how old that is.
+**It reads the estate, not the last sweep.** Serving whatever the most recent completed
+sweep collected would mean a service that sweep failed to reach contributes nothing, and
+PMM loses every probe field for it until some later sweep succeeds - an unreachable host
+reads as a host with nothing installed on it. The estate is upserted, so the same service
+still answers with what it last reported and how old that is.
 
 ## The refresh
 
@@ -230,8 +229,7 @@ would be a second copy that goes stale on the next refresh.
 `task_history_id` is the exception that keeps that rule affordable, and it is a pointer
 rather than an observation: the probe's full output already exists in the tasks layer,
 so recording which task ran lets a reader reach it without the receipt storing any of
-it. The run row used to carry a flat `facts` list as well - a projection of the same
-document, with no consumer left once `GET /facts` was retired - and it is gone.
+it.
 
 ### PMM's half
 
@@ -386,4 +384,3 @@ things.
 - **No pagination**, except `GET /runs`. Correct at this sandbox's 20 hosts and wrong at
   a real estate's thousands.
 - **No browser-side SEP bearer.** Removed with the Inventory page's move onto the proxy.
-- **`GET /facts` is gone** - replaced by the estate, 2026-08-17.

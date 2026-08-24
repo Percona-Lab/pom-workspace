@@ -571,8 +571,8 @@ rows on the way. The endpoint being a stored-row read is what keeps the two apar
 sweep runs on its own 10-minute clock, and can be scoped to named hosts.
 
 Because the rows are upserted rather than replaced per sweep, a service the newest sweep
-failed to reach still answers with what it last reported and how old that is - where the
-retired `GET /facts` would have dropped it, making an unreachable host look like a host
+failed to reach still answers with what it last reported and how old that is. Serving the
+last sweep's output instead would drop it, making an unreachable host look like a host
 with nothing installed on it.
 
 What the probe contributes is what no metric carries: the **installed** package version
@@ -586,8 +586,6 @@ repository, and any mongod running that PMM has no service for.
 It also carries the executor-mapping and Nomad fan-out machinery (`mapping.py`,
 `dispatch.py`, `payload/`). The upgrade and restart apps will want exactly those, so
 expect them to move to a shared home once there is a second caller.
-
-> `GET /facts` was retired on **2026-08-17**, replaced by the estate above.
 
 The full picture, including the document's conventions and the traps behind them, is in
 [`architecture.md`](architecture.md).
@@ -861,7 +859,7 @@ As configured by this workspace's `pmm/.env` and `om`:
 | vmagent | VictoriaMetrics | metrics push |
 | SEP `PMMSyncer` | PMM `/v1/inventory` | REST + Bearer service account token |
 | SEP tasks app | PMM `/nomad` on `:8443` | REST over HTTPS, credentials in the URL — register, dispatch, poll, stream logs |
-| pmm-managed `services/om` | SEP `/api/apps/om_inventory/facts` | REST + Bearer, pulls on-host facts; `PMM_SEP_URL` |
+| pmm-managed `services/om` | SEP `/api/apps/om_inventory/services` | REST + Bearer, reads the estate's on-host facts; `PMM_SEP_URL` |
 | SEP (all three services + beat) | PMM's embedded PostgreSQL `:5432` | database `sep`, role `sep` |
 | SEP core app | Grafana in pmm-server | validates a `pmm_session` cookie, maps the org role |
 | PMM nginx | SEP `:8000` | proxies `/api`, `/sep_app`, `/files`, `/stream-logs`, `/execution-events` via `host.docker.internal` |
