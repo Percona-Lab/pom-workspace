@@ -77,6 +77,22 @@ def flat(s, n):
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def decode(raw):
+    """Return one transcript line as a dict, or ``None`` if it is not usable yet.
+
+    ``errors="replace"`` rather than a hard decode: the file is being appended to
+    while this reads it, so the last line can be a partial write. A mangled
+    character costs one unreadable label; raising ends the feed.
+
+    :param raw: One line, as bytes.
+    :return: The parsed entry, or ``None``.
+    """
+    try:
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except ValueError:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tail", type=int, default=0, help="show only the last N lines of history")
@@ -89,15 +105,18 @@ def main():
         return 1
     print(f"# {path}\n", file=sys.stderr)
 
+    # Binary, and the offset counts bytes. In text mode `len(line)` is a count of
+    # *characters*, while seek() wants the byte offset - so one non-ASCII character
+    # anywhere in the transcript (a dash in a commit message, a box-drawing char in
+    # captured output) puts the two out of step, the next seek lands mid-character,
+    # and the follow loop dies on "invalid start byte" partway through a run.
     history, offset = [], 0
-    with open(path) as fh:
-        for line in fh:
-            offset += len(line)
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            history.extend(summarise(entry))
+    with open(path, "rb") as fh:
+        for raw in fh:
+            offset += len(raw)
+            entry = decode(raw)
+            if entry is not None:
+                history.extend(summarise(entry))
 
     for line in history[-args.tail :] if args.tail else history:
         print(line, flush=True)
@@ -115,13 +134,12 @@ def main():
             return 0
         if size <= offset:
             continue
-        with open(path) as fh:
+        with open(path, "rb") as fh:
             fh.seek(offset)
-            for line in fh:
-                offset += len(line)
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
+            for raw in fh:
+                offset += len(raw)
+                entry = decode(raw)
+                if entry is None:
                     continue
                 for out in summarise(entry):
                     print(out, flush=True)

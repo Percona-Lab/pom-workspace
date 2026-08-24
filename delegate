@@ -236,6 +236,20 @@ prepare_lane() {
     dim "carried $f"
   done
 
+  # ...except the Grafana service account token, which is the one carried value
+  # that cannot be reused. It is minted by a *running* Grafana and stored in that
+  # instance's database, and a lane runs its own PMM in its own inner-Docker
+  # volume - so the carried token authenticates against nothing here. Everything
+  # SEP does through PMM then fails with `401 Auth method is not service account
+  # token`, which reads like broken code rather than a stale secret, and `./om
+  # setup` will not re-mint because render_sep_env keeps any token that is already
+  # there. Reset it to the placeholder so `./om env` mints one once PMM is up.
+  if [[ -f "$dir/SEP/.env" ]]; then
+    sed -i -e 's|^\(AUTH__PROVIDER__GRAFANA__SERVICE_ACCOUNT_TOKEN\)=.*|\1=@grafana-token|' \
+           -e 's|^\(PMM__API_KEY\)=.*|\1=@grafana-token|' "$dir/SEP/.env"
+    dim "reset SEP/.env's Grafana token - this lane mints its own"
+  fi
+
   # The plan usually lives in an untracked directory and references its siblings
   # by relative path, so carry the whole directory rather than just the file.
   local plan_dir
@@ -283,17 +297,26 @@ case "$ACTION" in
     # writes as it goes. Read-only; it cannot disturb the run.
     run="$(resolve_run "${RUN_ARG:-}")"; [[ -n "$run" ]] || die "no such run"
     script=".devcontainer/agent-activity.py"
+    # The run's own tree and lane, not this checkout's. A lane run mounts the
+    # worktree and nothing of this directory but the bare .git dirs, so
+    # addressing $ROOT looks in a path the container does not have - which is a
+    # missing-file error rather than an empty feed, and reads like a broken
+    # script. Both are recorded per run precisely so a later command can ask.
+    act_dir="$(cat "$AGENT_DIR/$run/workdir" 2>/dev/null || echo "$ROOT")"
+    act_lane="$(cat "$AGENT_DIR/$run/lane" 2>/dev/null || true)"
+    [[ "$act_lane" == "main" ]] && act_lane=""
+    act_home="openmanager-agent-home${act_lane:+-$act_lane}"
     # -t only when there is a terminal to attach: docker refuses it otherwise,
     # which would make this unusable from a script or another agent's shell.
     tty_flag=(); [[ -t 0 ]] && tty_flag=(-t)
     follow=(); [[ -t 1 ]] || follow=(--no-follow)
     if docker inspect -f '{{.State.Running}}' "om-agent-$run" 2>/dev/null | grep -q true; then
-      exec docker exec "${tty_flag[@]}" -u vscode -w "$ROOT" "om-agent-$run" \
+      exec docker exec "${tty_flag[@]}" -u vscode -w "$act_dir" "om-agent-$run" \
         python3 "$script" ${TAIL:+--tail "$TAIL"} "${follow[@]}"
     fi
-    # Finished run: the transcript is still in the home volume.
+    # Finished run: the transcript is still in that run's home volume.
     exec docker run --rm "${tty_flag[@]}" -e OM_START_DOCKER=0 -e OM_CHOWN_WORKSPACE=0 \
-      -v openmanager-agent-home:/home/vscode -v "$ROOT:$ROOT" -w "$ROOT" \
+      -v "$act_home:/home/vscode" -v "$act_dir:$act_dir" -w "$act_dir" \
       -e "OM_UID=$(id -u)" -e "OM_GID=$(id -g)" \
       "$IMAGE" python3 "$script" --no-follow ${TAIL:+--tail "$TAIL"} ;;
   attach)
