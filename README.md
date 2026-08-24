@@ -14,6 +14,50 @@ Two git submodules plus an in-tree database stack, one orchestrator:
 Everything is driven from the repo root by [`./om`](om). Run `./om` with no arguments for
 its full help.
 
+---
+
+## Quick start
+
+From a fresh clone to PMM, SEP and four MongoDB topologies running against each other:
+
+```bash
+git clone <this-repo> openmanager && cd openmanager
+./om doctor                  # check prerequisites first - see §2 if it complains
+./om bootstrap               # submodules, both .env files, PMM, SEP's venv and
+                             # migrations, then everything else. Idempotent.
+./om start clusters          # the four PSMDB topologies
+./om status                  # what came up, and on which ports
+```
+
+PMM is then at **<https://localhost:8443>** (`admin` / `admin`), with the SEP pages under
+`/pmm-ui/sep/`. `./om urls` lists every address, including for components that are stopped.
+
+`./om bootstrap` is also the way back when a workspace has drifted: it is safe to re-run,
+and each step leaves existing state alone. Full detail in §3-§6.
+
+Then, day to day:
+
+| | |
+| --- | --- |
+| `./om status` | what is up, and on which ports |
+| `./om urls [comp...]` | every address a component serves, running or not |
+| `./om start <comp>` / `./om stop <comp>` | `pmm`, `sep-backend`, `sep-frontend`; groups `sep`, `clusters`, `all` |
+| `./om build pmm` / `./om build ui` | compile your Go or UI changes into the running server |
+| `./om logs <comp> [-f]` | logs |
+| `./om inventory` | what OM has discovered about the estate (§7) |
+| `./om doctor` | prerequisites and common misconfigurations |
+
+Start only the topology the work needs - a sharded cluster costs real memory, and four of
+them cost four times as much:
+
+```bash
+./om start standalone          # one mongod
+./om start replicaset-single   # a single-node replica set
+./om start replicaset-cluster  # three-node replica set
+./om start sharded-cluster     # mongos + config servers + shards + arbiters
+./om start pmm-client-node00   # a host with a PMM client and no database
+```
+
 > **New to this system?** Read [`docs/topology.md`](docs/topology.md) first — what the two
 > products are, what runs on your machine, and what talks to what. Its Part 10 is the
 > container-level reference, and [`docs/glossary.md`](docs/glossary.md) defines every

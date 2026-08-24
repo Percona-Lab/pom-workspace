@@ -174,7 +174,7 @@ erDiagram
         text node_id FK "ON DELETE CASCADE"
         text name
         int port
-        text role
+        text role "mongod / mongos / config / arbiter, read off the probe"
         jsonb observed "installed_version, config_path, argv, ..."
     }
     INVENTORY_RUN {
@@ -214,7 +214,7 @@ that reading one back needs a shape check rather than a type.
 | `services_total / resolved / orphaned / answered` | what enumeration found, and what could be reached. `resolved=9, answered=0` is a healthy mapping with broken executors - a distinction one "failed" count hides |
 | `hosts_total / probeable / answered` | the same one level up. The gap between the first two is the estate nothing can be dispatched to, which is an onboarding fact rather than a failed run |
 | `scope` | node ids, or SQL **NULL** for a full sweep. Without it a one-host refresh reads as a full sweep that found one host |
-| `nodes` | one outcome record per attempted entity: where it ran, how the host was matched, whether it answered, how long, and the error |
+| `nodes` | one outcome record per attempted entity: where it ran, how the host was matched, whether it answered, how long, the error, and the `task_history_id` of its dispatch |
 
 `nodes` is **host-oriented**: one entry per host attempted, each carrying the services
 on it. A flat service list - which it was - cannot show a machine with a PMM client and
@@ -226,6 +226,12 @@ duration was copied onto each service and read as several measurements when it w
 It carries **outcomes, never observations**. What the probe found belongs to the
 estate, where it is upserted and stays current; a receipt carrying the attributes too
 would be a second copy that goes stale on the next refresh.
+
+`task_history_id` is the exception that keeps that rule affordable, and it is a pointer
+rather than an observation: the probe's full output already exists in the tasks layer,
+so recording which task ran lets a reader reach it without the receipt storing any of
+it. The run row used to carry a flat `facts` list as well - a projection of the same
+document, with no consumer left once `GET /facts` was retired - and it is gone.
 
 ### PMM's half
 
@@ -251,8 +257,20 @@ the Hosts page has a delete action.
 
 ### SEP's app - `/api/apps/om_inventory`
 
-Authorised at the mount: `IsApiAuthenticated`, plus a bearer required on unsafe
-methods. Reached by pmm-managed with the `--sep-token` bearer, never by a browser.
+Authorised at the mount (`IsApiAuthenticated`, plus a bearer required on unsafe
+methods) **and per route**. SEP gates every state-changing endpoint on a minimum role,
+and an unregistered route resolves to `ADMIN` deliberately - so each unsafe route here
+declares its own:
+
+| rank | routes |
+| --- | --- |
+| **editor** | `POST /runs` - it runs a fixed payload and is the button beside a row, so requiring admin would put the routine question behind the rarest role |
+| **admin** | both estate deletes, and both config writes |
+
+Reached by pmm-managed with the `--sep-token` bearer, never by a browser. That principal
+is admitted by identity *before* ranks are compared, so the deployment token reaches
+every route whatever a human needs - scheduled sweeps keep working regardless of the
+rank chosen above.
 
 | Method | Path | For |
 | --- | --- | --- |
@@ -280,6 +298,11 @@ methods. Reached by pmm-managed with the `--sep-token` bearer, never by a browse
 | `POST` | `/inventory/runs` | trigger a refresh |
 | `GET` | `/inventory/runs[/{run_id}]` | refresh history; the detail also returns `entities` |
 | `GET`/`PATCH` | `/inventory/config`, `DELETE /inventory/config/{key}` | the app's configuration |
+
+The human is gated here rather than in SEP, by Grafana role in `auth_server.go`:
+`POST /inventory/runs` is **editor**, the two deletes and both config writes are
+**admin**. SEP's own ranks above cover the same routes for a caller that reaches it
+directly.
 
 Two things about this surface are load-bearing:
 

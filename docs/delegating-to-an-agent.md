@@ -86,6 +86,79 @@ up:
 ./delegate --attach last        # a shell in the still-running container
 ```
 
+To see what the agent is actually doing, tool by tool:
+
+```bash
+./delegate --activity last           # follow it live
+./delegate --activity last --tail 40 # ...from the last 40 actions
+```
+
+This exists because `claude --print` emits nothing until it finishes, so on a
+multi-hour run the container's own stdout is not a progress log. It reads the
+session transcript as that is written, is read-only, and works on a finished run
+too - the transcript survives in the home volume.
+
+## Lanes: running somewhere other than this checkout
+
+By default the agent edits **this** working tree, which means `./delegate`
+refuses to start on a dirty one and you cannot keep working while it runs. A
+lane removes both constraints:
+
+```bash
+./delegate plan.md --worktree feat-a               # run in a lane, not here
+./delegate plan.md --worktree feat-b --port-offset 100
+                                                   # a second one, at the same time
+./delegate --worktrees                             # lanes and their disk use
+./delegate --rm-worktree feat-a                    # remove a lane and its volumes
+```
+
+A lane is a git worktree of this workspace **plus its own inner-Docker and home
+volumes**, so a run touches nothing this checkout owns. Two agents can work at
+once, each with its own PMM, its own database sandbox and its own branches;
+only the git object store is shared, which is what makes the agent's commits
+visible from here. The dirty-tree check is skipped entirely for lanes.
+
+The submodules get worktrees of their own rather than a `submodule update`,
+which would clone `pmm` and `SEP` from GitHub again. All three repos land on a
+branch named `agent/<lane>`.
+
+What is carried in automatically: `pmm/.env`, `SEP/.env`, and the plan's own
+parent directory, so a plan that links to its siblings by relative path still
+resolves. Anything else untracked needs `--carry <path>`, repeatable.
+
+Two things that are not obvious:
+
+- **The Grafana service-account token is reset when the lane is created.**
+  Grafana mints it and stores it in that instance's database, and a lane runs
+  its own PMM - so a carried token authenticates against nothing. `./om env`
+  mints a fresh one once the lane's PMM is up. Without this the symptom is
+  `401 Auth method is not service account token` on everything SEP does through
+  PMM, which reads like broken code rather than a stale secret.
+- **A lane cannot check out a branch this checkout has open.** Git refuses the
+  same branch in two worktrees. Plans meant to run in a lane should say to
+  commit on the lane's own `agent/<lane>` branches and leave the port to a
+  human, rather than naming a PR branch to check out.
+
+Cost, honestly: a lane is a fresh checkout, so its first run pays `./om setup` -
+a venv, a `pnpm install` - and its own image pull. Reusing a lane costs neither.
+
+After a run ends, its container is gone but the lane's data is not:
+
+```bash
+./delegate --up feat-a          # bring that lane's stack back up, no agent, no timeout
+./delegate --down feat-a        # and back down
+```
+
+Use `--up` rather than `--keep` when you want to look at PMM yourself
+afterwards: `--keep` only lasts until the run's `--timeout`, and the container
+dies with the stack inside it.
+
+**One machine-wide caveat.** PMM and the databases are containers and are
+namespaced per lane, but SEP's backend runs **natively** - so port 8000 is
+shared across every checkout on the machine. Whichever one started SEP last owns
+it, and `./om status` elsewhere will report `(not started by om)`. Stop it in the
+lane before starting it here.
+
 ## What you get back
 
 Every run leaves `.om/agent/<run-id>/` (gitignored):

@@ -3,7 +3,7 @@
 Every proper noun and piece of jargon that shows up in this workspace, in plain words.
 Ordered so that reading top to bottom builds up — not alphabetically.
 
-**As of:** 2026-08-06
+**As of:** 2026-08-24
 
 ---
 
@@ -199,6 +199,49 @@ the two do not contend.
 
 **Percona Toolkit.** Command-line database utilities. They run on the executor host, not
 on your development machine.
+
+---
+
+## OpenManager
+
+**OpenManager (OM).** The thing this workspace is being built for: PMM and SEP together
+answering "what databases do we have, what version are they on, and are they healthy" -
+and later, doing something about it. Not a product directory of its own; it is code in
+both repos, `pmm/managed/services/om/` on one side and the `om_inventory` app on the
+other.
+
+**estate.** Everything OM knows exists: one row per host, one per database service. It is
+*upserted* - a host stays in the table with its last known facts even when a sweep cannot
+reach it, and its freshness columns say how stale that is. The alternative, storing only
+the last sweep's output, cannot answer "what is on this machine" the moment a machine is
+unreachable.
+
+**sweep.** One pass over the estate: ask PMM what exists, work out which host can run a
+payload, run it, write down what came back. Takes tens of seconds, so nothing waits on
+one - reads serve the last sweep's rows, and `POST /runs` returns `202` with a run id.
+
+**probe.** The Python script a sweep runs *on* a database host, over the task executor. It
+collects the facts no metric carries: the command line a mongod was started with, the
+config file it read, and the *installed* binary version as against the *running* one -
+their divergence is the upgraded-but-not-restarted case.
+
+**receipt (`om.inventory_run`).** What one sweep attempted and how it went: which hosts,
+matched how, answered or not, how long, and what failed. Deliberately **outcomes, not
+observations** - what the probe found lives on the estate, which stays current, so
+copying it here would create a second version that goes stale immediately.
+
+**orphaned.** A service OM could not match to any host able to run a payload. It is a
+description, not an error - the alternative, probing some arbitrary host instead, would
+store one machine's answers against another's name.
+
+**unregistered mongod.** A MongoDB process found running on a host that PMM has no
+service for. Arbiters are the ordinary case: they hold no data, so there is nothing for
+SCRAM to authenticate against and `pmm-admin add mongodb` fails for them. They are
+recorded on the *host*, not invented as service rows.
+
+**executor.** The agent-side runner a probe is dispatched to - PMM's own task executor,
+one per host. A host with no usable executor is *seen* by every sweep and *probed* by
+none, which is a fact about onboarding rather than a failure.
 
 ---
 
