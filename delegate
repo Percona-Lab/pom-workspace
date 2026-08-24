@@ -13,11 +13,40 @@
 #   ./delegate plans/my-plan.md --stack --publish --keep
 #                                            ...and leave it up for you to poke at
 #
+# LANES - working somewhere other than this checkout
+#
+#   ./delegate plan.md --worktree feat-a     run in a git worktree, not here
+#   ./delegate plan.md --worktree feat-b --port-offset 100
+#                                            ...a second one, at the same time
+#   ./delegate --worktrees                   list lanes and their disk use
+#   ./delegate --rm-worktree feat-a          remove a lane and its volumes
+#
+# A lane is a git worktree plus its own inner-Docker and home volumes. It leaves
+# this checkout completely alone - so you can keep working here while an agent
+# runs, and run several agents at once. Each lane has its own PMM, its own
+# database sandbox and its own branches; nothing is shared but the git object
+# store, which is what makes the agent's commits visible from here.
+#
+# Costs, honestly: a lane is a fresh checkout, so its first run pays `./om setup`
+# (a venv, pnpm install) and its own image pull. Reusing a lane costs neither.
+#
 #   ./delegate --list                        every run, newest first
 #   ./delegate --logs <run>                  follow (or replay) a run's output
+#   ./delegate --activity <run> [--tail N]   what the agent is doing, tool by tool
 #   ./delegate --attach <run>                shell into a --keep container
 #   ./delegate --stop <run>                  kill a run
 #   ./delegate --shell                       interactive container, same setup
+#
+#   ./delegate --up [lane]                   bring the stack up, no agent, no
+#                                            timeout - for looking at PMM yourself
+#   ./delegate --down [lane]                 take it back down
+#
+# --up is the one to use after a run ends: a run's --keep only lasts until its
+# --timeout, and the container dies with the stack in it. The data survives in the
+# lane's volume, so --up brings it all back without re-pulling anything.
+#
+# Options: --base <ref> to fork a lane from something other than HEAD, --carry
+# <path> (repeatable) to copy an untracked file or directory into a lane.
 #
 # Each run leaves .om/agent/<run-id>/ behind: the plan it was given, the full
 # log, the diff it produced, and the report it wrote about its own work.
@@ -70,9 +99,13 @@ PUBLISH=0          # map the stack's ports onto the host
 KEEP=0             # leave the container alive when the agent finishes
 DETACH=0           # do not follow the log
 BRANCH=""          # create and switch to this branch first
+WT_NAME=""         # lane: run in this git worktree instead of this checkout
+BASE=""            # ref a new lane forks from (default HEAD)
+CARRY=()           # untracked paths to copy into a lane
+PORT_OFFSET=0      # added to each published port, so lanes do not collide
 MODEL=""
 TIMEOUT_MIN=180
-JSON=0
+JSON=1          # stream-json; --text for the quiet, buffered form
 ALLOW_DIRTY=0
 REBUILD=0
 
@@ -82,9 +115,19 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --list)    ACTION=list; shift ;;
     --logs)    ACTION=logs;   RUN_ARG="${2:-}"; shift 2 ;;
+    --activity) ACTION=activity; RUN_ARG="${2:-}"; shift 2 ;;
+    --tail)    TAIL="${2:?--tail needs a count}"; shift 2 ;;
     --attach)  ACTION=attach; RUN_ARG="${2:-}"; shift 2 ;;
     --stop)    ACTION=stop;   RUN_ARG="${2:-}"; shift 2 ;;
     --shell)   ACTION=shell; shift ;;
+    --worktrees) ACTION=worktrees; shift ;;
+    --up)      ACTION=up;   RUN_ARG="${2:-}"; [[ "${2:-}" == -* ]] && RUN_ARG=""; [[ -n "$RUN_ARG" ]] && shift; shift ;;
+    --down)    ACTION=down; RUN_ARG="${2:-}"; [[ "${2:-}" == -* ]] && RUN_ARG=""; [[ -n "$RUN_ARG" ]] && shift; shift ;;
+    --rm-worktree) ACTION=rm_worktree; RUN_ARG="${2:?--rm-worktree needs a name}"; shift 2 ;;
+    --worktree) WT_NAME="${2:?--worktree needs a name, e.g. --worktree feat-a}"; shift 2 ;;
+    --base)    BASE="${2:?--base needs a ref}"; shift 2 ;;
+    --carry)   CARRY+=("${2:?--carry needs a path}"); shift 2 ;;
+    --port-offset) PORT_OFFSET="${2:?--port-offset needs a number}"; shift 2 ;;
     --stack)   STACK=1; shift ;;
     --clusters) CLUSTERS="${2:?--clusters needs a list}"; STACK=1; shift 2 ;;
     --publish) PUBLISH=1; shift ;;
@@ -94,6 +137,7 @@ while [[ $# -gt 0 ]]; do
     --model)   MODEL="${2:?--model needs an id}"; shift 2 ;;
     --timeout) TIMEOUT_MIN="${2:?--timeout needs minutes}"; shift 2 ;;
     --json)    JSON=1; shift ;;
+    --text)    JSON=0; shift ;;
     --dirty)   ALLOW_DIRTY=1; shift ;;
     --rebuild) REBUILD=1; shift ;;
     -h|--help) usage 0 ;;
@@ -125,6 +169,89 @@ resolve_run() {
 }
 
 # ---------------------------------------------------------------------------
+# Lanes
+#
+# A lane is a git worktree of this workspace plus the two volumes that back a
+# container running in it. Everything a run touches is per-lane, so two lanes can
+# work at once and neither can disturb this checkout.
+#
+# Lanes live outside the workspace, as siblings, because a worktree inside .om/
+# would be inside the tree it is a worktree of - which confuses every tool that
+# walks upwards looking for a repository root.
+# ---------------------------------------------------------------------------
+WT_ROOT="${OM_AGENT_WORKTREE_ROOT:-$(dirname "$ROOT")/$(basename "$ROOT")-agents}"
+
+lane_dir()  { printf '%s/%s\n' "$WT_ROOT" "$1"; }
+# Unsuffixed for this checkout, suffixed per lane. The asymmetry is deliberate:
+# suffixing the default too would orphan the volumes - and the tens of GB of
+# images in them - that every run before lanes existed created.
+lane_vol()  {
+  if [[ -z "${LANE:-}" ]]; then printf 'openmanager-agent-%s\n' "$1"
+  else printf 'openmanager-agent-%s-%s\n' "$1" "$LANE"; fi
+}
+
+# Create the worktree if it is not there, and make it usable by ./om.
+#
+# The submodules get worktrees of their own rather than a `submodule update`,
+# which would clone pmm and SEP from GitHub again - minutes of network and a
+# second copy of every object. A worktree shares the object store and only
+# materialises the files.
+prepare_lane() {
+  local name="$1" dir base branch
+  dir="$(lane_dir "$name")"
+  base="${BASE:-HEAD}"
+  branch="agent/$name"
+
+  if [[ -d "$dir" ]]; then
+    info "lane '$name' at $dir (reusing)"
+    return 0
+  fi
+
+  info "creating lane '$name' at $dir"
+  mkdir -p "$WT_ROOT"
+  git -C "$ROOT" worktree add -B "$branch" "$dir" "$base" >/dev/null \
+    || die "could not create the worktree"
+  ok "superproject: $branch from $(git -C "$ROOT" rev-parse --short "$base")"
+
+  # Submodules. Each gets its own branch because git refuses to check the same
+  # branch out in two worktrees, and this checkout already holds theirs.
+  local sub sub_head
+  for sub in pmm SEP; do
+    [[ -d "$ROOT/$sub/.git" ]] || { warn "$sub is not a git repo here - skipped"; continue; }
+    sub_head="$(git -C "$ROOT/$sub" rev-parse HEAD)"
+    rmdir "$dir/$sub" 2>/dev/null || true
+    git -C "$ROOT/$sub" worktree add -B "$branch" "$dir/$sub" "$sub_head" >/dev/null \
+      || die "could not create the $sub worktree"
+    ok "$sub: $branch from $(git -C "$ROOT/$sub" rev-parse --short HEAD) ($(git -C "$ROOT/$sub" branch --show-current) here)"
+  done
+
+  # Untracked files ./om cannot regenerate. The .env files hold the generated
+  # passwords and the PMM API key; without them the lane bootstraps a second set,
+  # which works but means a second PMM identity.
+  local f
+  for f in pmm/.env SEP/.env "${CARRY[@]}"; do
+    [[ -e "$ROOT/$f" ]] || continue
+    mkdir -p "$(dirname "$dir/$f")"
+    cp -a "$ROOT/$f" "$dir/$f"
+    dim "carried $f"
+  done
+
+  # The plan usually lives in an untracked directory and references its siblings
+  # by relative path, so carry the whole directory rather than just the file.
+  local plan_dir
+  plan_dir="$(cd "$(dirname "$PLAN")/.." 2>/dev/null && pwd || true)"
+  if [[ -n "$plan_dir" && "$plan_dir" == "$ROOT"/* ]]; then
+    local rel="${plan_dir#$ROOT/}"
+    if [[ ! -e "$dir/$rel" ]]; then
+      cp -a "$ROOT/$rel" "$dir/$rel"
+      dim "carried $rel/ (the plan's directory, for its relative links)"
+    fi
+  fi
+
+  ok "lane ready - its first run pays ./om setup, later runs do not"
+}
+
+# ---------------------------------------------------------------------------
 # Sub-commands that are not a run
 # ---------------------------------------------------------------------------
 case "$ACTION" in
@@ -149,12 +276,110 @@ case "$ACTION" in
       exec docker logs -f "om-agent-$run"
     fi
     exec less -R "$AGENT_DIR/$run/log.txt" ;;
+  activity)
+    # What the agent is doing, right now, tool by tool. Needed because
+    # `claude --print` emits nothing until it finishes: on a multi-hour run its
+    # own stdout is not a progress log, so this reads the session transcript it
+    # writes as it goes. Read-only; it cannot disturb the run.
+    run="$(resolve_run "${RUN_ARG:-}")"; [[ -n "$run" ]] || die "no such run"
+    script=".devcontainer/agent-activity.py"
+    # -t only when there is a terminal to attach: docker refuses it otherwise,
+    # which would make this unusable from a script or another agent's shell.
+    tty_flag=(); [[ -t 0 ]] && tty_flag=(-t)
+    follow=(); [[ -t 1 ]] || follow=(--no-follow)
+    if docker inspect -f '{{.State.Running}}' "om-agent-$run" 2>/dev/null | grep -q true; then
+      exec docker exec "${tty_flag[@]}" -u vscode -w "$ROOT" "om-agent-$run" \
+        python3 "$script" ${TAIL:+--tail "$TAIL"} "${follow[@]}"
+    fi
+    # Finished run: the transcript is still in the home volume.
+    exec docker run --rm "${tty_flag[@]}" -e OM_START_DOCKER=0 -e OM_CHOWN_WORKSPACE=0 \
+      -v openmanager-agent-home:/home/vscode -v "$ROOT:$ROOT" -w "$ROOT" \
+      -e "OM_UID=$(id -u)" -e "OM_GID=$(id -g)" \
+      "$IMAGE" python3 "$script" --no-follow ${TAIL:+--tail "$TAIL"} ;;
   attach)
     run="$(resolve_run "${RUN_ARG:-}")"; [[ -n "$run" ]] || die "no such run"
     exec docker exec -it -u vscode -w "$ROOT" "om-agent-$run" bash ;;
   stop)
     run="$(resolve_run "${RUN_ARG:-}")"; [[ -n "$run" ]] || die "no such run"
     docker rm -f "om-agent-$run" >/dev/null && ok "stopped om-agent-$run"
+    exit 0 ;;
+  worktrees)
+    [[ -d "$WT_ROOT" ]] || { echo "no lanes yet ($WT_ROOT does not exist)"; exit 0; }
+    printf '%-16s %-30s %-8s %s\n' LANE BRANCH SIZE VOLUMES
+    for d in "$WT_ROOT"/*; do
+      [[ -d "$d" ]] || continue
+      n="$(basename "$d")"
+      vols="$(docker volume ls --format '{{.Name}}' | grep -c -- "-$n\$" || true)"
+      printf '%-16s %-30s %-8s %s\n' "$n" \
+        "$(git -C "$d" branch --show-current 2>/dev/null || echo '?')" \
+        "$(du -sh "$d" 2>/dev/null | cut -f1)" "$vols"
+    done
+    exit 0 ;;
+  rm_worktree)
+    n="$RUN_ARG"; d="$(lane_dir "$n")"
+    [[ -d "$d" ]] || die "no lane '$n' at $d"
+    if docker ps --format '{{.Names}}' | grep -q "^om-agent-" && \
+       docker ps --filter "volume=openmanager-agent-dind-$n" -q | grep -q .; then
+      die "a container is still using lane '$n' - ./delegate --stop <run> first"
+    fi
+    warn "removing lane '$n'"
+    for sub in pmm SEP; do
+      [[ -d "$d/$sub" ]] && git -C "$ROOT/$sub" worktree remove --force "$d/$sub" 2>/dev/null \
+        && ok "removed the $sub worktree" || true
+    done
+    git -C "$ROOT" worktree remove --force "$d" 2>/dev/null && ok "removed $d" \
+      || { rm -rf "$d"; warn "worktree metadata was stale; removed the directory"; }
+    git -C "$ROOT" worktree prune
+    docker volume rm "openmanager-agent-dind-$n" "openmanager-agent-home-$n" >/dev/null 2>&1 \
+      && ok "removed its volumes" || true
+    dim "the agent/$n branches are kept - delete them yourself if you are done with them"
+    exit 0 ;;
+  up|down)
+    # LANE has to be set before lane_vol is called; --up/--down take the lane by
+    # name rather than reusing --worktree, so `--up` alone means this checkout.
+    LANE="${RUN_ARG:-}"
+    if [[ -n "$LANE" ]]; then WORKDIR="$(lane_dir "$LANE")"; else WORKDIR="$ROOT"; fi
+    name="om-stack-${LANE:-main}"
+    if [[ "$ACTION" == down ]]; then
+      docker rm -f "$name" >/dev/null 2>&1 && ok "stopped $name" || dim "$name was not running"
+      exit 0
+    fi
+    [[ -d "$WORKDIR" ]] || die "no such tree: $WORKDIR"
+    ensure_image
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    up_args=(
+      -d --name "$name" --privileged --init --shm-size=2g
+      -v "$WORKDIR:$WORKDIR" -w "$WORKDIR"
+      -v "$(lane_vol dind):/var/lib/docker"
+      -v "$(lane_vol home):/home/vscode"
+      -e "OM_WORKSPACE=$WORKDIR" -e OM_CHOWN_WORKSPACE=0
+      -e "OM_UID=$(id -u)" -e "OM_GID=$(id -g)"
+    )
+    if [[ -n "$LANE" ]]; then
+      up_args+=(-v "$ROOT/.git:$ROOT/.git")
+      for sub in pmm SEP; do
+        [[ -d "$ROOT/$sub/.git" ]] && up_args+=(-v "$ROOT/$sub/.git:$ROOT/$sub/.git")
+      done
+    fi
+    for prt in 8443 8000 5174 5173; do
+      hp=$(( prt + PORT_OFFSET ))
+      if (command -v ss >/dev/null && ss -ltn 2>/dev/null | grep -q ":$hp "); then
+        warn "host port $hp is busy - not publishing $prt"
+      else up_args+=(-p "$hp:$prt"); fi
+    done
+    info "bringing the stack up in ${LANE:-this checkout} (no agent, no timeout)"
+    dim "tree $WORKDIR"
+    docker run "${up_args[@]}" "$IMAGE" bash -lc "
+      set -uo pipefail
+      ./om setup 2>&1 | tail -5
+      ./om start pmm sep ${CLUSTERS:-} 2>&1 | tail -20
+      ./om status 2>&1
+      echo '### the stack is up; this container stays until ./delegate --down'
+      sleep infinity" >/dev/null || die "could not start $name"
+    ok "started $name"
+    dim "watch it:   docker logs -f $name"
+    dim "shell in:   docker exec -it -u vscode -w $WORKDIR $name bash"
+    dim "take down:  ./delegate --down ${LANE:-}"
     exit 0 ;;
   shell)
     ensure_image
@@ -179,27 +404,41 @@ esac
 [[ -f "$PLAN" ]] || die "no such plan: $PLAN"
 [[ -f "$BRIEF" ]] || die "missing $BRIEF"
 
-# The agent edits this tree, so the run has to start from a state you can get
-# back to. The reason is concrete: the undo this prints at the end is `git reset
-# --hard <start-ref>`, and running that with uncommitted work in the tree
-# destroys it.
+# Which tree the agent works in.
+LANE=""
+WORKDIR="$ROOT"
+if [[ -n "$WT_NAME" ]]; then
+  LANE="$WT_NAME"
+  prepare_lane "$WT_NAME"
+  WORKDIR="$(lane_dir "$WT_NAME")"
+fi
+
+# The agent edits its tree, so the run has to start from a state you can get back
+# to. The reason is concrete: the undo this prints at the end is `git reset --hard
+# <start-ref>`, and running that with uncommitted work in the tree destroys it.
+#
+# In a lane there is nothing to protect: the worktree was just created from a
+# committed ref, and this checkout is not mounted at all. That is the point of a
+# lane - you can keep working here, dirty tree and all, while an agent runs.
 #
 # Submodule pointers are excluded. They are near-permanently ahead in this
 # workspace - that is what a superproject of two feature branches looks like -
 # and the runner records each submodule's own diff separately anyway.
 DIRTY_BACKUP=""
-dirty="$(git -C "$ROOT" status --porcelain --untracked-files=no --ignore-submodules=all)"
+dirty=""
+[[ -z "$LANE" ]] && dirty="$(git -C "$WORKDIR" status --porcelain --untracked-files=no --ignore-submodules=all)"
 if [[ -n "$dirty" ]]; then
   if [[ "$ALLOW_DIRTY" != 1 ]]; then
     warn "the working tree has uncommitted changes:"
     printf '%s\n' "$dirty" | head -10 | sed 's/^/      /'
+    dim "or run somewhere else entirely:  --worktree <name>"
     die "commit or stash first, or pass --dirty to accept it"
   fi
   # --dirty was asked for. Take a recoverable snapshot of the tracked changes so
   # the undo command is not a one-way door. `stash create` builds the commit
   # objects without touching the working tree, so the agent still sees the
   # changes exactly as they are. Untracked files are not in it.
-  DIRTY_BACKUP="$(git -C "$ROOT" stash create 2>/dev/null || true)"
+  DIRTY_BACKUP="$(git -C "$WORKDIR" stash create 2>/dev/null || true)"
   warn "starting dirty - the undo command will discard these changes"
   [[ -n "$DIRTY_BACKUP" ]] && dim "recover them with: git stash apply $DIRTY_BACKUP"
 fi
@@ -218,6 +457,20 @@ if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}" ]]; then
   echo
 fi
 
+# Who the agent commits as. Resolved here, on the host, because the container's
+# home is fresh every run: `git config user.name` inside it finds nothing and
+# falls back to a placeholder, which is how a branch ends up authored by
+# "openmanager-agent <agent@localhost>" and has to be rewritten by hand.
+GIT_NAME="$(git -C "$ROOT" config user.name || true)"
+GIT_EMAIL="$(git -C "$ROOT" config user.email || true)"
+if [[ -z "$GIT_NAME" || -z "$GIT_EMAIL" ]]; then
+  warn "git user.name/user.email are not set here, so the agent's commits would"
+  warn "be authored by a placeholder. Set them first:"
+  dim "  git config --global user.name 'Your Name'"
+  dim "  git config --global user.email 'you@example.com'"
+  die "refusing to produce commits nobody can claim"
+fi
+
 ensure_image
 
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
@@ -225,7 +478,9 @@ RUN_DIR="$AGENT_DIR/$RUN_ID"
 CONTAINER="om-agent-$RUN_ID"
 mkdir -p "$RUN_DIR"
 
-START_REF="$(git -C "$ROOT" rev-parse HEAD)"
+START_REF="$(git -C "$WORKDIR" rev-parse HEAD)"
+printf '%s\n' "${LANE:-main}" > "$RUN_DIR/lane"
+printf '%s\n' "$WORKDIR" > "$RUN_DIR/workdir"
 cp "$PLAN" "$RUN_DIR/plan.md"
 printf '%s\n' "$PLAN" > "$RUN_DIR/plan-source"
 printf '%s\n' "$START_REF" > "$RUN_DIR/start-ref"
@@ -246,10 +501,13 @@ printf '%s\n' "$START_REF" > "$RUN_DIR/start-ref"
 # still a child when the shell exits, and the last lines of a run - which is
 # where the interesting part usually is - can be lost. A pipeline cannot lose
 # them, because the shell waits for tee.
-cat > "$RUN_DIR/run.sh" <<RUNNER
+cat > "$RUN_DIR/run.sh" <<'RUNNER'
 #!/usr/bin/env bash
-"$RUN_DIR/body.sh" 2>&1 | tee -a "$RUN_DIR/log.txt"
-exit \${PIPESTATUS[0]}
+# /om-run is this run's directory, bind-mounted. It is addressed by that fixed
+# path rather than its host path because in a lane the run directory lives under
+# the main checkout, which the container deliberately cannot see.
+/om-run/body.sh 2>&1 | tee -a /om-run/log.txt
+exit ${PIPESTATUS[0]}
 RUNNER
 chmod +x "$RUN_DIR/run.sh"
 
@@ -257,20 +515,24 @@ cat > "$RUN_DIR/body.sh" <<RUNNER
 #!/usr/bin/env bash
 set -uo pipefail
 
-RUN_DIR="$RUN_DIR"
-export OM_AGENT_REPORT="$RUN_DIR/report.md"
+export OM_AGENT_REPORT=/om-run/report.md
 export OM_AGENT_RUN_ID="$RUN_ID"
 
-cd "$ROOT"
+cd "$WORKDIR"
 # Hard stop if this fails: it exits 78 when there is no way to authenticate, and
 # carrying on from there just produces a confusing "Not logged in" from claude.
 # The exit file is written here too, so --list reports a code rather than a "?".
-seed-claude.sh || { rc=\$?; echo "\$rc" > "$RUN_DIR/exit"; exit \$rc; }
-git config --global --add safe.directory "$ROOT" 2>/dev/null || true
-git config --global --add safe.directory "$ROOT/pmm" 2>/dev/null || true
-git config --global --add safe.directory "$ROOT/SEP" 2>/dev/null || true
-git config --global user.name  "\$(git config user.name  || echo openmanager-agent)"
-git config --global user.email "\$(git config user.email || echo agent@localhost)"
+seed-claude.sh || { rc=\$?; echo "\$rc" > /om-run/exit; exit \$rc; }
+git config --global --add safe.directory "$WORKDIR" 2>/dev/null || true
+git config --global --add safe.directory "$WORKDIR/pmm" 2>/dev/null || true
+git config --global --add safe.directory "$WORKDIR/SEP" 2>/dev/null || true
+echo "==> tree: $WORKDIR  (lane ${LANE:-main})"
+git -C "$WORKDIR" branch --show-current | sed 's/^/    superproject: /'
+for _s in pmm SEP; do
+  echo "    \$_s: \$(git -C "$WORKDIR/\$_s" branch --show-current 2>/dev/null)"
+done
+git config --global user.name  "$GIT_NAME"
+git config --global user.email "$GIT_EMAIL"
 RUNNER
 
 if [[ -n "$BRANCH" ]]; then
@@ -299,21 +561,21 @@ fi
 
 cat >> "$RUN_DIR/body.sh" <<RUNNER
 echo "==> handing the plan to the agent"
-claude ${claude_args[*]} "\$(cat '$RUN_DIR/prompt.md')"
+claude ${claude_args[*]} "\$(cat /om-run/prompt.md)"
 agent_exit=\$?
 echo "==> agent finished with exit \$agent_exit"
 
 # The diff, for review. Recorded here rather than on the host because the agent
 # may have committed, in which case the interesting comparison is against the
 # commit the run started from.
-git -C "$ROOT" --no-pager log --oneline "$START_REF"..HEAD > "$RUN_DIR/commits.txt" 2>/dev/null || true
-git -C "$ROOT" diff "$START_REF" > "$RUN_DIR/diff.patch" 2>/dev/null || true
+git -C "$WORKDIR" --no-pager log --oneline "$START_REF"..HEAD > /om-run/commits.txt 2>/dev/null || true
+git -C "$WORKDIR" diff "$START_REF" > /om-run/diff.patch 2>/dev/null || true
 for sub in pmm SEP; do
-  git -C "$ROOT/\$sub" --no-pager log --oneline -20 > "$RUN_DIR/commits-\$sub.txt" 2>/dev/null || true
-  git -C "$ROOT/\$sub" diff HEAD > "$RUN_DIR/diff-\$sub.patch" 2>/dev/null || true
+  git -C "$WORKDIR/\$sub" --no-pager log --oneline -20 > /om-run/commits-\$sub.txt 2>/dev/null || true
+  git -C "$WORKDIR/\$sub" diff HEAD > /om-run/diff-\$sub.patch 2>/dev/null || true
 done
 
-echo "\$agent_exit" > "$RUN_DIR/exit"
+echo "\$agent_exit" > /om-run/exit
 RUNNER
 
 if [[ "$KEEP" == 1 ]]; then
@@ -334,21 +596,44 @@ args=(
   -d --name "$CONTAINER"
   --privileged --init --shm-size=2g
   --stop-timeout 30
-  # Mounted at its own path so SEP/venv and the node_modules trees, which bake in
-  # absolute paths, work identically inside and outside the container.
-  -v "$ROOT:$ROOT" -w "$ROOT"
-  # Inner Docker's storage, kept between runs: without it every run re-pulls PMM.
-  -v openmanager-agent-dind:/var/lib/docker
-  # The agent's whole home, kept between runs. Not just ~/.claude: the trust
-  # flag and the account identity live in ~/.claude.json, one level up, and a
-  # volume that covers only ~/.claude leaves Claude Code reporting a missing
-  # config file next to a backup of it every single run.
-  -v openmanager-agent-home:/home/vscode
-  -e "OM_WORKSPACE=$ROOT"
-  # Never chown: this is the caller's real checkout. The uid is matched instead.
+  # The tree the agent works in, mounted at its own path so SEP/venv and the
+  # node_modules trees, which bake in absolute paths, work identically inside and
+  # outside the container.
+  -v "$WORKDIR:$WORKDIR" -w "$WORKDIR"
+  # This run's directory, at a fixed path. It lives under the main checkout, so
+  # in a lane it has to be mounted separately - the container never sees the rest
+  # of that checkout.
+  -v "$RUN_DIR:/om-run"
+  # Inner Docker's storage, per lane: two daemons cannot share one /var/lib/docker,
+  # and per-lane rather than per-run means a second run in the same lane reuses
+  # the images instead of pulling PMM again.
+  -v "$(lane_vol dind):/var/lib/docker"
+  # The agent's whole home. Not just ~/.claude: the trust flag and the account
+  # identity live in ~/.claude.json, one level up, and a volume covering only
+  # ~/.claude leaves Claude Code reporting a missing config file next to a backup
+  # of it every single run.
+  -v "$(lane_vol home):/home/vscode"
+  -e "OM_WORKSPACE=$WORKDIR"
+  # Both the lane and this checkout: Claude Code resolves a worktree's project
+  # identity through its git common dir, which points back here, so trusting only
+  # the lane leaves the session refusing to start.
+  -e "OM_TRUST_PATHS=$WORKDIR:$ROOT"
+  # Never chown: this is a real checkout of the caller's. The uid is matched instead.
   -e OM_CHOWN_WORKSPACE=0
   -e "OM_UID=$(id -u)" -e "OM_GID=$(id -g)"
 )
+
+# A lane's worktrees keep their git metadata in this checkout - a worktree's .git
+# is a file pointing at <main>/.git/worktrees/<name>. Mount those gitdirs, and
+# nothing else, so git works in the lane while the rest of this checkout stays
+# invisible. It is also what makes the agent's commits land in the shared object
+# store, and so visible from here.
+if [[ -n "$LANE" ]]; then
+  args+=(-v "$ROOT/.git:$ROOT/.git")
+  for sub in pmm SEP; do
+    [[ -d "$ROOT/$sub/.git" ]] && args+=(-v "$ROOT/$sub/.git:$ROOT/$sub/.git")
+  done
+fi
 
 # Both halves of your Claude config, read-only. ~/.claude has the credentials
 # and the global CLAUDE.md; ~/.claude.json has the account identity and the
@@ -362,11 +647,15 @@ for v in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL \
 done
 
 if [[ "$PUBLISH" == 1 ]]; then
+  # --port-offset is how two lanes publish at once: lane A on 8443, lane B on
+  # 8543. The container-side port never changes, so ./om status inside is right
+  # either way; only the host side moves.
   for p in 8443 8000 5174 5173; do
-    if (command -v ss >/dev/null && ss -ltn 2>/dev/null | grep -q ":$p ") ; then
-      warn "port $p is busy on this machine - not publishing it"
+    hp=$(( p + PORT_OFFSET ))
+    if (command -v ss >/dev/null && ss -ltn 2>/dev/null | grep -q ":$hp ") ; then
+      warn "host port $hp is busy - not publishing $p"
     else
-      args+=(-p "$p:$p")
+      args+=(-p "$hp:$p")
     fi
   done
 fi
@@ -374,12 +663,14 @@ fi
 info "run $RUN_ID"
 dim "plan     $PLAN"
 dim "image    $IMAGE"
+dim "tree     $WORKDIR${LANE:+   (lane '$LANE')}"
 dim "from     $START_REF"
+dim "commits  $GIT_NAME <$GIT_EMAIL>"
 dim "stack    $([[ "$STACK" == 1 ]] && echo "pmm sep ${CLUSTERS}" || echo "not started")"
 dim "timeout  ${TIMEOUT_MIN}m"
 
 docker run "${args[@]}" "$IMAGE" \
-  timeout "${TIMEOUT_MIN}m" "$RUN_DIR/run.sh" >/dev/null \
+  timeout "${TIMEOUT_MIN}m" /om-run/run.sh >/dev/null \
   || die "could not start $CONTAINER"
 
 ok "started $CONTAINER"
@@ -409,6 +700,12 @@ info "review"
 dim "report   $RUN_DIR/report.md"
 dim "log      $RUN_DIR/log.txt"
 dim "diff     $RUN_DIR/diff.patch"
-dim "undo     git reset --hard $START_REF"
+if [[ -n "$LANE" ]]; then
+  dim "tree     $WORKDIR"
+  dim "branches agent/$LANE in the superproject and both submodules"
+  dim "remove   ./delegate --rm-worktree $LANE"
+else
+  dim "undo     git reset --hard $START_REF"
+fi
 [[ -n "$DIRTY_BACKUP" ]] && dim "         (then: git stash apply $DIRTY_BACKUP)"
 [[ "$KEEP" == 1 ]] && dim "attach   ./delegate --attach $RUN_ID"

@@ -40,9 +40,11 @@ CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
 CLAUDE_CONFIG="${CLAUDE_CONFIG:-$HOME/.claude.json}"
 HOST_CLAUDE="${HOST_CLAUDE:-/host-claude}"
 HOST_CLAUDE_CONFIG="${HOST_CLAUDE_CONFIG:-/host-claude.json}"
-# The directory to mark trusted. The workspace is mounted at its own host path,
-# so this is that path.
-WORKSPACE="${OM_WORKSPACE:-$PWD}"
+# Directories to mark trusted, colon-separated. Usually one, but a git worktree
+# needs two: Claude Code resolves a project's identity through the git common
+# dir, which for a worktree points back at the main checkout, so trusting only
+# the worktree leaves the session refusing to start.
+TRUST_PATHS="${OM_TRUST_PATHS:-${OM_WORKSPACE:-$PWD}}"
 
 say()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
@@ -70,10 +72,10 @@ fi
 # curated subset of the host's file rather than copied wholesale: that file
 # carries the history of every project you have ever opened, and none of it
 # belongs in here.
-python3 - "$CLAUDE_CONFIG" "$WORKSPACE" "$HOST_CLAUDE_CONFIG" <<'PY'
+python3 - "$CLAUDE_CONFIG" "$TRUST_PATHS" "$HOST_CLAUDE_CONFIG" <<'PY'
 import json, pathlib, sys
 
-out, workspace, host = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
+out, trust, host = pathlib.Path(sys.argv[1]), sys.argv[2].split(":"), pathlib.Path(sys.argv[3])
 
 cfg = {}
 if out.exists():
@@ -94,9 +96,11 @@ if host.exists():
 
 # Without this the run dies on "this workspace has not been trusted", which
 # an unattended session has no way to answer.
-cfg.setdefault("projects", {}).setdefault(workspace, {})["hasTrustDialogAccepted"] = True
+projects = cfg.setdefault("projects", {})
+for d in filter(None, trust):
+    projects.setdefault(d, {})["hasTrustDialogAccepted"] = True
 out.write_text(json.dumps(cfg, indent=2) + "\n")
-print(f"trusted {workspace}")
+print("trusted " + ", ".join(filter(None, trust)))
 PY
 
 # User-level settings, inside the container only. Deliberately not the repo's
