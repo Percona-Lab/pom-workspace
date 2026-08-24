@@ -1,8 +1,8 @@
 [submodule "pmm"]
 	path = pmm
 	url = git@github.com:percona/pmm.git
-	branch = PMM-15326-pom-inventory
+	branch = PMM-15326-om-integration
 [submodule "SEP"]
 	path = SEP
 	url = git@github.com:percona/SEP.git
-	branch = PMM-15326-pom-inventory
+	branch = PMM-15326-om-integration
