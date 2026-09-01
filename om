@@ -482,22 +482,35 @@ node_ok() {
 # Running the app once with --start-celery lets the scheduler create them; after
 # that a plain backend start works. Verified both ways on 2026-08-03.
 #
-# Returns 0 when the schema is present (or is not SQLite, i.e. managed elsewhere).
+# Checks the actual beat_dburi target (via SQLAlchemy's own dialect-agnostic
+# table reflection) rather than special-casing SQLite. This workspace's harness
+# overlay points CELERY.BEAT_DBURI at PMM's embedded Postgres, and the earlier
+# SQLite-only check unconditionally returned "ready" for it - true on a
+# long-lived database, but false right after `./om reset all`: SEP-1860's
+# startup-time schedule seeding then races the beat scheduler's own table
+# creation and uvicorn dies on `UndefinedTableError: celery_intervalschedule`.
+# Found and fixed 2026-09-01 after that race hit a genuinely fresh Postgres
+# database twice in a row.
+#
+# Returns 0 when the schema is present.
 beat_schema_ready() {
   [[ -x "$SEP_DIR/venv/bin/python" ]] || return 1
   ( cd "$SEP_DIR" && "$SEP_DIR/venv/bin/python" - <<'PY' >/dev/null 2>&1
-import sqlite3, sys
+import sys
+from sqlalchemy import create_engine, inspect
 from app.core.config import settings
 uri = str(settings.CELERY.beat_dburi or "")
-if not uri.startswith("sqlite"):
-    sys.exit(0)
-path = uri.split("sqlite:///")[-1]
+if not uri:
+    sys.exit(1)
 try:
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    names = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
+    engine = create_engine(uri)
+    try:
+        ready = inspect(engine).has_table("celery_intervalschedule")
+    finally:
+        engine.dispose()
 except Exception:
     sys.exit(1)
-sys.exit(0 if "celery_intervalschedule" in names else 1)
+sys.exit(0 if ready else 1)
 PY
   )
 }
