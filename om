@@ -2713,9 +2713,10 @@ if not runs:
     sys.exit("  no sweeps recorded yet — trigger one with ./om inventory run")
 for r in runs:
     c = r["counts"]
-    print("  %s  %-8s resolved=%-3d answered=%-3d orphaned=%-3d facts=%d" % (
+    print("  %s  %-8s services resolved=%-3d answered=%-3d orphaned=%-3d  hosts answered=%d/%d" % (
         r["started_at"][11:19], r["status"], c["services_resolved"],
-        c["services_answered"], c["services_orphaned"], r["facts_collected"]))
+        c["services_answered"], c["services_orphaned"],
+        c["hosts_answered"], c["hosts_total"]))
     if r.get("error"):
         print("      ! %s" % r["error"][:100])
 '
