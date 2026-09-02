@@ -115,7 +115,7 @@ register() {
 }
 
 # pmm-agent setup fails outright if the server is not answering yet, and
-# supervisord would then flap this program. Wait instead. The checks below need
+# systemd would then crash-loop this unit. Wait instead. The checks below need
 # the API too, and a missing answer there would read as "unknown agent".
 until curl -ksSf -o /dev/null "https://${PMM_SERVER}/v1/server/readyz" 2>/dev/null; do
     log "waiting for https://${PMM_SERVER} ..."
@@ -150,22 +150,22 @@ fi
 
 # Publish readiness again, and on a database node re-assert the MongoDB service.
 #
-# Both scripts are supervisord one-shots that ran when the container started, so
-# on a plain restart this is redundant. It is not redundant after `supervisorctl
-# restart pmm-agent`: that runs this program alone, and the marker `./om start`
-# waits on - plus, on a re-registration, the service that went with the replaced
-# node - would otherwise never come back. Observed exactly that way: restarting
-# this program to recover a Nomad client left a monitored database unmonitored,
-# and the only thing that noticed was OM reporting a mongod it had no service for.
+# Both units are systemd one-shots that ran when the container started, so on a
+# plain restart this is redundant. It is not redundant after `systemctl restart
+# pmm-agent`: that runs this unit alone, and the marker `./om start` waits on -
+# plus, on a re-registration, the service that went with the replaced node -
+# would otherwise never come back. Observed exactly that way: restarting this
+# unit to recover a Nomad client left a monitored database unmonitored, and the
+# only thing that noticed was OM reporting a mongod it had no service for.
 #
-# Both names are tried because the database image supervises `register` and the
-# pmm-client-only image supervises `register-client`; the absent one simply fails
-# and is ignored. Backgrounded because both scripts wait for *this* agent to
-# connect, which cannot happen until the exec below replaces this shell.
+# Both names are tried because the database image ships register.service and the
+# pmm-client-only image ships register-client.service; the absent one simply
+# fails and is ignored. Backgrounded because both scripts wait for *this* agent
+# to connect, which cannot happen until the exec below replaces this shell.
 (
     sleep 5
-    for program in register register-client; do
-        supervisorctl start "$program" >/dev/null 2>&1 || true
+    for unit in register.service register-client.service; do
+        systemctl start "$unit" >/dev/null 2>&1 || true
     done
 ) &
 

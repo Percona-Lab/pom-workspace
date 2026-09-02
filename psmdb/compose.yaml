@@ -17,8 +17,9 @@
 # and pmm-agent >= 3.2.0 brings a Nomad *client* with it. That is the whole
 # point: SEP dispatches onto the host that owns the data, so a payload can
 # `apt-get install percona-server-mongodb-server=<newer>` and
-# `supervisorctl restart mongo` in place. A sidecar pmm-client — which is what
-# the Terraform sandbox deploys — could never do that.
+# `systemctl restart mongod` in place, the same as a real host. A sidecar
+# pmm-client - which is what the Terraform sandbox deploys - could never do
+# that.
 #
 # Run ./bootstrap.sh once first: it generates the shared keyfile.
 
@@ -72,11 +73,18 @@ x-node: &node
   # have to be relaxed together. This is still narrower than the full
   # `privileged: true` the workspace's om-nomad uses, but it is emphatically a
   # local-sandbox setting — a container that can mount can escape.
+  #
+  # The same relaxation happens to be what systemd (PID 1 in this image) needs
+  # too: it manages its own cgroup subtree the same way Nomad does, and the
+  # tmpfs mounts below are the standard systemd-in-Docker recipe for /run.
   cap_add:
     - SYS_ADMIN
   security_opt:
     - apparmor:unconfined
     - seccomp:unconfined
+  tmpfs:
+    - /run
+    - /run/lock
   volumes:
     - *keyfile-mount
     - *cgroup-mount
@@ -113,6 +121,9 @@ x-client-node: &client-node
   security_opt:
     - apparmor:unconfined
     - seccomp:unconfined
+  tmpfs:
+    - /run
+    - /run/lock
   volumes:
     - *cgroup-mount
     - *agent-state-mount

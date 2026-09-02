@@ -1,0 +1,22 @@
+# The one program every sandbox node runs, database or not. See
+# scripts/run-pmm-agent.sh for what it does; this unit only owns process
+# lifecycle, matching supervisord's old pmm-agent.conf.
+[Unit]
+Description=pmm-agent (brings a Nomad client with it, pmm-client >= 3.2.0)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# See entrypoint.sh: systemd units start with a clean environment, so
+# compose's environment: block (PMM_SERVER, PMM_USER, ...) has to be
+# reimported explicitly.
+EnvironmentFile=-/run/container.env
+ExecStart=/srv/scripts/run-pmm-agent.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

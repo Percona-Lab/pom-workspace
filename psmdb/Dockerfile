@@ -14,8 +14,10 @@
 #
 # Ubuntu rather than Oracle Linux because the point of this image is that PSMDB
 # is *package-managed and upgradable in place*: `apt-get install
-# percona-server-mongodb-server=<newer>` + a supervisord restart is the rolling
-# upgrade loop, run as a SEP payload through the Nomad client that lives here.
+# percona-server-mongodb-server=<newer>` + `systemctl restart mongod` is the
+# rolling upgrade loop, run as a SEP payload through the Nomad client that lives
+# here - the same command a real, non-containerized host would use, because
+# this image runs systemd as PID 1 (see below).
 #
 # Everything is installed from Percona's apt repos, pinned to a major series via
 # PSMDB_REPO, so the upgrade target is a repo switch rather than a new image.
@@ -45,18 +47,28 @@ ARG PSMDB_REPO=psmdb-70
 # different python or a different pmm-client than the nodes it sits beside.
 ARG WITH_PSMDB=1
 
-# Debian maintainer scripts start services on install. There is no init system
-# here and supervisord owns process lifecycle, so tell them not to: without this
-# the postinst for percona-server-mongodb-server fails the build, and later an
-# in-container upgrade would too.
+# Debian maintainer scripts start services on install, and this image wants
+# package-install and service-start to stay two separate, individually
+# observable steps even though systemd is present (see below) - so tell
+# postinst scripts not to. Without this the postinst for
+# percona-server-mongodb-server fails the build, and later an in-container
+# upgrade or a bootstrap payload's own `apt-get install` would too, racing
+# against whatever config that payload has not written yet.
 RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
     && chmod +x /usr/sbin/policy-rc.d
+
+# Tells systemd it is running in a container: since v183 it reads this to skip
+# things a container cannot or should not do itself (mounting real filesystems,
+# udev, hardware watchdogs, ...) rather than needing the elaborate unit-masking
+# older systemd-in-Docker guides carry. Set here rather than only at `docker
+# run` time so it is true for every consumer of this image, including `./om`.
+ENV container=docker
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg procps jq iproute2 \
         python3 python3-venv python3-pip \
-        supervisor \
+        systemd systemd-sysv dbus \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL -o /tmp/percona-release.deb \
@@ -103,20 +115,61 @@ RUN mkdir -p /srv/scripts \
         && chown -R mongod:mongod /var/lib/mongo /var/log/mongo /var/lib/pbm; \
     fi
 
-# supervisord's conf.d is a glob, so the process table is assembled from parts
-# rather than switched between two whole copies: pmm-agent is the same program on
-# every node and is declared once, and only the database programs are conditional.
-COPY supervisord/ /srv/supervisord/
-RUN cp /srv/supervisord/pmm-agent.conf /etc/supervisor/conf.d/ \
+# One unit file per program, so the process table is assembled from parts
+# rather than switched between two whole copies: pmm-agent.service is the same
+# on every node and is always enabled, and only the database units are
+# conditional. "Enabling" a unit is just the symlink `systemctl enable` would
+# create - done directly here so it works at build time with no systemd running
+# yet, rather than depending on `systemctl` reaching a live daemon over D-Bus.
+#
+# -f on every ln: the pmm-client .deb's postinst already enables its own
+# packaged pmm-agent.service (deb-systemd-helper runs regardless of
+# policy-rc.d, which only blocks *starting* a service, not *enabling* one) -
+# harmless, since our /etc/systemd/system/pmm-agent.service below overrides
+# the package's /usr/lib/systemd/system/ copy by path precedence regardless of
+# what the pre-existing symlink target says, but the symlink itself has to be
+# forced or this step fails on a name dpkg got to first.
+#
+# WITH_PSMDB=1 additionally masks the *packaged* mongod.service.
+# percona-server-mongodb-server's postinst enables it the same way pmm-client's
+# postinst enables pmm-agent.service above - but this one is a live conflict,
+# not just a build nuisance: at boot systemd starts every enabled unit
+# automatically (policy-rc.d only blocks postinst-triggered starts, not
+# systemd's own unit activation), so the packaged unit binds :27017 from
+# /etc/mongod.conf a few seconds before mongo.service gets there with
+# /etc/mongod-node.conf, and mongo.service then fails to bind with "Address
+# already in use". Masking - a symlink to /dev/null, winning the same
+# path-precedence race the pmm-agent.service override above relies on - makes
+# systemd refuse to start it under any name, leaving mongo.service as this
+# image's only owner of the mongod process. Not applied on the WITH_PSMDB=0
+# build, where percona-server-mongodb-server is not installed at build time at
+# all: a bootstrap payload installing it later is meant to get a live,
+# controllable mongod.service, not a masked one.
+COPY systemd/ /srv/systemd/
+RUN mkdir -p /etc/systemd/system/multi-user.target.wants \
+    && cp /srv/systemd/pmm-agent.service /etc/systemd/system/ \
+    && ln -sf /etc/systemd/system/pmm-agent.service \
+        /etc/systemd/system/multi-user.target.wants/pmm-agent.service \
     && if [ "${WITH_PSMDB}" = "1" ]; then \
-        cp /srv/supervisord/psmdb.conf /etc/supervisor/conf.d/; \
+        for unit in mongo pbm-agent cluster-init register; do \
+            cp "/srv/systemd/${unit}.service" /etc/systemd/system/; \
+            ln -sf "/etc/systemd/system/${unit}.service" \
+                "/etc/systemd/system/multi-user.target.wants/${unit}.service"; \
+        done \
+        && ln -sf /dev/null /etc/systemd/system/mongod.service; \
     else \
-        cp /srv/supervisord/client.conf /etc/supervisor/conf.d/; \
+        cp /srv/systemd/register-client.service /etc/systemd/system/ \
+        && ln -sf /etc/systemd/system/register-client.service \
+            /etc/systemd/system/multi-user.target.wants/register-client.service; \
     fi
 
 COPY scripts/ /srv/scripts/
 RUN chmod +x /srv/scripts/*.sh
 
 EXPOSE 27017 27018 27019
+# systemd's clean-shutdown signal, so `docker stop` (and compose's `down`) ask
+# it to shut down properly - stopping every enabled unit in dependency order -
+# instead of racing SIGTERM against whatever mongod itself does with it.
+STOPSIGNAL SIGRTMIN+3
 ENTRYPOINT ["/srv/scripts/entrypoint.sh"]
-CMD ["supervisord", "-n", "-c", "/etc/supervisor/supervisord.conf"]
+CMD ["/sbin/init"]
