@@ -38,7 +38,17 @@
 #
 #   PMM_SERVER_IMAGE=perconalab/pmm-server:3-dev-container
 #
-PMM_SERVER_IMAGE=perconalab/pmm-server@sha256:d6a3f1660b43bce0965818f557344c200bedc5bc305228c1de06eea6c24db9dd
+# Re-pinned 2026-09-02: the previous digest (d6a3f166..., ~2026-08-05) only shipped
+# PostgreSQL 14 (/usr/pgsql-14), while this checkout's own
+# build/ansible/roles/postgres/files/postgres-migration - bind-mounted into the
+# container from the working tree, not baked into the image - now looks for
+# /usr/pgsql-18 and fails "No such file or directory" on every start. The image this
+# workspace's `3-dev-container` tag currently points at ships both pgsql-14 and
+# pgsql-18, so the digest below is just today's tag, re-pinned for the same
+# moving-bookmark reason as the paragraph above. Verified ClickHouse still starts
+# healthy on this digest (the PMM-15309 concern above), so the underlying reason for
+# pinning at all - not the specific value - still holds.
+PMM_SERVER_IMAGE=perconalab/pmm-server@sha256:708e5931dbf5873839d29f154aa455105baa44cef0a134690ea8c308de8c9a74
 
 # --- ports ------------------------------------------------------------------
 #
