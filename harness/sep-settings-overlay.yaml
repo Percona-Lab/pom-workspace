@@ -31,6 +31,15 @@ development:
       PORT: 5432
       NAME: sep
       USER: sep
+      # This block replaces SEP's own settings.yaml DATABASE entirely rather than
+      # merging into it (it is a plain mapping under a profile, not a
+      # dynaconf_merge one), so OM's schema token has to be re-declared here too
+      # or SEP's engine falls back to the class default (`{}`) and every query
+      # against `om.host`/`om.service`/`om.inventory_run` reaches Postgres as the
+      # literal, undefined schema `om_schema`. Keep in sync with SEP/settings.yaml
+      # and SEP/sidecar/settings.yaml's equivalent entries.
+      SCHEMA_TRANSLATE_MAP:
+        om_schema: om
     # Matches sidecar/settings.yaml's embedded-profile default (SEP-1860):
     # a full multi-syncer collection once a day, on top of the more frequent
     # PMM-only sync below.
