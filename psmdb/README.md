@@ -215,10 +215,13 @@ Everything is idempotent — containers get recreated onto existing data volumes
   replaces rather than updates it. Anything keyed on that id - OM's `om.host`,
   for one - gains a row and keeps the old one. Harmless here, worth knowing before
   you conclude an estate has twice the hosts it does.
-- **Ubuntu, not RHEL.** Chosen for `apt`. The same Dockerfile works on
-  `oraclelinux:9` with `dnf` if you need to match a RHEL estate — the official
-  `percona/percona-server-mongodb` image is UBI 9 and its mongod is rpm-owned, so
-  package upgrades work there too.
+- **Ubuntu, not RHEL — except the `pmm-client-rocky` pool.** The four database
+  topologies are Ubuntu-only, chosen for `apt`. The `pmm-client`/`pmm-client-rocky`
+  pools (§8) build from the same Dockerfile with `BASE_OS=rocky`, on `rockylinux:9`
+  with `dnf` — that exists to give SEP's `om_bootstrap` app's dnf/rpm install path
+  (`SEP/app/sep/apps/om_bootstrap/strategies/packages.py`) a host to actually run
+  against. The database topologies stay Ubuntu-only because they are already-
+  configured infrastructure, not a bootstrap target.
 - **No host ports.** By design; see §2.
 
 ---
@@ -245,7 +248,7 @@ Everything is idempotent — containers get recreated onto existing data volumes
 
 ## 8. Hosts with a PMM client and no database
 
-`pmm-client` is not a topology. It is a pool of three unrelated machines that
+`pmm-client` is not a topology. It is a pool of four unrelated machines that
 carry a PMM client and nothing else - **no `mongod`, no `pbm-agent`, and not even
 the PSMDB packages installed**. They come from this same Dockerfile built with
 `WITH_PSMDB=0`, so the base, the libc, the python and the pmm-client are
@@ -253,7 +256,7 @@ identical to the database nodes standing beside them; only the database is
 absent.
 
 ```bash
-./om start pmm-client              # all three
+./om start pmm-client              # all four
 ./om start pmm-client-node01       # exactly one - each node is its own profile too
 ./om logs pmm-client-node01 -f
 ```
@@ -282,9 +285,19 @@ then writes `/run/om-node-ready` - the same marker `register.sh` writes on a
 database node once it has registered. `./om start` waits on that one file for
 every node in the sandbox, so it never has to ask which kind it is looking at.
 
-**Adding a fourth.** Copy one three-line service block in `compose.yaml` (giving
+**Adding a fifth.** Copy one three-line service block in `compose.yaml` (giving
 it its own private profile alongside `pmm-client`) and bump `CLIENT_NODES` in
 `../om` to match.
 
 **MinIO does not come up with them.** It carries the four database profiles
 rather than none, because a host with no database has nothing to back up.
+
+**Rocky Linux instead of Ubuntu.** `pmm-client-rocky` is the same pool, built
+`BASE_OS=rocky` (§6), same node count as the Ubuntu pool -
+`./om start pmm-client pmm-client-rocky` brings up four of each in one command.
+
+```bash
+./om start pmm-client-rocky              # all four
+./om start pmm-client-rocky-node00       # exactly one
+./om logs pmm-client-rocky-node00 -f
+```

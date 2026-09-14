@@ -403,16 +403,20 @@ than taking the name over on its own. `docker logs <node>` says so, and names th
 
 ### Hosts with a PMM client and no database
 
-`pmm-client` is a pool of three hosts built from the same Dockerfile with
+`pmm-client` is a pool of four hosts built from the same Dockerfile with
 `WITH_PSMDB=0`: `pmm-agent` and the executor client it carries, and no `mongod`,
 no `pbm-agent`, none of the PSMDB packages. PMM lists them as nodes and SEP will
 dispatch to them, so they are where a payload with no database to talk to gets
-developed - and, since the Percona apt repos are still enabled on them, the
+developed - and, since the Percona repos are still enabled on them, the
 starting point for a payload that *installs* a database on a bare machine.
 
+A second pool, `pmm-client-rocky`, is the same four hosts built `BASE_OS=rocky`
+instead of the Ubuntu default - a host for `om_bootstrap`'s dnf/rpm install path
+(PMM-15347) to actually run against.
+
 ```bash
-./om start pmm-client               # all three
-./om start pmm-client-node01        # just that one
+./om start pmm-client pmm-client-rocky   # all eight, four of each OS
+./om start pmm-client-node01             # just that one
 ./om logs pmm-client-node01 -f
 ```
 

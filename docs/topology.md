@@ -237,14 +237,21 @@ flowchart TB
 
 11 containers for the sharded cluster — one per node, no sidecars.
 
-There is a fifth profile, `pmm-client`, which is not a topology: three unrelated hosts
+There is a fifth profile, `pmm-client`, which is not a topology: four unrelated hosts
 carrying a PMM client and **no database** - same Dockerfile built with `WITH_PSMDB=0`, so
 no `mongod`, no `pbm-agent`, not even the PSMDB packages. The Nomad client rides inside
 pmm-agent rather than inside mongod, so they are still full SEP execution hosts: a place
 for a payload with no database to talk to, and the *before* state of provisioning one
-(the Percona apt repos are enabled on them, just unused). They export no service, so they
+(the Percona repos are enabled on them, just unused). They export no service, so they
 have no `cluster` string and no `/root/.mongodb_uri`. Started individually -
 `./om start pmm-client-node01` - because each node carries its own compose profile too.
+
+A sixth profile, `pmm-client-rocky`, is the same pool on Rocky Linux instead of Ubuntu
+(`BASE_OS=rocky` on the same Dockerfile) - four hosts too, added so `om_bootstrap`'s
+already-implemented `dnf`/`rpm` install path (PMM-15347) has a host that can actually
+report `os_id: rocky` to run it against. Scoped to this profile alone: the four database
+topologies above stay Ubuntu-only, since they are pre-built infrastructure, not a
+bootstrap target.
 
 **The `cluster` column is not cosmetic.** SEP's inventory has no cluster *entity*, only a
 cluster *string* per service, set by `pmm-admin add mongodb --cluster=`. OM groups
@@ -872,7 +879,7 @@ As configured by this workspace's `pmm/.env` and `om`:
 | --- | --- |
 | [`../om`](../om) | how all three stacks start and stop |
 | [`../psmdb/compose.yaml`](../psmdb/compose.yaml) | the four topologies, MinIO, and the `pmm_default` join |
-| [`../psmdb/Dockerfile`](../psmdb/Dockerfile) | the node image, and why it is Ubuntu + apt |
+| [`../psmdb/Dockerfile`](../psmdb/Dockerfile) | the node image (Ubuntu + apt by default; `BASE_OS=rocky` for the `pmm-client-rocky` pool) |
 | [`../psmdb/README.md`](../psmdb/README.md) | the cluster stack in depth: upgrade loop, bootstrap ordering, rough edges |
 | `pmm/.env` | which PMM features this workspace turns on |
 | `pmm/docker-compose.dev.yml` | the PMM devcontainer, its published ports and host-gateway alias |

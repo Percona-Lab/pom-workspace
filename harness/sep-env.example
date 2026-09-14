@@ -59,3 +59,18 @@ SEP_INTERNAL_TOKEN=@pmm-sep-token
 # on purpose - two tokens would be two things to rotate for no benefit.
 AUTH__PROVIDER__GRAFANA__SERVICE_ACCOUNT_TOKEN=@grafana-token
 PMM__API_KEY=@grafana-token
+
+# --- being reached by a Nomad executor --------------------------------------
+#
+# exec-artifact dispatches (PMM-15347's om_bootstrap, currently the only
+# consumer) have the target host download its script from SEP rather than
+# carrying it inline. Left unset, the download URL is derived from whichever
+# request triggered the dispatch (pmm-managed -> SEP, which reaches SEP through
+# host.docker.internal) - fine for that hop, wrong for the *target* host to
+# reuse, and on this image host.docker.internal resolves to 127.0.0.1 inside
+# every pmm-client-node* container, so every such dispatch failed downloading
+# its own script with "dial tcp 127.0.0.1:8000: connect: connection refused"
+# until this was pinned. 172.24.0.1 is pmm_default's own bridge gateway,
+# confirmed reachable from pmm-client-node00 directly (PMM-15347 bootstrap
+# testing, 2026-09-07).
+SNIPPETS_BASE_URL=http://172.24.0.1:8000

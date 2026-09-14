@@ -191,7 +191,10 @@ manages. Started per profile — `./om start replicaset-cluster` — or all at o
 hosts built from the same image with `WITH_PSMDB=0`, so they carry pmm-agent and its
 Nomad client and no database at all. Full SEP execution hosts that export no service -
 somewhere to run a payload that has nothing to query, and the *before* state of one that
-installs a database. Spawned individually: `./om start pmm-client-node01`.
+installs a database. Spawned individually: `./om start pmm-client-node01`. A sixth
+profile, `pmm-client-rocky`, is the same pool built `BASE_OS=rocky` instead of the
+Ubuntu default - a host for `om_bootstrap`'s dnf/rpm install path (PMM-15347) to run
+against.
 
 **MinIO.** S3-compatible object storage, used locally as a backup target. Defaults to
 port 9000, the same default as PMM's ClickHouse — in `psmdb/` it publishes nothing, so

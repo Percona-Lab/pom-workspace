@@ -33,8 +33,27 @@
 # so PMM lists it as a node and SEP will dispatch to it, which makes it the place
 # to develop a payload that has no database to talk to - and the starting point
 # for one that installs a database, since the psmdb repos are enabled either way.
+#
+# BASE_OS additionally selects the distro, ubuntu (default) or rocky. This exists
+# because SEP's om_bootstrap app (app/sep/apps/om_bootstrap/strategies/packages.py)
+# already implements both apt/dpkg and dnf/rpm install paths - PMM-15347's
+# bootstrap flow picks one per host from om_inventory's `os_id` probe fact - but
+# until now nothing in this sandbox could ever report `os_id: rocky`, so that path
+# had no host to actually run against. Scoped to WITH_PSMDB=0 client-only hosts:
+# bootstrap's job is installing PSMDB *onto* a bare host, so that is the only
+# variant that needs to exist per OS. The four pre-built database topologies
+# (WITH_PSMDB=1) stay Ubuntu-only - they are already-configured infrastructure,
+# not a bootstrap target, and PSMDB_REPO's in-place-upgrade story above is
+# unaffected either way.
+ARG BASE_OS=ubuntu
+FROM ubuntu:24.04 AS base-ubuntu
+FROM rockylinux:9 AS base-rocky
+FROM base-${BASE_OS} AS base
 
-FROM ubuntu:24.04
+# Redeclared: an ARG used only in a FROM line above this point is not otherwise
+# visible to the instructions that follow it (Dockerfile scoping rule) - every
+# `${BASE_OS}` branch below needs it live again.
+ARG BASE_OS=ubuntu
 
 # The major series this image is *built* on. An upgrade payload switches the repo
 # (percona-release enable-only psmdb-80) and installs over the top; it does not
@@ -54,8 +73,16 @@ ARG WITH_PSMDB=1
 # percona-server-mongodb-server fails the build, and later an in-container
 # upgrade or a bootstrap payload's own `apt-get install` would too, racing
 # against whatever config that payload has not written yet.
-RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
-    && chmod +x /usr/sbin/policy-rc.d
+#
+# RPM scriptlets have no equivalent hazard here: percona-server-mongodb's spec
+# guards its own `%systemd_post` with `[ -d /run/systemd/system ]` before calling
+# systemctl, which is never true mid-`docker build` (no systemd is running yet),
+# so `dnf install` on the rocky branch never races a service start the way dpkg's
+# unconditional postinst does.
+RUN if [ "${BASE_OS}" = "ubuntu" ]; then \
+        printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+        && chmod +x /usr/sbin/policy-rc.d; \
+    fi
 
 # Tells systemd it is running in a container: since v183 it reads this to skip
 # things a container cannot or should not do itself (mounting real filesystems,
@@ -64,46 +91,87 @@ RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
 # run` time so it is true for every consumer of this image, including `./om`.
 ENV container=docker
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg procps jq iproute2 \
-        python3 python3-venv python3-pip \
-        systemd systemd-sysv dbus \
-    && rm -rf /var/lib/apt/lists/*
+# Package names split between apt's finer-grained tooling packages and dnf's
+# coarser ones (systemd/dbus/python3-venv already ship inside rockylinux:9's own
+# base packages, so rocky's list is shorter, not just renamed) - iproute2/iproute
+# and gnupg/gnupg2 are the two that actually differ by name rather than presence.
+# --allowerasing: rockylinux:9 ships curl-minimal, which the full curl package
+# conflicts with by design (both provide /usr/bin/curl) - confirmed against a
+# real build, which fails here without it.
+RUN if [ "${BASE_OS}" = "ubuntu" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg procps jq iproute2 \
+            python3 python3-venv python3-pip \
+            systemd systemd-sysv dbus \
+            sudo \
+        && rm -rf /var/lib/apt/lists/*; \
+    else \
+        dnf install -y --allowerasing \
+            ca-certificates curl gnupg2 procps-ng jq iproute \
+            python3 python3-pip \
+            sudo \
+        && dnf clean all; \
+    fi
 
-RUN curl -fsSL -o /tmp/percona-release.deb \
-        https://repo.percona.com/apt/percona-release_latest.generic_all.deb \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends /tmp/percona-release.deb \
-    && rm -f /tmp/percona-release.deb \
-    && rm -rf /var/lib/apt/lists/*
+# percona-release is the one component whose install mechanism genuinely differs
+# (a fetched .deb vs. a fetched .rpm) - everything after this installs through it
+# and is package-manager-agnostic from here on, mirroring SEP's own
+# _configure_repository step (app/sep/apps/om_bootstrap/strategies/packages.py) so
+# a bootstrap run does on a real host exactly what this image already did at
+# build time.
+RUN if [ "${BASE_OS}" = "ubuntu" ]; then \
+        curl -fsSL -o /tmp/percona-release.deb \
+            https://repo.percona.com/apt/percona-release_latest.generic_all.deb \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends /tmp/percona-release.deb \
+        && rm -f /tmp/percona-release.deb \
+        && rm -rf /var/lib/apt/lists/*; \
+    else \
+        dnf install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm \
+        && dnf clean all; \
+    fi
 
 # enable-only pins the PSMDB series; pbm and pmm3-client are additive. Leaving
 # these repo definitions in the image is the point — they are what makes an
-# in-container `apt-get install` work later.
+# in-container `apt-get install`/`dnf install` work later.
 #
 # All three are enabled in both builds, including the psmdb-* ones the client
 # build installs nothing from. That is deliberate: it is what lets a payload turn
-# a bare host into a database host with an apt install, which is the same seam
+# a bare host into a database host with a package install, which is the same seam
 # the in-place upgrade uses on a node that already has one.
+#
+# percona-server-mongodb is one meta-package on the yum side (unlike apt's four
+# separate server/mongos/shell/mongosh packages) - the same name SEP's
+# _install_package step installs for a rocky host, so this image's WITH_PSMDB=1
+# build stays a true preview of what a bootstrap run does.
 RUN percona-release enable-only "${PSMDB_REPO}" release \
     && percona-release enable pbm release \
     && percona-release enable pmm3-client release \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends pmm-client \
-    && if [ "${WITH_PSMDB}" = "1" ]; then \
-        apt-get install -y --no-install-recommends \
-            percona-server-mongodb-server \
-            percona-server-mongodb-mongos \
-            percona-server-mongodb-shell \
-            percona-mongodb-mongosh \
-            percona-backup-mongodb; \
-    fi \
-    && rm -rf /var/lib/apt/lists/*
+    && if [ "${BASE_OS}" = "ubuntu" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends pmm-client \
+        && if [ "${WITH_PSMDB}" = "1" ]; then \
+            apt-get install -y --no-install-recommends \
+                percona-server-mongodb-server \
+                percona-server-mongodb-mongos \
+                percona-server-mongodb-shell \
+                percona-mongodb-mongosh \
+                percona-backup-mongodb; \
+        fi \
+        && rm -rf /var/lib/apt/lists/*; \
+    else \
+        dnf install -y pmm-client \
+        && if [ "${WITH_PSMDB}" = "1" ]; then \
+            dnf install -y percona-server-mongodb percona-backup-mongodb; \
+        fi \
+        && dnf clean all; \
+    fi
 
-# The Nomad client the pmm-client deb ships (build/packages/deb/install:7 in the
-# pmm repo). Asserted at build time: if a future pmm-client drops it, the image
-# fails here rather than silently producing nodes SEP cannot dispatch to.
+# The Nomad client the pmm-client package ships (build/packages/deb/install:7 in
+# the pmm repo - the rpm carries the same path). Asserted at build time: if a
+# future pmm-client drops it, the image fails here rather than silently
+# producing nodes SEP cannot dispatch to.
 RUN test -x /usr/local/percona/pmm/tools/nomad
 
 # The mongod user is created by percona-server-mongodb-server's postinst, so it
@@ -128,7 +196,10 @@ RUN mkdir -p /srv/scripts \
 # harmless, since our /etc/systemd/system/pmm-agent.service below overrides
 # the package's /usr/lib/systemd/system/ copy by path precedence regardless of
 # what the pre-existing symlink target says, but the symlink itself has to be
-# forced or this step fails on a name dpkg got to first.
+# forced or this step fails on a name dpkg got to first. The rpm's own
+# %systemd_post scriptlet is a no-op at build time (see the policy-rc.d
+# comment above), so -f is just a harmless no-op there rather than a fix for
+# an equivalent race.
 #
 # WITH_PSMDB=1 additionally masks the *packaged* mongod.service.
 # percona-server-mongodb-server's postinst enables it the same way pmm-client's

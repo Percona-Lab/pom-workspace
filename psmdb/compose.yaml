@@ -133,6 +133,17 @@ x-client-node: &client-node
     PMM_USER: admin
     PMM_PASSWORD: admin
 
+# Same host, built from psmdb/Dockerfile with BASE_OS=rocky instead of the
+# default ubuntu - the only difference from *client-node is the image. This is
+# what SEP's om_bootstrap app (already implementing both an apt/dpkg and a
+# dnf/rpm install path, app/sep/apps/om_bootstrap/strategies/packages.py) has
+# had no host to actually run its Rocky branch against: PMM reads a host's
+# `os_id` from om_inventory's probe of /etc/os-release, and until this image
+# existed nothing in the sandbox could ever report `os_id: rocky`.
+x-client-node-rocky: &client-node-rocky
+  <<: *client-node
+  image: openmanager/pmm-client-node-rocky:3
+
 # Per-topology environments live up here, not on the first member, so exactly one
 # member can carry RS_BOOTSTRAP without the others inheriting it through the
 # anchor. Two nodes racing rs.initiate() would be a genuine bug, not noise.
@@ -469,6 +480,41 @@ services:
     profiles: [pmm-client, pmm-client-node02]
     container_name: pmm-client-node02
     hostname: pmm-client-node02
+
+  pmm-client-node03:
+    <<: *client-node
+    profiles: [pmm-client, pmm-client-node03]
+    container_name: pmm-client-node03
+    hostname: pmm-client-node03
+
+  # ── profile: pmm-client-rocky ─────────────────────────────────────────────
+  # Same pool shape as pmm-client above, on Rocky instead of Ubuntu - same node
+  # count too, so `./om start pmm-client pmm-client-rocky` brings up four of
+  # each in one command. Keep CLIENT_ROCKY_NODES in ../om in step with the
+  # count here.
+  pmm-client-rocky-node00:
+    <<: *client-node-rocky
+    profiles: [pmm-client-rocky, pmm-client-rocky-node00]
+    container_name: pmm-client-rocky-node00
+    hostname: pmm-client-rocky-node00
+
+  pmm-client-rocky-node01:
+    <<: *client-node-rocky
+    profiles: [pmm-client-rocky, pmm-client-rocky-node01]
+    container_name: pmm-client-rocky-node01
+    hostname: pmm-client-rocky-node01
+
+  pmm-client-rocky-node02:
+    <<: *client-node-rocky
+    profiles: [pmm-client-rocky, pmm-client-rocky-node02]
+    container_name: pmm-client-rocky-node02
+    hostname: pmm-client-rocky-node02
+
+  pmm-client-rocky-node03:
+    <<: *client-node-rocky
+    profiles: [pmm-client-rocky, pmm-client-rocky-node03]
+    container_name: pmm-client-rocky-node03
+    hostname: pmm-client-rocky-node03
 
 networks:
   # Created by pmm/docker-compose.dev.yml (./om start pmm). Joining it rather

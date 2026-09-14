@@ -17,6 +17,22 @@
 # Nothing here is needed for a CI-built image.
 
 development:
+  # SEP's own settings.yaml default block already trusts host.docker.internal
+  # (pmm-managed reaching SEP from inside the pmm-server container) but has no
+  # way to know this workspace's own docker network gateway. A Nomad executor
+  # container (pmm-client-node00 et al, on pmm_default) downloading a dispatched
+  # exec-artifact script reaches SEP over that gateway, not host.docker.internal
+  # -- and TrustedHostMiddleware answered every such request "Invalid host
+  # header" until this was added (PMM-15347 bootstrap testing, 2026-09-07).
+  # This *replaces* settings.yaml's own list for the development profile rather
+  # than extending it (ALLOWED_HOSTS is a plain list, not a dynaconf_merge one),
+  # so every entry from there is repeated here too.
+  ALLOWED_HOSTS:
+    - "localhost"
+    - "127.0.0.1"
+    - "host.docker.internal"
+    - "172.24.0.1"
+
   PMM:
     ANNOTATIONS_ENABLED: true
 
