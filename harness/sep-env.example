@@ -20,6 +20,12 @@
 #                    exist, so ./om env leaves it unresolved on a cold workspace
 #                    and fills it in when re-run after ./om start pmm
 #
+#   @encryption-key  a fresh Fernet key, generated once per workspace and then
+#                    kept: SEP has no default and never derives it, and rotating
+#                    it after secrets have been encrypted at rest makes every one
+#                    of them unreadable. ./om env preserves an existing value the
+#                    same way it preserves the Grafana token.
+#
 # No real secret belongs in this file.
 
 # --- the databases ----------------------------------------------------------
@@ -59,3 +65,10 @@ SEP_INTERNAL_TOKEN=@pmm-sep-token
 # on purpose - two tokens would be two things to rotate for no benefit.
 AUTH__PROVIDER__GRAFANA__SERVICE_ACCOUNT_TOKEN=@grafana-token
 PMM__API_KEY=@grafana-token
+
+# --- at-rest encryption ------------------------------------------------------
+#
+# Required with no default (app/core/config.py): every secret-typed
+# settings-override value and the om_bootstrap credentials it generates are
+# encrypted with this key before they ever reach the database.
+ENCRYPTION_KEY=@encryption-key

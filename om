@@ -631,6 +631,16 @@ gen_secret() { # [bytes] -> 2*bytes hex characters
   fi
 }
 
+# A valid Fernet key: 32 random bytes, url-safe base64. SEP's ENCRYPTION_KEY
+# validator (app/core/config.py) rejects anything else.
+gen_fernet_key() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 32
+  else
+    head -c 32 /dev/urandom | base64
+  fi
+}
+
 # Asks on the terminal rather than on stdin, so a prompt still works when the
 # command's stdin is a pipe. No controlling terminal means no answer, and the
 # safe reading of no answer is "do not overwrite" - the group redirection is what
@@ -806,7 +816,7 @@ PY
   fi
 }
 
-# Renders SEP/.env from harness/sep-env.example, resolving the two placeholders.
+# Renders SEP/.env from harness/sep-env.example, resolving its placeholders.
 #
 # The Grafana token cannot exist before PMM does, so a cold workspace gets a file
 # with everything else in it and a warning. Re-running after `./om start pmm` fills
@@ -816,17 +826,20 @@ env_sep() { # mode: create | refresh
   [[ -f "$SEP_ENV_TEMPLATE" ]] || die "missing $SEP_ENV_TEMPLATE"
   [[ -d "$SEP_DIR" ]] || die "SEP/ not found - run: git submodule update --init"
 
-  local existing_token=""
+  local existing_token="" existing_enc_key=""
   if [[ -f "$out" ]]; then
     existing_token="$(env_value "$out" PMM__API_KEY)"
+    existing_enc_key="$(env_value "$out" ENCRYPTION_KEY)"
   fi
 
   # A token that is still the placeholder means the file was written on a cold
-  # workspace, before PMM existed to mint one. Finishing that job is the whole
-  # point of re-running, so it happens even in create mode - which otherwise
-  # leaves an existing file alone.
+  # workspace, before PMM existed to mint one. An absent encryption key means
+  # the file predates ENCRYPTION_KEY becoming required (SEP-1972). Either one
+  # is worth completing even in create mode - which otherwise leaves an
+  # existing file alone.
   local unfinished=0
   [[ -z "$existing_token" || "$existing_token" == "@grafana-token" ]] && unfinished=1
+  [[ -z "$existing_enc_key" || "$existing_enc_key" == "@encryption-key" ]] && unfinished=1
 
   if [[ -f "$out" ]]; then
     if [[ "$mode" == create ]]; then
@@ -834,13 +847,13 @@ env_sep() { # mode: create | refresh
         dim "SEP/.env exists - left untouched"
         return 0
       fi
-      dim "SEP/.env exists but has no Grafana token - completing it"
+      dim "SEP/.env exists but is missing something required - completing it"
     else
       confirm "SEP/.env exists. Overwrite it?" || { dim "SEP/.env left untouched"; return 0; }
     fi
   fi
 
-  local sep_pw internal token
+  local sep_pw internal token enc_key
   sep_pw="$(env_value "$PMM_DIR/.env" PMM_SEP_POSTGRES_PASSWORD)"
   [[ -n "$sep_pw" ]] || die "PMM_SEP_POSTGRES_PASSWORD is not in pmm/.env - run ./om env first"
   # Both halves of the same secret: pmm-managed sends it, SEP compares against it.
@@ -857,8 +870,18 @@ env_sep() { # mode: create | refresh
     token="@grafana-token"
   fi
 
+  # Never rotate an existing key: everything it has already encrypted at rest
+  # would become unreadable.
+  if [[ -n "$existing_enc_key" && "$existing_enc_key" != "@encryption-key" ]]; then
+    enc_key="$existing_enc_key"
+    dim "kept the existing ENCRYPTION_KEY"
+  else
+    enc_key="$(gen_fernet_key)"
+    ok "generated ENCRYPTION_KEY"
+  fi
+
   sed -e "s|@sep-password|$sep_pw|g" -e "s|@pmm-sep-token|$internal|g" \
-      -e "s|@grafana-token|$token|g" \
+      -e "s|@grafana-token|$token|g" -e "s|@encryption-key|$enc_key|g" \
       "$SEP_ENV_TEMPLATE" > "$out.tmp" || die "rendering $out failed"
   mv "$out.tmp" "$out"
 
