@@ -67,6 +67,14 @@ development:
     # Sign in an unauthenticated caller from the ambient PMM session - the other
     # half of PMM-15293's /api/oauth/session/exchange.
     AMBIENT_SESSION_SSO_ENABLED: true
+    OM_INVENTORY:
+      # ENABLED defaults to False in the product (percona/sep#1437) to match PMM's
+      # own OMEnabledDefault: pmm-managed's ChangeSettings is what flips it, on the
+      # PMM-15360-om-service-gate companion (percona/pmm#5852). That switch isn't
+      # in this workspace's pmm pin (PMM-15326-onto-main testing is SEP-side
+      # only), so without this override the sweep could never turn on here at all.
+      # Testing convenience only - never change #1437's own shipped default for this.
+      ENABLED: true
     # The default 127.0.0.1 is unreachable from the PMM container, which proxies
     # /sep to host.docker.internal. Same exposure as the PMM devcontainer's own
     # published 8443 - a dev box, not a shared host.
