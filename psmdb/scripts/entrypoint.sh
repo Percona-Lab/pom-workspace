@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Render this node's mongod/mongos config from the environment, then hand over to
-# supervisord. Everything that needs a *running* server — replica set initiation,
-# the root user, PMM registration, PBM config — happens elsewhere: register.sh as
-# a supervisord one-shot on this node, cluster-init.sh as a per-topology init
-# container. This script only has to make the process startable.
+# systemd (PID 1). Everything that needs a *running* server - replica set
+# initiation, the root user, PMM registration, PBM config - happens elsewhere:
+# register.service as a one-shot unit on this node, cluster-init.service as a
+# per-topology bootstrap. This script only has to make the process startable.
 #
 # Contract (compose sets these):
 #   ROLE           mongod | mongos | client
@@ -95,12 +95,25 @@ write_mongos_conf() {
     log "mongos.conf: port=${MONGO_PORT} configDB=${CONFIG_DB}"
 }
 
+# systemd (unlike supervisord, which this replaced) does not pass its own
+# environment down to the units it manages - each unit starts with a minimal,
+# clean environment unless told otherwise. Since this script is PID 1's direct
+# child, it still sees everything compose's `environment:` block set (ROLE,
+# REPLSET, RS_BOOTSTRAP, PMM_SERVER, the PBM_S3_* vars, and whatever else a
+# topology adds), so it snapshots that here for every unit below to import via
+# EnvironmentFile=-/run/container.env - the "-" makes a missing file
+# non-fatal, which only matters for images built without this script running
+# first, which does not happen in practice. /run is a tmpfs (compose sets
+# tmpfs: [/run, /run/lock] for systemd's own needs), so this never touches a
+# volume or outlives the container.
+env > /run/container.env
+
 # ROLE=client is a host with a PMM client and nothing else, from the WITH_PSMDB=0
 # build of this image. There is no server to configure, no keyfile to install
 # (nothing here joins a replica set), and no mongod user to chown to - that user
 # arrives with percona-server-mongodb-server, which this build does not carry.
-# So hand straight over to supervisord, which will find only pmm-agent and
-# register-client.sh in its conf.d.
+# So hand straight over to systemd, which on this build only has pmm-agent.service
+# and register-client.service enabled.
 if [ "$ROLE" = "client" ]; then
     log "pmm-client-only host: no database to configure"
     exec "$@"
@@ -109,7 +122,7 @@ fi
 install_keyfile
 if [ "$ROLE" = "mongos" ]; then
     write_mongos_conf
-    # supervisord picks the program by role; the unused one stays stopped.
+    # run-mongo.sh picks the program by role; the unused one stays stopped.
     touch /run/is-mongos
 else
     write_mongod_conf

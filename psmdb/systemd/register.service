@@ -1,0 +1,21 @@
+# One-shot: register this node's MongoDB service with PMM and drop the
+# credentials file SEP's payloads read - see scripts/register.sh. WITH_PSMDB=1
+# only. Restart=on-failure is what makes "keep trying until pmm-server is up"
+# work, matching supervisord's old autorestart=unexpected.
+[Unit]
+Description=Register this node's MongoDB service with PMM
+After=mongo.service pmm-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# See entrypoint.sh: systemd units start with a clean environment.
+EnvironmentFile=-/run/container.env
+ExecStart=/srv/scripts/register.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

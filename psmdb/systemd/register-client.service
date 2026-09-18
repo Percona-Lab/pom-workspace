@@ -1,0 +1,20 @@
+# One-shot readiness marker for a pmm-client-only host - see
+# scripts/register-client.sh. WITH_PSMDB=0 only; register.service is its
+# database-node counterpart, the two are never installed on the same image.
+[Unit]
+Description=Readiness marker for a pmm-client-only host
+After=pmm-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# See entrypoint.sh: systemd units start with a clean environment.
+EnvironmentFile=-/run/container.env
+ExecStart=/srv/scripts/register-client.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

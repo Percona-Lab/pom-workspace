@@ -1,0 +1,19 @@
+# pbm-agent, or a quiet no-op on nodes that must not run one - see
+# scripts/run-pbm-agent.sh. WITH_PSMDB=1 only.
+[Unit]
+Description=pbm-agent
+After=network.target
+
+[Service]
+Type=simple
+User=mongod
+# See entrypoint.sh: systemd units start with a clean environment.
+EnvironmentFile=-/run/container.env
+ExecStart=/srv/scripts/run-pbm-agent.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

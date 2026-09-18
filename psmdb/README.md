@@ -102,7 +102,7 @@ docker exec replicaset-cluster-node02 bash -c '
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
       percona-server-mongodb-server percona-server-mongodb-mongos percona-server-mongodb-shell
-  supervisorctl restart mongo'
+  systemctl restart mongo'
 ```
 
 Measured result — a genuine mixed-version replica set, which is the state a
@@ -123,19 +123,19 @@ not the image — it is part of what you are developing.
 Three things the image does so this works non-interactively:
 
 - **`policy-rc.d` returns 101**, so Debian maintainer scripts never try to start
-  a service. There is no init system; supervisord owns lifecycle.
+  a service on install - even though systemd (see below) could actually start
+  it. Package-install and service-start stay two separate, individually
+  observable steps, which is the seam a rolling-upgrade or bootstrap payload
+  needs to drive.
 - **The generated config is `/etc/mongod-node.conf`, not `/etc/mongod.conf`.**
   The latter is a dpkg *conffile*; writing to it makes every upgrade stop at
   `configuration file '/etc/mongod.conf' … keep your currently-installed
   version?` and fail with `end of file on stdin at conffile prompt`. Found the
-  hard way — see the comment at the top of `scripts/entrypoint.sh`.
-- **`supervisorctl restart mongo`** is the container analogue of `systemctl
-  restart mongod`, and it is the same command on every node regardless of role,
-  so a payload can target nodes generically.
-
-**The one place this will not mimic a VM**: there is no systemd, so a payload
-written against `systemctl` will not port. If that matters for your app, drive
-restarts through an abstraction you can swap.
+  hard way - see the comment at the top of `scripts/entrypoint.sh`.
+- **`systemctl restart mongo`** is the same command on every node regardless of
+  role, so a payload can target nodes generically - and it is the *real*
+  command, not a container analogue: this image runs systemd as PID 1 (see
+  §6), so a payload written against `systemctl` ports to a real host unchanged.
 
 ---
 
@@ -183,6 +183,18 @@ Everything is idempotent — containers get recreated onto existing data volumes
   /sys/fs/cgroup/cgroup.subtree_control: read-only file system`. Interestingly
   the Nomad client *inside pmm-server* starts without them; the difference is
   not explained.
+- **systemd is PID 1**, not supervisord - the same `cap_add: SYS_ADMIN` +
+  `security_opt: apparmor:unconfined, seccomp:unconfined` the Nomad client
+  above needs turns out to be what systemd needs too, plus a `tmpfs` mount on
+  `/run` and `/run/lock` (both in `compose.yaml`) and `ENV container=docker` in
+  the Dockerfile, which tells systemd (since v183) to skip the things a
+  container cannot or should not do itself - no elaborate unit-masking needed.
+  `systemctl status`, `journalctl -u mongo`, and friends all work over `docker
+  exec`. One thing this changes from a plain VM: `policy-rc.d` still returns
+  101 (see §3), so a fresh `apt-get install percona-server-mongodb-server`
+  installs the package without starting it - a payload has to `systemctl
+  enable --now mongod` itself, the same as it would to control the timing on a
+  real host.
 - **Arbiters force an explicit default write concern.** A shard of
   `svr0/svr1/arb0` has three voting members but only two writable ones, so
   `sh.addShard` refuses until `setDefaultRWConcern` is set. `cluster-init.sh`
@@ -192,21 +204,24 @@ Everything is idempotent — containers get recreated onto existing data volumes
   same name, but services from a torn-down topology linger until removed in PMM.
 - **Restarting `pmm-agent` used to de-register the node's database.** `setup
   --force` replaces the node, and replacing a node takes its services with it.
-  `register.sh` is a supervisord one-shot that ran at container start, so nothing
-  added the service back: the node returned healthy, its mongod kept running, and
-  PMM simply stopped knowing there was a database on it. Nothing surfaced that -
-  it was found only because OM reported a mongod it had no service for.
+  `register.sh` ran as a one-shot unit at container start, so nothing added the
+  service back: the node returned healthy, its mongod kept running, and PMM
+  simply stopped knowing there was a database on it. Nothing surfaced that - it
+  was found only because OM reported a mongod it had no service for.
   `run-pmm-agent.sh` now re-asserts registration on every start, so a
-  `supervisorctl restart pmm-agent` is safe again. If you meet a node in the old
-  state, `supervisorctl start register` inside it puts the service back.
+  `systemctl restart pmm-agent` is safe again. If you meet a node in the old
+  state, `systemctl start register` inside it puts the service back.
 - **Restarting `pmm-agent` gives the node a new PMM node id**, because `--force`
   replaces rather than updates it. Anything keyed on that id - OM's `om.host`,
   for one - gains a row and keeps the old one. Harmless here, worth knowing before
   you conclude an estate has twice the hosts it does.
-- **Ubuntu, not RHEL.** Chosen for `apt`. The same Dockerfile works on
-  `oraclelinux:9` with `dnf` if you need to match a RHEL estate — the official
-  `percona/percona-server-mongodb` image is UBI 9 and its mongod is rpm-owned, so
-  package upgrades work there too.
+- **Ubuntu, not RHEL — except the `pmm-client-rocky` pool.** The four database
+  topologies are Ubuntu-only, chosen for `apt`. The `pmm-client`/`pmm-client-rocky`
+  pools (§8) build from the same Dockerfile with `BASE_OS=rocky`, on `rockylinux:9`
+  with `dnf` — that exists to give SEP's `om_bootstrap` app's dnf/rpm install path
+  (`SEP/app/sep/apps/om_bootstrap/strategies/packages.py`) a host to actually run
+  against. The database topologies stay Ubuntu-only because they are already-
+  configured infrastructure, not a bootstrap target.
 - **No host ports.** By design; see §2.
 
 ---
@@ -218,9 +233,9 @@ Everything is idempotent — containers get recreated onto existing data volumes
 | `Dockerfile` | both node images - PSMDB 7.0 + PBM + pmm-client + python3 from Percona apt repos, or `WITH_PSMDB=0` for the client-only build |
 | `compose.yaml` | four database profiles + `pmm-client`, MinIO, joins `pmm_default` |
 | `bootstrap.sh` | generates `secrets/keyfile`, checks the network exists |
-| `supervisord/pmm-agent.conf` | the one program both images run |
-| `supervisord/psmdb.conf` | the four database programs, `WITH_PSMDB=1` only |
-| `supervisord/client.conf` | the readiness one-shot, `WITH_PSMDB=0` only |
+| `systemd/pmm-agent.service` | the one unit both images run |
+| `systemd/mongo.service`, `pbm-agent.service`, `cluster-init.service`, `register.service` | the four database units, `WITH_PSMDB=1` only |
+| `systemd/register-client.service` | the readiness one-shot, `WITH_PSMDB=0` only |
 | `scripts/entrypoint.sh` | renders the mongod/mongos config from the environment |
 | `scripts/run-mongo.sh` | mongod or mongos, one program either way |
 | `scripts/run-pmm-agent.sh` | waits for PMM, `pmm-agent setup`, then the agent |
@@ -233,7 +248,7 @@ Everything is idempotent — containers get recreated onto existing data volumes
 
 ## 8. Hosts with a PMM client and no database
 
-`pmm-client` is not a topology. It is a pool of three unrelated machines that
+`pmm-client` is not a topology. It is a pool of four unrelated machines that
 carry a PMM client and nothing else - **no `mongod`, no `pbm-agent`, and not even
 the PSMDB packages installed**. They come from this same Dockerfile built with
 `WITH_PSMDB=0`, so the base, the libc, the python and the pmm-client are
@@ -241,7 +256,7 @@ identical to the database nodes standing beside them; only the database is
 absent.
 
 ```bash
-./om start pmm-client              # all three
+./om start pmm-client              # all four
 ./om start pmm-client-node01       # exactly one - each node is its own profile too
 ./om logs pmm-client-node01 -f
 ```
@@ -270,9 +285,19 @@ then writes `/run/om-node-ready` - the same marker `register.sh` writes on a
 database node once it has registered. `./om start` waits on that one file for
 every node in the sandbox, so it never has to ask which kind it is looking at.
 
-**Adding a fourth.** Copy one three-line service block in `compose.yaml` (giving
+**Adding a fifth.** Copy one three-line service block in `compose.yaml` (giving
 it its own private profile alongside `pmm-client`) and bump `CLIENT_NODES` in
 `../om` to match.
 
 **MinIO does not come up with them.** It carries the four database profiles
 rather than none, because a host with no database has nothing to back up.
+
+**Rocky Linux instead of Ubuntu.** `pmm-client-rocky` is the same pool, built
+`BASE_OS=rocky` (§6), same node count as the Ubuntu pool -
+`./om start pmm-client pmm-client-rocky` brings up four of each in one command.
+
+```bash
+./om start pmm-client-rocky              # all four
+./om start pmm-client-rocky-node00       # exactly one
+./om logs pmm-client-rocky-node00 -f
+```

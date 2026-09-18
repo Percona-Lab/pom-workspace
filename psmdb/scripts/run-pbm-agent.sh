@@ -4,8 +4,8 @@
 # PBM belongs on data-bearing mongod nodes and on config-server members. It must
 # NOT run on a mongos (no local storage to back up) and there is nothing useful
 # for it to do on an arbiter, which holds no data. Rather than making the
-# supervisord program conditional, this exits 0 on those nodes and supervisord's
-# exitcodes/autorestart leave it alone.
+# pbm-agent.service unit conditional, this idles on those nodes instead of
+# exiting - see the sleep below.
 
 set -o errexit
 set -o nounset
@@ -18,8 +18,9 @@ log() { printf '[pbm-agent] %s\n' "$*" >&2; }
 
 if [ "$ROLE" = "mongos" ] || [ "$PBM_ENABLED" != "1" ]; then
     log "not applicable on this node (role=${ROLE} enabled=${PBM_ENABLED}); idling"
-    # Sleep rather than exit: a bare exit 0 inside startsecs reads as a failed
-    # start and supervisord logs it as an error on every node that skips PBM.
+    # Sleep rather than exit: pbm-agent.service is Type=simple with
+    # Restart=always, so a quick exit reads as a crash loop and systemd logs a
+    # failure on every node that skips PBM.
     exec sleep infinity
 fi
 

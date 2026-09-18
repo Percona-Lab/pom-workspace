@@ -1,0 +1,23 @@
+# One-shot: rs.initiate() + root user on the elected bootstrap member,
+# sh.addShard on a mongos. A no-op everywhere else - see scripts/cluster-init.sh.
+# WITH_PSMDB=1 only. Idempotent, so Restart=on-failure re-running it after a
+# transient failure (e.g. mongod not up yet) is safe.
+[Unit]
+Description=One-shot cluster bootstrap (rs.initiate / sh.addShard)
+After=mongo.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# See entrypoint.sh: systemd units start with a clean environment, and this
+# one specifically needs RS_BOOTSTRAP/SHARD_BOOTSTRAP/RS_MEMBERS/SHARDS from
+# compose's environment: block to know it has anything to do at all.
+EnvironmentFile=-/run/container.env
+ExecStart=/srv/scripts/cluster-init.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

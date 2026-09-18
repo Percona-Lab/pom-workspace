@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Register this node's MongoDB service with PMM and drop the credentials file
-# SEP's payloads read. Runs as a supervisord one-shot, after cluster-init.sh has
-# created the root user.
+# SEP's payloads read. Runs as register.service, a systemd one-shot unit,
+# after cluster-init.service has created the root user.
 #
 # Two things here matter to SEP specifically:
 #

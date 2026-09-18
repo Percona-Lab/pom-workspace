@@ -1,0 +1,22 @@
+# mongod or mongos - one unit either way, so `systemctl restart mongo` is the
+# same command on every node regardless of role. WITH_PSMDB=1 only.
+[Unit]
+Description=mongod/mongos
+After=network.target
+
+[Service]
+Type=simple
+# See entrypoint.sh: systemd units start with a clean environment.
+EnvironmentFile=-/run/container.env
+ExecStart=/srv/scripts/run-mongo.sh
+Restart=always
+RestartSec=5
+# mongod's clean shutdown is SIGTERM (the default); give it the full 60s before
+# systemd escalates to SIGKILL, or an upgrade restart can leave an unclean
+# dbPath. Matches supervisord's old stopwaitsecs=60.
+TimeoutStopSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

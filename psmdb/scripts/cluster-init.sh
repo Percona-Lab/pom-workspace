@@ -14,8 +14,8 @@
 #   SHARD_BOOTSTRAP=1  on a mongos: wait for each shard's set to have a primary,
 #                      then sh.addShard it.
 #
-# Everything is idempotent — re-running against an initiated set or an existing
-# user is a no-op — because supervisord may restart this after a container
+# Everything is idempotent - re-running against an initiated set or an existing
+# user is a no-op - because systemd may restart this after a container
 # recreate onto an existing data volume.
 
 set -o errexit
