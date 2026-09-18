@@ -1,0 +1,3 @@
+# Written by start.sh after each fresh boot - derived from that boot's own
+# minted secret, not meaningful outside this one running deployment.
+.env

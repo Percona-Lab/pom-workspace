@@ -1,0 +1,124 @@
+# Standalone PMM + SEP + OpenManager stack: one PMM server, the app-restricted
+# SEP side-car, and six bare pmm-client hosts (3 Ubuntu, 3 Rocky) for
+# om_bootstrap to dispatch MongoDB replica-set bootstrap runs against.
+#
+# Every image is public and pre-built - nothing here needs a checkout of this
+# repo to run, only this file (or this directory, for ./start.sh). See
+# README.md for bring-up: PMM_SEP_TOKEN below is a placeholder start.sh
+# replaces after the first boot mints PMM's secrets, so `docker compose up`
+# alone will not wire OpenManager's probe correctly.
+#
+# Mirrors SEP/sidecar/pmm-fb/compose.yaml's pmm-server + sep-sidecar pairing
+# (the shipped PMM+SEP integration) plus psmdb/compose.yaml's client-node
+# anchors (bare pmm-client hosts) - rendered into one self-contained file
+# rather than referencing either, so it stays usable on its own.
+
+name: om-demo
+
+services:
+  pmm-server:
+    image: docker.io/perconalab/pmm-server-fb:${PMM_FB_TAG:-PR-4571-a08488b}
+    environment:
+      PMM_ENABLE_SEP: "1"
+      PMM_SEP_ADDRESS: sep-sidecar:9000
+      PMM_ENABLE_NOMAD: "1" # SEP task execution runs through PMM's embedded Nomad...
+      PMM_PUBLIC_ADDRESS: pmm-server # ...which refuses to start without a public address
+      # Wires pmm-managed's own OpenManager probe/bootstrap client (distinct
+      # from PMM_SEP_ADDRESS above, which only points PMM's nginx proxy at
+      # the side-car). PMM_SEP_TOKEN must equal SEP's derived
+      # SEP_INTERNAL_TOKEN - HMAC-SHA256 of the SECRET_KEY PMM mints into the
+      # pmm-sep volume below, label b"sep-internal-token". That key does not
+      # exist until pmm-server's first boot, so start.sh brings this
+      # container up once, reads the minted key back out, computes the
+      # token, and recreates pmm-server with it - `docker compose up` alone
+      # leaves this placeholder in place and OpenManager's enable toggle
+      # fails "not available in SEP".
+      PMM_SEP_URL: http://sep-sidecar:9000
+      PMM_SEP_TOKEN: "${PMM_SEP_TOKEN:-@pmm-sep-token}"
+    ports:
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - pmm-data:/srv
+      - pmm-sep:/srv/sep
+    networks: [om-demo]
+
+  sep-sidecar:
+    image: ghcr.io/plebioda/sep:PMM-15347-om-integration-v2
+    depends_on:
+      pmm-server:
+        condition: service_healthy
+    # The image runs as uid/gid 1001; PMM writes its secret files 0640 group 0
+    # under a setgid directory, so group 0 membership is what makes them
+    # readable.
+    group_add: ["0"]
+    environment:
+      SECRETS_DIR: /run/secrets/sep
+      SEP_NOMAD_ENDPOINT: https://admin:admin@pmm-server:8443/nomad
+      BASE_URL: http://sep-sidecar:9000/sep
+      # Testing-only: speeds up PMMSyncer's pull of PMM's node/service
+      # inventory into SEP from the baked profile's 15-minute default.
+      # INVENTORY_SYNC_INTERVAL is read once at startup, not
+      # runtime-overridable, so this has to be an env var.
+      TASKS__INVENTORY_SYNC_INTERVAL__EVERY: "${SEP_INVENTORY_SYNC_MINUTES:-1}"
+      TASKS__INVENTORY_SYNC_INTERVAL__PERIOD: minutes
+    ports:
+      - "127.0.0.1:9000:9000" # sep API
+      - "127.0.0.1:9001:9001" # inventory API
+      - "127.0.0.1:9002:9002" # tasks API
+    volumes:
+      - pmm-sep:/run/secrets/sep:ro
+    networks: [om-demo]
+
+  # ── bare pmm-client hosts: no database, just PMM + Nomad agent ────────────
+  # om_bootstrap dispatches its MongoDB replica-set bootstrap payload onto
+  # these. Real systemd as PID 1 (systemctl enable/start mongod.service is
+  # part of the payload).
+  pmm-client-node00: &client-node
+    image: ghcr.io/plebioda/pmm-client-node:3
+    restart: unless-stopped
+    networks: [om-demo]
+    cgroup: host
+    cap_add: [SYS_ADMIN]
+    security_opt: [apparmor:unconfined, seccomp:unconfined]
+    tmpfs: [/run, /run/lock]
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - agent-state:/srv/agent-state
+    environment:
+      ROLE: client
+      PMM_SERVER: pmm-server:8443
+      PMM_USER: admin
+      PMM_PASSWORD: admin
+    hostname: pmm-client-node00
+
+  pmm-client-node01:
+    <<: *client-node
+    hostname: pmm-client-node01
+
+  pmm-client-node02:
+    <<: *client-node
+    hostname: pmm-client-node02
+
+  pmm-client-rocky-node00:
+    <<: *client-node
+    image: ghcr.io/plebioda/pmm-client-node-rocky:3
+    hostname: pmm-client-rocky-node00
+
+  pmm-client-rocky-node01:
+    <<: *client-node
+    image: ghcr.io/plebioda/pmm-client-node-rocky:3
+    hostname: pmm-client-rocky-node01
+
+  pmm-client-rocky-node02:
+    <<: *client-node
+    image: ghcr.io/plebioda/pmm-client-node-rocky:3
+    hostname: pmm-client-rocky-node02
+
+networks:
+  om-demo:
+    driver: bridge
+
+volumes:
+  pmm-data:
+  pmm-sep:
+  agent-state:
