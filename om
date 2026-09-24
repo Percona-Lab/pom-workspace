@@ -128,7 +128,7 @@ STATE_DIR="$ROOT/.om"
 # SEP's own settings.yaml deep-merged with this workspace's development overrides,
 # written to harness/ and handed to SEP as SETTINGS_FILE (PreEnvSettings reads it,
 # app/core/config.py). That keeps the SEP checkout at upstream's file, so its branch
-# carries OM code alone, exactly as harness/pmm.conf does for pmm.
+# carries OM code alone, exactly as harness/pmm-compose.override.yml does for pmm.
 #
 # Rendered from SEP's current settings.yaml on every run rather than snapshotted, so
 # an upstream change to any setting this workspace does not override is picked up
@@ -1201,30 +1201,6 @@ ensure_pmm_managed() {
   fi
 }
 
-# pmm.conf with the workspace's SEP locations injected, written to harness/.
-#
-# PMM's nginx has no include hook inside its server block, so a location cannot
-# be added without replacing the whole file. Rendering it from pmm's current copy
-# on every start keeps PMM's other locations exactly as the checkout has them --
-# a snapshot would drift, which is how SEP's own committed template ended up
-# still proxying the five bare prefixes the SEP UI stopped using on 2026-08-10.
-#
-# The fragment goes in ahead of `location /pmm-ui`, inside the server block.
-render_pmm_conf() {
-  local src="$PMM_DIR/build/ansible/roles/nginx/files/conf.d/pmm.conf"
-  local frag="$HARNESS_DIR/sep-locations.conf"
-  local out="$HARNESS_DIR/pmm.conf"
-  [[ -f "$src" ]]  || die "pmm.conf missing at $src"
-  [[ -f "$frag" ]] || die "SEP locations fragment missing at $frag"
-  grep -q '^    # PMM UI$' "$src" || die "pmm.conf has no '# PMM UI' anchor — render_pmm_conf needs updating"
-  awk -v frag="$frag" '
-    /^    # PMM UI$/ && !done { while ((getline line < frag) > 0) print line; print ""; done = 1 }
-    { print }
-  ' "$src" > "$out.tmp" || die "rendering pmm.conf failed"
-  grep -q 'location /sep/' "$out.tmp" || die "rendered pmm.conf has no /sep location"
-  mv "$out.tmp" "$out"
-}
-
 # Both compose files, in order. The first one fixes the project directory, so
 # pmm/ must lead: it keeps the project name `pmm` (as `make env-up` produces) and
 # makes the override's relative paths resolve against the pmm checkout.
@@ -1251,11 +1227,10 @@ start_pmm() {
     ok "image pulled"
   fi
   # PMM's own docker-compose.dev.yml plus harness/pmm-compose.override.yml, which
-  # carries what this workspace needs and the pmm checkout should not: the SEP
-  # nginx overlay, the host-gateway alias, and the entrypoint mounts the published
-  # dev image is too old to provide. Then PMM's env-pg-config, which tunes the
-  # embedded PostgreSQL on a fresh /srv volume.
-  render_pmm_conf
+  # carries what this workspace needs and the pmm checkout should not: the
+  # host-gateway alias, a cold-start health grace, and the mounts that give the
+  # published dev image the SEP files the branch's entrypoint calls. Then PMM's
+  # env-pg-config, which tunes the embedded PostgreSQL on a fresh /srv volume.
 
   # 300s rather than 100s, because the budget covers far more than the wait it
   # looks like it covers. Compose counts from the moment `up` is invoked, so on a

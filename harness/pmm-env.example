@@ -3,8 +3,8 @@
 # pmm/.env is rendered as pmm/.env.dev.example - upstream's file, whatever it says
 # today - with the keys below overwritten. Only what this workspace needs
 # differently lives here, so an upstream change to a key we do not override is
-# picked up rather than silently pinned. Same reason harness/pmm.conf and
-# harness/sep-settings.yaml are rendered instead of committed as copies.
+# picked up rather than silently pinned. Same reason harness/sep-settings.yaml is
+# rendered instead of committed as a copy.
 #
 # Two placeholder values are resolved by ./om env rather than read literally:
 #
@@ -89,6 +89,18 @@ PMM_PUBLIC_ADDRESS=pmm-server
 # is supplied by harness/pmm-compose.override.yml, so this points at a SEP backend
 # running natively on the host (./om start sep-backend).
 PMM_SEP_URL=http://host.docker.internal:8000
+
+# Where PMM's own nginx sends /sep/, and the only per-deployment input the shipped
+# reverse proxy takes: the entrypoint interpolates it into the `location /sep/` block
+# it renders from build/ansible/roles/nginx/files/sep/sep.conf.template. The shipped
+# topology points it at the side-car container (sep-sidecar:9000 in
+# harness/full-stack/compose.yaml); here SEP runs natively on the host instead, which
+# is exactly the difference this variable exists to express.
+#
+# Separate from PMM_SEP_URL above on purpose, and not derivable from it: this one
+# serves the browser and takes a bare host:port, while PMM_SEP_URL is pmm-managed's
+# own direct call and takes a URL. The shipped stack sets both, to the same backend.
+PMM_SEP_ADDRESS=host.docker.internal:8000
 
 # Bearer token pmm-managed sends to SEP. Nothing on the SEP side pins its value, so
 # it is generated rather than shared.

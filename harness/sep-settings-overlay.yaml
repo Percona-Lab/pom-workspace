@@ -3,7 +3,7 @@
 # `./om` deep-merges this into SEP's own settings.yaml and writes the result to
 # harness/sep-settings.yaml (gitignored), then points SEP at it with SETTINGS_FILE.
 # So the SEP checkout keeps upstream's settings.yaml untouched and this workspace
-# carries its own configuration -- the same split as harness/pmm.conf.
+# carries its own configuration -- the same split as harness/pmm-compose.override.yml.
 #
 # Everything here except the casdoor drop could equally be `SEP__`-prefixed
 # variables in SEP/.env. The drop cannot: AUTH__PROVIDER__CASDOOR=null arrives as
@@ -64,15 +64,24 @@ development:
 
   SEP:
     DATABASE: *pmm_embedded_db
+    # Matches sidecar/settings.yaml, and for the same reason it gives there: PMM
+    # ships a hardcoded `location /sep/` and forwards the prefix intact, so SEP
+    # has to be mounted under it. The harness used to strip the prefix in its own
+    # nginx fragment instead, because ROOT_PATH did not exist when that was
+    # written (SEP-1794); it does now, so the fragment is gone and this matches
+    # what ships. Requests that arrive unprefixed still route - which is what lets
+    # pmm-managed keep calling PMM_SEP_URL directly, exactly as the side-car
+    # topology does with sep-sidecar:9000.
+    ROOT_PATH: /sep
     # Sign in an unauthenticated caller from the ambient PMM session - the other
     # half of PMM-15293's /api/oauth/session/exchange.
     AMBIENT_SESSION_SSO_ENABLED: true
     OM_INVENTORY:
       # ENABLED defaults to False in the product (percona/sep#1437) to match PMM's
       # own OMEnabledDefault: pmm-managed's ChangeSettings is what flips it, on the
-      # PMM-15360-om-service-gate companion (percona/pmm#5852). That switch isn't
-      # in this workspace's pmm pin (PMM-15326-onto-main testing is SEP-side
-      # only), so without this override the sweep could never turn on here at all.
+      # PMM-15360-om-service-gate companion (percona/pmm#5888). Since the pmm pin
+      # moved to the PR stack that switch IS present, so this only seeds the sweep
+      # as on before anyone touches Settings; PMM overwrites it either way.
       # Testing convenience only - never change #1437's own shipped default for this.
       ENABLED: true
     # The default 127.0.0.1 is unreachable from the PMM container, which proxies
@@ -96,3 +105,4 @@ development:
     # Beat schedule lives in the same `sep` database; overridden with the password
     # from .env as CELERY__BEAT_DBURI.
     BEAT_DBURI: "postgresql://sep@127.0.0.1:5432/sep"
+

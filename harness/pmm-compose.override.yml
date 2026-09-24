@@ -2,8 +2,13 @@
 #
 # Everything the workspace needs from the PMM container that PMM itself has no
 # reason to carry. Keeping it here means the pmm checkout stays a clean branch of
-# OM code, which is also how the shipped integration works: SEP's
-# sidecar/pmm-fb/compose.yaml supplies its own overlay rather than patching PMM.
+# OM code: the workspace supplies its own overlay rather than patching PMM's files.
+#
+# It deliberately does not supply its own nginx config. PMM owns `location /sep/`
+# (percona/pmm#5884) and SEP is built to be served under it - "PMM ships a
+# hardcoded location /sep/ block, so this is fixed topology rather than a
+# per-deployment input", SEP/sidecar/settings.yaml. So the only thing this
+# workspace varies is PMM_SEP_ADDRESS, which is the input PMM exposes for it.
 #
 # Relative paths resolve against the project directory, which is pmm/ because om
 # passes pmm/docker-compose.dev.yml first and runs compose from there.
@@ -40,21 +45,34 @@ services:
       start_period: 240s
 
     volumes:
-      # PMM's own pmm.conf with the SEP locations injected, rendered by om on
-      # every start. Overrides the mount docker-compose.dev.yml already makes
-      # from the repo copy: same target, so this entry wins.
-      - ../harness/pmm.conf:/etc/nginx/conf.d/pmm.conf:ro
-
-      # SEP PostgreSQL exposure (PMM-15238 / percona/pmm#5700). PMM_SERVER_IMAGE
-      # is perconalab/pmm-server:3-dev-container, a published image older than
-      # the branch, so it runs the *image's* /opt/entrypoint.sh and PMM_ENABLE_SEP
-      # is a silent no-op unless the branch's version is mounted over it.
-      # postgres-migration comes along because the same PR moved the PG version
-      # literals into the entrypoint and passes them down as exported variables;
-      # the image's copy would abort.
+      # The SEP integration's server-side half, mounted from the checkout because
+      # PMM_SERVER_IMAGE is a published perconalab/pmm-server older than the
+      # branch. It runs the *image's* /opt/entrypoint.sh, under which
+      # PMM_ENABLE_SEP is a silent no-op, so the branch's entrypoint has to be
+      # mounted over it - and then every helper that entrypoint calls has to be
+      # mounted too, or it aborts under `set -o errexit` on the first one missing.
       #
-      # A feature build of the branch bakes all three in and needs none of this,
-      # which is why SEP's harness pins pmm-server-fb rather than the dev image.
+      # Nothing here is a workspace-specific config: each file is PMM's own, from
+      # the checkout, at the path the image would have baked it. A feature build
+      # of the branch carries all five and needs none of these mounts, which is
+      # why harness/full-stack/ pins pmm-server-fb rather than the dev image.
+      #
+      #   entrypoint.sh       the branch's, per above
+      #   postgres-sep        exposes the embedded PostgreSQL (percona/pmm#5700)
+      #   postgres-migration  the same PR moved the PG version literals into the
+      #                       entrypoint and passes them down as exported
+      #                       variables; the image's older copy would abort
+      #   sep.conf.template   the `location /sep/` block the entrypoint renders
+      #                       into /etc/nginx/sep.d/, which pmm.conf includes
+      #                       (percona/pmm#5884). PMM_SEP_ADDRESS is the only
+      #                       input; see harness/pmm-env.example
+      #   sep-secrets         publishes SEP's SECRET_KEY and DB credentials. The
+      #                       entrypoint calls it unconditionally - it owns its
+      #                       own PMM_ENABLE_SEP gate - so a missing file kills
+      #                       the container even with SEP disabled
       - ./build/docker/server/entrypoint.sh:/opt/entrypoint.sh:ro
       - ./build/ansible/roles/postgres/files/postgres-sep:/opt/ansible/roles/postgres/files/postgres-sep:ro
       - ./build/ansible/roles/postgres/files/postgres-migration:/opt/ansible/roles/postgres/files/postgres-migration:ro
+      - ./build/ansible/roles/nginx/files/sep/sep.conf.template:/opt/ansible/roles/nginx/files/sep/sep.conf.template:ro
+      - ./build/ansible/roles/sep/files/sep-secrets:/opt/ansible/roles/sep/files/sep-secrets:ro
+
