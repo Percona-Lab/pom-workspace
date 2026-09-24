@@ -1298,8 +1298,13 @@ start_sep_backend() {
   # (app/tasks/routes.py :: execute_task_queue.apply_async), running-task status
   # comes from the 30s sync_running_tasks periodic, and the snippet catalog is
   # populated by sync_snippets.delay() at startup — with no worker those all
-  # queue up in data/celery/broker/ and silently never run. SEP_CELERY=0 opts
+  # queue up in the sep-valkey broker and silently never run. SEP_CELERY=0 opts
   # out for the rare uvicorn-only case.
+  #
+  # "Silently" is not a figure of speech: beat is a separate process, so it keeps
+  # dispatching and keeps stamping celery_periodictask.last_run_at whether or not
+  # anything consumes. A dead worker therefore looks exactly like a live one from
+  # the database, and the only honest signal is the queue depth in valkey.
   local celery_note="" make_args=()
   if [[ "${SEP_CELERY:-1}" != "0" ]]; then
     make_args=(START_CELERY=1); celery_note=" + celery worker/beat"

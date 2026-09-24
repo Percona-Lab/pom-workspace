@@ -106,3 +106,25 @@ development:
     # from .env as CELERY__BEAT_DBURI.
     BEAT_DBURI: "postgresql://sep@127.0.0.1:5432/sep"
 
+    # Valkey, the same broker and the same two database numbers the shipped
+    # side-car uses (sidecar/settings.yaml: redis://127.0.0.1:6379/0 and /1,
+    # served by its bundled [program:valkey]). Supplied here as a container
+    # rather than a supervisord program because SEP runs natively in this
+    # workspace; harness/pmm-compose.override.yml starts it.
+    #
+    # This overrides SEP's own `development:` default of filesystem://, which
+    # is not crash-safe and took the worker down on 2026-09-24. Kombu's
+    # filesystem transport reads a message file that a concurrent producer has
+    # created but not yet written, gets a zero-length payload, and raises
+    # JSONDecodeError out of drain_events - which Celery classes unrecoverable
+    # and stops consuming on. Nothing restarts it and nothing says so: beat
+    # keeps dispatching, so celery_periodictask.last_run_at goes on advancing
+    # into a queue with no reader. Observed as 133 unconsumed messages and a
+    # bootstrap run stuck on install_package for half an hour, with the
+    # packages in fact installed and every Nomad allocation complete.
+    BROKER_URL: "redis://127.0.0.1:6379/0"
+    RESULT_BACKEND: "redis://127.0.0.1:6379/1"
+    # Only the filesystem transport reads these, and an explicit null drops the
+    # block that SEP's development profile merged in rather than leaving four
+    # dead paths pointing at data/celery/.
+    BROKER_TRANSPORT_OPTIONS: null

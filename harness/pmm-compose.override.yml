@@ -1,8 +1,9 @@
 # Compose overlay for pmm/docker-compose.dev.yml, applied by `./om start pmm`.
 #
 # Everything the workspace needs from the PMM container that PMM itself has no
-# reason to carry. Keeping it here means the pmm checkout stays a clean branch of
-# OM code: the workspace supplies its own overlay rather than patching PMM's files.
+# reason to carry, plus the one side service a natively-run SEP cannot supply
+# itself. Keeping it here means the pmm checkout stays a clean branch of OM code:
+# the workspace supplies its own overlay rather than patching PMM's files.
 #
 # It deliberately does not supply its own nginx config. PMM owns `location /sep/`
 # (percona/pmm#5884) and SEP is built to be served under it - "PMM ships a
@@ -76,3 +77,38 @@ services:
       - ./build/ansible/roles/nginx/files/sep/sep.conf.template:/opt/ansible/roles/nginx/files/sep/sep.conf.template:ro
       - ./build/ansible/roles/sep/files/sep-secrets:/opt/ansible/roles/sep/files/sep-secrets:ro
 
+  # SEP's Celery broker and result backend.
+  #
+  # The shipped side-car bundles this as [program:valkey] inside its own
+  # container and points Celery at redis://127.0.0.1:6379/{0,1}
+  # (SEP/sidecar/supervisord.conf, SEP/sidecar/settings.yaml). SEP runs natively
+  # here, so it gets the same Valkey as a container instead - same image family
+  # the side-car copies its binaries from, same port, same database numbers, so
+  # harness/sep-settings-overlay.yaml's URLs are the side-car's verbatim.
+  #
+  # This replaces SEP's `development:` default of filesystem://, which is not
+  # crash-safe: on 2026-09-24 it fed the worker a zero-length message and killed
+  # it with an unrecoverable JSONDecodeError, silently, for half an hour. The
+  # overlay records the full failure.
+  #
+  # In the pmm compose project rather than a file of its own because SEP already
+  # cannot start without this project - it borrows PMM's PostgreSQL and Nomad -
+  # so one lifecycle is one thing to forget rather than two. Published on
+  # loopback only: SEP reaches it from the host, and nothing in a container does.
+  sep-valkey:
+    profiles:
+      - pmm
+    image: valkey/valkey:8-bookworm
+    container_name: sep-valkey
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    # No volume. Both databases are scratch: the broker is a queue that should be
+    # empty at rest, and results expire after RESULT_EXPIRES anyway. Persisting
+    # them would only carry a crashed run's backlog into the next start.
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
