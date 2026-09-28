@@ -17,15 +17,12 @@ name: om-demo
 
 services:
   pmm-server:
-    # STALE, and broken against the side-car pinned below: PR-4571-b0634ff is a
-    # pre-rename build. It provisions the `sep` role and database and proxies
-    # `location /sep/`, while the side-car now expects `pmm_extensions` and
-    # serves /extensions, so the two cannot talk - the side-car dies on
-    #   asyncpg ... no pg_hba.conf entry for ... user "pmm_extensions"
-    # Replace with the first feature build off the post-rename bundle
-    # (percona/pmm PMM-15347-om-integration-v3 at/after 747f92d40); the two
-    # halves only work as a matched pair. Override meanwhile with PMM_FB_TAG.
-    image: docker.io/perconalab/pmm-server-fb:${PMM_FB_TAG:-PR-4571-b0634ff}
+    # The first feature build off the post-rename bundle (percona/pmm
+    # PMM-15347-om-integration-v3 at 747f92d40), so it provisions the
+    # pmm_extensions role and database and proxies `location /extensions/`.
+    # Matched pair with the side-car below; neither half works against a
+    # pre-rename counterpart.
+    image: docker.io/perconalab/pmm-server-fb:${PMM_FB_TAG:-PR-4571-3c88545}
     environment:
       PMM_ENABLE_EXTENSIONS: "1"
       PMM_EXTENSIONS_ADDRESS: sep-sidecar:9000
@@ -77,12 +74,12 @@ services:
       start_period: 240s
 
   sep-sidecar:
-    # Built from SEP main with `make image` (SEP_RESTRICT_APPS=1), tagged by the
-    # commit rather than a branch: every SEP PR in this effort is merged, so
-    # there is no branch left to name, and main moves under a tag that reused it.
-    # SEP ships no published side-car image - its CI only builds sep:builder for
-    # tests - so this is a local build pushed to a personal registry.
-    image: ghcr.io/plebioda/sep:postrename-2172cffae
+    # SEP's PMM-15347-om-integration-v3: main plus the two open PRs, #1613
+    # (om_inventory dispatch fixes) and #1619 (start_service restart). Tagged
+    # by that branch's commit, which is also what the workspace pins its SEP
+    # submodule to. SEP publishes no side-car image - its CI only builds
+    # sep:builder for tests - so this is a local build in a personal registry.
+    image: ghcr.io/plebioda/sep:integration-f786f7558
     depends_on:
       pmm-server:
         condition: service_healthy
@@ -113,7 +110,7 @@ services:
   # these. Real systemd as PID 1 (systemctl enable/start mongod.service is
   # part of the payload).
   pmm-client-node00: &client-node
-    image: ghcr.io/plebioda/pmm-client-node:3
+    image: ghcr.io/plebioda/pmm-client-node:pr-4571-3c88545
     restart: unless-stopped
     networks: [om-demo]
     cgroup: host
@@ -140,17 +137,17 @@ services:
 
   pmm-client-rocky-node00:
     <<: *client-node
-    image: ghcr.io/plebioda/pmm-client-node-rocky:3
+    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-3c88545
     hostname: pmm-client-rocky-node00
 
   pmm-client-rocky-node01:
     <<: *client-node
-    image: ghcr.io/plebioda/pmm-client-node-rocky:3
+    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-3c88545
     hostname: pmm-client-rocky-node01
 
   pmm-client-rocky-node02:
     <<: *client-node
-    image: ghcr.io/plebioda/pmm-client-node-rocky:3
+    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-3c88545
     hostname: pmm-client-rocky-node02
 
 networks:

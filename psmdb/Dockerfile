@@ -45,7 +45,15 @@
 # (WITH_PSMDB=1) stay Ubuntu-only - they are already-configured infrastructure,
 # not a bootstrap target, and PSMDB_REPO's in-place-upgrade story above is
 # unaffected either way.
+# The exact PMM client build the WITH_PSMDB=0 (bare-client) image runs, in place
+# of whatever percona-release's pmm3-client channel currently ships - a feature
+# build under test, most often. Its own stage regardless of BASE_OS, so
+# switching it is one --build-arg, not a Dockerfile edit; WITH_PSMDB=1 below
+# never reads from this stage and keeps installing the released package.
+ARG PMM_CLIENT_FB_IMAGE=docker.io/perconalab/pmm-client-fb:PR-4571-3c88545
 ARG BASE_OS=ubuntu
+
+FROM ${PMM_CLIENT_FB_IMAGE} AS pmm-client-fb
 FROM ubuntu:24.04 AS base-ubuntu
 FROM rockylinux:9 AS base-rocky
 FROM base-${BASE_OS} AS base
@@ -166,6 +174,24 @@ RUN percona-release enable-only "${PSMDB_REPO}" release \
             dnf install -y percona-server-mongodb percona-backup-mongodb; \
         fi \
         && dnf clean all; \
+    fi
+
+# WITH_PSMDB=0 only: the released pmm-client package above still does the real
+# work - creating the pmm-agent user, the /usr/sbin symlinks, the systemd
+# postinst - this only overwrites the three binaries afterward with the ones
+# from PMM_CLIENT_FB_IMAGE, at the exact paths the package already established
+# (verified identical across both: /usr/local/percona/pmm/{bin/pmm-agent,
+# bin/pmm-admin,tools/nomad}, with /usr/sbin/pmm-{agent,admin} symlinked in).
+# WITH_PSMDB=1 database nodes are untouched and keep the released client.
+RUN --mount=type=bind,from=pmm-client-fb,target=/mnt/pmm-client-fb \
+    if [ "${WITH_PSMDB}" = "0" ]; then \
+        cp -f /mnt/pmm-client-fb/usr/local/percona/pmm/bin/pmm-agent /usr/local/percona/pmm/bin/pmm-agent \
+        && cp -f /mnt/pmm-client-fb/usr/local/percona/pmm/bin/pmm-admin /usr/local/percona/pmm/bin/pmm-admin \
+        && cp -f /mnt/pmm-client-fb/usr/local/percona/pmm/tools/nomad /usr/local/percona/pmm/tools/nomad \
+        && chown pmm-agent:pmm-agent \
+            /usr/local/percona/pmm/bin/pmm-agent \
+            /usr/local/percona/pmm/bin/pmm-admin \
+            /usr/local/percona/pmm/tools/nomad; \
     fi
 
 # The Nomad client the pmm-client package ships (build/packages/deb/install:7 in

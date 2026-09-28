@@ -1,0 +1,67 @@
+# The PMM feature-build client, plus a Python runtime for Nomad's raw_exec.
+#
+# Why this exists: perconalab/pmm-client-fb ships nomad at
+# /usr/local/percona/pmm/tools/nomad but no python3 at all (it is RHEL 9 based
+# and deliberately minimal). OpenManager's om_inventory probe and om_bootstrap
+# steps are Python payloads dispatched through raw_exec, so on a node whose PMM
+# client comes from this image they have no interpreter to run under and every
+# dispatch fails on the host rather than in the app.
+#
+# Reconstructed on 2026-09-28 from `docker history` of
+# ghcr.io/plebioda/pmm-client-fb-nomad:pr-4571-b0634ff, which was built ad hoc
+# on 2026-09-25 with no Dockerfile in the repo. The layer list, and so the file
+# list below, is that image's; the source stage is inferred from the paths
+# (/usr/lib64/python3.9, /lib64/*) being RHEL 9 ones, which rockylinux:9
+# matches ABI-for-ABI with the client's own base.
+#
+# Copying rather than `dnf install`: the client image has no package manager
+# configured against a usable repo, and a copy keeps the result pinned to
+# exactly what was tested instead of whatever the repo serves that day.
+#
+# Build:
+#   docker build -f Containerfile.pmm-client-nomad \
+#     --build-arg PMM_CLIENT_FB_IMAGE=docker.io/perconalab/pmm-client-fb:<tag> \
+#     -t ghcr.io/plebioda/pmm-client-fb-nomad:<tag> .
+
+ARG PMM_CLIENT_FB_IMAGE=docker.io/perconalab/pmm-client-fb:PR-4571-3c88545
+
+FROM rockylinux:9 AS py
+RUN dnf -y install --setopt=install_weak_deps=False \
+        python3.9 python3.9-pip iproute gzip \
+    && dnf clean all
+
+FROM ${PMM_CLIENT_FB_IMAGE}
+
+# The client image runs as pmm-agent, which cannot write /usr/bin, and the
+# raw_exec driver needs root anyway to start a task as another user. The image
+# this reconstructs also ends as root, so this both matches it and is what
+# makes the symlinks below possible.
+USER root
+
+# iproute and gzip: Nomad's raw_exec driver shells out to both when it sets up
+# a task's network and unpacks an artifact.
+COPY --from=py /usr/sbin/ip /sbin/ip
+COPY --from=py /usr/bin/gzip /usr/bin/gunzip /bin/
+COPY --from=py /lib64/libbpf.so.1 /lib64/libelf.so.1 /lib64/libmnl.so.0 /lib64/libzstd.so.1 /lib64/
+
+# The interpreter, its shared libraries, and its standard library.
+COPY --from=py /lib64/libffi.so.8 /lib64/libsqlite3.so.0 /lib64/libexpat.so.1 \
+               /lib64/libbz2.so.1 /lib64/liblzma.so.5 /lib64/libuuid.so.1 /lib64/
+COPY --from=py /usr/bin/python3.9 /usr/bin/python3.9
+COPY --from=py /usr/bin/pip3.9 /usr/bin/pip3.9
+COPY --from=py /usr/lib64/libpython3.9.so.1.0 /usr/lib64/libpython3.9.so.1.0
+COPY --from=py /usr/lib64/python3.9 /usr/lib64/python3.9
+COPY --from=py /usr/lib/python3.9 /usr/lib/python3.9
+COPY --from=py /usr/share/python3-wheels /usr/share/python3-wheels
+
+# pip installs the probe's one dependency (pymongo) from PyPI over TLS, and the
+# client image's trust store does not cover it.
+COPY --from=py /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+               /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+
+# The payloads invoke `python3`, and the run-python job template builds its venv
+# with `pip3`; neither names a version.
+RUN ln -sf /usr/bin/python3.9 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.9 /usr/bin/python \
+    && ln -sf /usr/bin/pip3.9 /usr/bin/pip3 \
+    && ln -sf /usr/bin/pip3.9 /usr/bin/pip
