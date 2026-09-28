@@ -75,9 +75,9 @@ PMM_ENABLE_NOMAD=1
 PMM_NOMAD_GC_DISK_USAGE_THRESHOLD=95
 PMM_NOMAD_GC_INODE_USAGE_THRESHOLD=90
 
-# Provisions the `sep` role and database inside PMM's embedded PostgreSQL, which
+# Provisions the `pmm_extensions` role and database inside PMM's embedded PostgreSQL, which
 # is where SEP's three services and the Celery beat store all live.
-PMM_ENABLE_SEP=1
+PMM_ENABLE_EXTENSIONS=1
 
 # The container has to resolve its own published name for Nomad's advertised
 # address to be reachable from the client nodes.
@@ -88,28 +88,28 @@ PMM_PUBLIC_ADDRESS=pmm-server
 # pmm-managed proxies SEP's inventory app at /v1/om/inventory/*. host.docker.internal
 # is supplied by harness/pmm-compose.override.yml, so this points at a SEP backend
 # running natively on the host (./om start sep-backend).
-PMM_SEP_URL=http://host.docker.internal:8000
+PMM_EXTENSIONS_URL=http://host.docker.internal:8000
 
 # Where PMM's own nginx sends /sep/, and the only per-deployment input the shipped
-# reverse proxy takes: the entrypoint interpolates it into the `location /sep/` block
-# it renders from build/ansible/roles/nginx/files/sep/sep.conf.template. The shipped
+# reverse proxy takes: the entrypoint interpolates it into the `location /extensions/` block
+# it renders from build/ansible/roles/nginx/files/sep/extensions.conf.template. The shipped
 # topology points it at the side-car container (sep-sidecar:9000 in
 # harness/full-stack/compose.yaml); here SEP runs natively on the host instead, which
 # is exactly the difference this variable exists to express.
 #
-# Separate from PMM_SEP_URL above on purpose, and not derivable from it: this one
-# serves the browser and takes a bare host:port, while PMM_SEP_URL is pmm-managed's
+# Separate from PMM_EXTENSIONS_URL above on purpose, and not derivable from it: this one
+# serves the browser and takes a bare host:port, while PMM_EXTENSIONS_URL is pmm-managed's
 # own direct call and takes a URL. The shipped stack sets both, to the same backend.
-PMM_SEP_ADDRESS=host.docker.internal:8000
+PMM_EXTENSIONS_ADDRESS=host.docker.internal:8000
 
 # Bearer token pmm-managed sends to SEP. Nothing on the SEP side pins its value, so
 # it is generated rather than shared.
-PMM_SEP_TOKEN=@generate
+PMM_EXTENSIONS_TOKEN=@generate
 
-# Password for the `sep` role PMM provisions. SEP's four database settings and the
+# Password for the `pmm_extensions` role PMM provisions. SEP's four database settings and the
 # Celery beat URI all have to carry the same value, which is what ./om env exists
 # to stop anyone doing by hand.
 #
 # Baked into the role on the /srv volume at first start: changing it later leaves
 # SEP authenticating with a password PostgreSQL no longer has.
-PMM_SEP_POSTGRES_PASSWORD=@generate
+PMM_EXTENSIONS_POSTGRES_PASSWORD=@generate

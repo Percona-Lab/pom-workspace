@@ -4,7 +4,7 @@
 #
 # Every image is public and pre-built - nothing here needs a checkout of this
 # repo to run, only this file (or this directory, for ./start.sh). See
-# README.md for bring-up: PMM_SEP_TOKEN below is a placeholder start.sh
+# README.md for bring-up: PMM_EXTENSIONS_TOKEN below is a placeholder start.sh
 # replaces after the first boot mints PMM's secrets, so `docker compose up`
 # alone will not wire OpenManager's probe correctly.
 #
@@ -17,33 +17,72 @@ name: om-demo
 
 services:
   pmm-server:
-    image: docker.io/perconalab/pmm-server-fb:${PMM_FB_TAG:-PR-4571-a08488b}
+    # STALE, and broken against the side-car pinned below: PR-4571-b0634ff is a
+    # pre-rename build. It provisions the `sep` role and database and proxies
+    # `location /sep/`, while the side-car now expects `pmm_extensions` and
+    # serves /extensions, so the two cannot talk - the side-car dies on
+    #   asyncpg ... no pg_hba.conf entry for ... user "pmm_extensions"
+    # Replace with the first feature build off the post-rename bundle
+    # (percona/pmm PMM-15347-om-integration-v3 at/after 747f92d40); the two
+    # halves only work as a matched pair. Override meanwhile with PMM_FB_TAG.
+    image: docker.io/perconalab/pmm-server-fb:${PMM_FB_TAG:-PR-4571-b0634ff}
     environment:
-      PMM_ENABLE_SEP: "1"
-      PMM_SEP_ADDRESS: sep-sidecar:9000
+      PMM_ENABLE_EXTENSIONS: "1"
+      PMM_EXTENSIONS_ADDRESS: sep-sidecar:9000
       PMM_ENABLE_NOMAD: "1" # SEP task execution runs through PMM's embedded Nomad...
       PMM_PUBLIC_ADDRESS: pmm-server # ...which refuses to start without a public address
       # Wires pmm-managed's own OpenManager probe/bootstrap client (distinct
-      # from PMM_SEP_ADDRESS above, which only points PMM's nginx proxy at
-      # the side-car). PMM_SEP_TOKEN must equal SEP's derived
-      # SEP_INTERNAL_TOKEN - HMAC-SHA256 of the SECRET_KEY PMM mints into the
-      # pmm-sep volume below, label b"sep-internal-token". That key does not
+      # from PMM_EXTENSIONS_ADDRESS above, which only points PMM's nginx proxy at
+      # the side-car). PMM_EXTENSIONS_TOKEN must equal SEP's derived
+      # EXTENSIONS_INTERNAL_TOKEN - HMAC-SHA256 of the SECRET_KEY PMM mints into the
+      # pmm-extensions volume below, label b"extensions-internal-token". That key does not
       # exist until pmm-server's first boot, so start.sh brings this
       # container up once, reads the minted key back out, computes the
       # token, and recreates pmm-server with it - `docker compose up` alone
       # leaves this placeholder in place and OpenManager's enable toggle
       # fails "not available in SEP".
-      PMM_SEP_URL: http://sep-sidecar:9000
-      PMM_SEP_TOKEN: "${PMM_SEP_TOKEN:-@pmm-sep-token}"
+      PMM_EXTENSIONS_URL: http://sep-sidecar:9000
+      PMM_EXTENSIONS_TOKEN: "${PMM_EXTENSIONS_TOKEN:-@pmm-extensions-token}"
     ports:
       - "127.0.0.1:8443:8443"
     volumes:
       - pmm-data:/srv
-      - pmm-sep:/srv/sep
+      - pmm-extensions:/srv/extensions
     networks: [om-demo]
 
+    # The image's own probe with a start period that matches a cold boot.
+    #
+    # Without this the stack cannot start from empty at all. The image allows
+    # 25s before failures count, then 3 at 4s apart, so a first boot - where the
+    # entrypoint provisions PostgreSQL, Grafana, VictoriaMetrics and ClickHouse
+    # before readyz answers - is declared unhealthy at roughly 40 seconds, every
+    # time, on exactly the run where nothing is wrong. `up --wait` gives up the
+    # instant that happens, so sep-sidecar never starts and start.sh exits with
+    # "dependency failed to start"; PMM then goes healthy about a minute later,
+    # untouched, with readyz already answering 200.
+    #
+    # Measured here on 2026-09-24: unhealthy at 18:44:22, readyz 200 at 18:44:49,
+    # healthy at 18:45:09.
+    #
+    # 240s covers it with room to spare, and is the same figure
+    # harness/pmm-compose.override.yml carries for the dev stack - this file was
+    # rendered standalone and never picked up that fix. Failures after the
+    # period still mark the container unhealthy in the usual way: the probe is
+    # unchanged, only the grace before it counts.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/v1/server/readyz"]
+      interval: 4s
+      timeout: 2s
+      retries: 3
+      start_period: 240s
+
   sep-sidecar:
-    image: ghcr.io/plebioda/sep:PMM-15347-om-integration-v2
+    # Built from SEP main with `make image` (SEP_RESTRICT_APPS=1), tagged by the
+    # commit rather than a branch: every SEP PR in this effort is merged, so
+    # there is no branch left to name, and main moves under a tag that reused it.
+    # SEP ships no published side-car image - its CI only builds sep:builder for
+    # tests - so this is a local build pushed to a personal registry.
+    image: ghcr.io/plebioda/sep:postrename-2172cffae
     depends_on:
       pmm-server:
         condition: service_healthy
@@ -52,9 +91,9 @@ services:
     # readable.
     group_add: ["0"]
     environment:
-      SECRETS_DIR: /run/secrets/sep
-      SEP_NOMAD_ENDPOINT: https://admin:admin@pmm-server:8443/nomad
-      BASE_URL: http://sep-sidecar:9000/sep
+      SECRETS_DIR: /run/secrets/extensions
+      EXTENSIONS_NOMAD_ENDPOINT: https://admin:admin@pmm-server:8443/nomad
+      BASE_URL: http://sep-sidecar:9000/extensions
       # Testing-only: speeds up PMMSyncer's pull of PMM's node/service
       # inventory into SEP from the baked profile's 15-minute default.
       # INVENTORY_SYNC_INTERVAL is read once at startup, not
@@ -66,7 +105,7 @@ services:
       - "127.0.0.1:9001:9001" # inventory API
       - "127.0.0.1:9002:9002" # tasks API
     volumes:
-      - pmm-sep:/run/secrets/sep:ro
+      - pmm-extensions:/run/secrets/extensions:ro
     networks: [om-demo]
 
   # ── bare pmm-client hosts: no database, just PMM + Nomad agent ────────────
@@ -120,5 +159,5 @@ networks:
 
 volumes:
   pmm-data:
-  pmm-sep:
+  pmm-extensions:
   agent-state:

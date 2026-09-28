@@ -5,7 +5,7 @@
 #
 # compose.yaml alone cannot do this: PMM_SEP_TOKEN must equal SEP's own
 # derived SEP_INTERNAL_TOKEN (HMAC-SHA256 of the SECRET_KEY PMM writes into
-# the pmm-sep volume on first boot, label b"sep-internal-token" - see SEP's
+# the pmm-extensions volume on first boot, label b"extensions-internal-token" - see SEP's
 # Settings.derive_internal_token), and that key does not exist until
 # pmm-server has already started once. So this script starts pmm-server and
 # sep-sidecar with the placeholder, waits for sep-sidecar to read the minted
@@ -22,7 +22,7 @@ start.sh [--fresh]
 
 Bring the stack up. With no flag, an existing deployment is left alone and
 only what compose would normally recreate (e.g. after an image change)
-restarts. With --fresh, everything - including the pmm-data, pmm-sep and
+restarts. With --fresh, everything - including the pmm-data, pmm-extensions and
 agent-state volumes - is torn down and recreated from nothing: a genuinely
 first-boot test, with PMM minting new secrets and every client re-registering.
 EOF
@@ -53,10 +53,10 @@ until [[ "$(docker inspect -f '{{.State.Health.Status}}' om-demo-sep-sidecar-1 2
 done
 
 echo "==> Deriving PMM_SEP_TOKEN from this boot's SECRET_KEY"
-secret_key="$(docker exec om-demo-sep-sidecar-1 cat /run/secrets/sep/SECRET_KEY)"
+secret_key="$(docker exec om-demo-sep-sidecar-1 cat /run/secrets/extensions/SECRET_KEY)"
 token="$(python3 -c "
 import hmac, hashlib, sys
-print(hmac.new(sys.argv[1].encode(), b'sep-internal-token', hashlib.sha256).hexdigest())
+print(hmac.new(sys.argv[1].encode(), b'extensions-internal-token', hashlib.sha256).hexdigest())
 " "$secret_key")"
 
 echo "==> Writing PMM_SEP_TOKEN to .env and recreating pmm-server"

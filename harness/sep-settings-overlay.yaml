@@ -5,7 +5,7 @@
 # So the SEP checkout keeps upstream's settings.yaml untouched and this workspace
 # carries its own configuration -- the same split as harness/pmm-compose.override.yml.
 #
-# Everything here except the casdoor drop could equally be `SEP__`-prefixed
+# Everything here except the casdoor drop could equally be `EXTENSIONS__`-prefixed
 # variables in SEP/.env. The drop cannot: AUTH__PROVIDER__CASDOOR=null arrives as
 # the *string* "null" and fails validation, because pydantic-settings does not
 # coerce it. Only YAML can express the None that AuthSettings._resolve_provider
@@ -22,15 +22,15 @@ development:
 
   INVENTORY:
     DATABASE: &pmm_embedded_db
-      # PMM's embedded PostgreSQL, exposed by PMM_ENABLE_SEP (percona/pmm#5700).
-      # All three services and the Celery beat store share the one `sep` database
+      # PMM's embedded PostgreSQL, exposed by PMM_ENABLE_EXTENSIONS (percona/pmm#5700).
+      # All three services and the Celery beat store share the one `pmm_extensions` database
       # the exposure provisions; the Alembic tracks use distinct version tables.
-      # PASSWORD comes from .env (SEP__/INVENTORY__/TASKS__DATABASE__PASSWORD).
+      # PASSWORD comes from .env (EXTENSIONS__/INVENTORY__/TASKS__DATABASE__PASSWORD).
       ENGINE: postgresql
       HOST: 127.0.0.1
       PORT: 5432
-      NAME: sep
-      USER: sep
+      NAME: pmm_extensions
+      USER: pmm_extensions
       # This block replaces SEP's own settings.yaml DATABASE entirely rather than
       # merging into it (it is a plain mapping under a profile, not a
       # dynaconf_merge one), so OM's schema token has to be re-declared here too
@@ -62,17 +62,17 @@ development:
     # skipped -- the next firing a minute later picks it back up.
     INVENTORY_SYNC_INTERVAL: 1 minutes
 
-  SEP:
+  EXTENSIONS:
     DATABASE: *pmm_embedded_db
     # Matches sidecar/settings.yaml, and for the same reason it gives there: PMM
-    # ships a hardcoded `location /sep/` and forwards the prefix intact, so SEP
+    # ships a hardcoded `location /extensions/` and forwards the prefix intact, so SEP
     # has to be mounted under it. The harness used to strip the prefix in its own
     # nginx fragment instead, because ROOT_PATH did not exist when that was
     # written (SEP-1794); it does now, so the fragment is gone and this matches
     # what ships. Requests that arrive unprefixed still route - which is what lets
-    # pmm-managed keep calling PMM_SEP_URL directly, exactly as the side-car
-    # topology does with sep-sidecar:9000.
-    ROOT_PATH: /sep
+    # pmm-managed keep calling PMM_EXTENSIONS_URL directly, exactly as the side-car
+    # topology does with the side-car on :9000.
+    ROOT_PATH: /extensions
     # Sign in an unauthenticated caller from the ambient PMM session - the other
     # half of PMM-15293's /api/oauth/session/exchange.
     AMBIENT_SESSION_SSO_ENABLED: true
@@ -102,9 +102,9 @@ development:
         # service_account_token comes from .env
 
   CELERY:
-    # Beat schedule lives in the same `sep` database; overridden with the password
+    # Beat schedule lives in the same `pmm_extensions` database; overridden with the password
     # from .env as CELERY__BEAT_DBURI.
-    BEAT_DBURI: "postgresql://sep@127.0.0.1:5432/sep"
+    BEAT_DBURI: "postgresql://pmm_extensions@127.0.0.1:5432/pmm_extensions"
 
     # Valkey, the same broker and the same two database numbers the shipped
     # side-car uses (sidecar/settings.yaml: redis://127.0.0.1:6379/0 and /1,

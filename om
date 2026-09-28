@@ -155,7 +155,7 @@ SEP_ENV_FILE="$HARNESS_DIR/sep.env"
 #
 # Unset (the default): PMM's embedded PostgreSQL, which is what the overlay pins and
 # what a single workspace wants -- the same `sep` database PMM provisions under
-# PMM_ENABLE_SEP, shared by all three services and the Celery beat store.
+# PMM_ENABLE_EXTENSIONS, shared by all three services and the Celery beat store.
 #
 # Set to a directory: SQLite files under it instead, one per service. That is what a
 # second checkout wants. Two worktrees cannot run at the same time -- container
@@ -277,7 +277,7 @@ PMM_MANAGED_STAMP=/usr/sbin/.pmm-managed.om-stamp
 # A string that only the working tree's router emits (lib/constants.ts ::
 # SEP_MYSQL_BACKUPS_PATH). Its presence in the deployed bundle is the cheap
 # "is this our UI, with the SEP apps?" probe.
-PMM_UI_SEP_MARKER='sep/mysql-backups'
+PMM_UI_SEP_MARKER='extensions/mysql-backups'
 
 SEP_BACKEND_PORT=8000
 SEP_FRONTEND_PORT=5174
@@ -316,7 +316,7 @@ CLIENT_NODES=4
 # Same host, on Rocky instead of Ubuntu - same Dockerfile, BASE_OS=rocky (see
 # psmdb/Dockerfile's own comment). Exists because SEP's om_bootstrap app already
 # implements a dnf/rpm install path alongside its apt/dpkg one
-# (SEP/app/sep/apps/om_bootstrap/strategies/packages.py) and, until this pool
+# (SEP/app/extensions/apps/om_bootstrap/strategies/packages.py) and, until this pool
 # existed, had no host in the sandbox that could ever report `os_id: rocky` to
 # actually run it against. Same node count as CLIENT_PROFILE's pool, so
 # `./om start pmm-client pmm-client-rocky` brings up four of each in one
@@ -780,17 +780,17 @@ env_pmm() { # mode: create (skip when present) | refresh (ask first)
   fi
 
   # Carried over rather than regenerated, even when the file is being rewritten.
-  # PMM_SEP_POSTGRES_PASSWORD is baked into the `sep` role on the /srv volume at
+  # PMM_EXTENSIONS_POSTGRES_PASSWORD is baked into the `pmm_extensions` role on the /srv volume at
   # first start, so inventing a new one leaves SEP presenting a password
   # PostgreSQL no longer has - and the symptom appears in SEP, not here.
   local sep_pw sep_token reused=0
-  sep_pw="$(env_value "$out" PMM_SEP_POSTGRES_PASSWORD)"
-  sep_token="$(env_value "$out" PMM_SEP_TOKEN)"
+  sep_pw="$(env_value "$out" PMM_EXTENSIONS_POSTGRES_PASSWORD)"
+  sep_token="$(env_value "$out" PMM_EXTENSIONS_TOKEN)"
   [[ -n "$sep_pw" ]] && reused=1 || sep_pw="$(gen_secret 16)"
   [[ -n "$sep_token" ]] || sep_token="$(gen_secret 32)"
 
-  OM_GENERATE_PMM_SEP_POSTGRES_PASSWORD="$sep_pw" \
-  OM_GENERATE_PMM_SEP_TOKEN="$sep_token" \
+  OM_GENERATE_PMM_EXTENSIONS_POSTGRES_PASSWORD="$sep_pw" \
+  OM_GENERATE_PMM_EXTENSIONS_TOKEN="$sep_token" \
   python3 - "$base" "$PMM_ENV_TEMPLATE" "$out" <<'PY' || die "rendering $out failed"
 import os, re, sys
 
@@ -831,9 +831,9 @@ PY
 
   ok "pmm/.env rendered from .env.dev.example + harness/pmm-env.example"
   if [[ "$reused" == 1 ]]; then
-    dim "kept the existing PMM_SEP_POSTGRES_PASSWORD (it is baked into /srv)"
+    dim "kept the existing PMM_EXTENSIONS_POSTGRES_PASSWORD (it is baked into /srv)"
   else
-    dim "generated PMM_SEP_POSTGRES_PASSWORD and PMM_SEP_TOKEN"
+    dim "generated PMM_EXTENSIONS_POSTGRES_PASSWORD and PMM_EXTENSIONS_TOKEN"
   fi
 }
 
@@ -875,11 +875,11 @@ env_sep() { # mode: create | refresh
   fi
 
   local sep_pw internal token enc_key
-  sep_pw="$(env_value "$PMM_DIR/.env" PMM_SEP_POSTGRES_PASSWORD)"
-  [[ -n "$sep_pw" ]] || die "PMM_SEP_POSTGRES_PASSWORD is not in pmm/.env - run ./om env first"
+  sep_pw="$(env_value "$PMM_DIR/.env" PMM_EXTENSIONS_POSTGRES_PASSWORD)"
+  [[ -n "$sep_pw" ]] || die "PMM_EXTENSIONS_POSTGRES_PASSWORD is not in pmm/.env - run ./om env first"
   # Both halves of the same secret: pmm-managed sends it, SEP compares against it.
-  internal="$(env_value "$PMM_DIR/.env" PMM_SEP_TOKEN)"
-  [[ -n "$internal" ]] || die "PMM_SEP_TOKEN is not in pmm/.env - run ./om env first"
+  internal="$(env_value "$PMM_DIR/.env" PMM_EXTENSIONS_TOKEN)"
+  [[ -n "$internal" ]] || die "PMM_EXTENSIONS_TOKEN is not in pmm/.env - run ./om env first"
 
   if [[ -n "$existing_token" && "$existing_token" != "@grafana-token" ]]; then
     token="$existing_token"
@@ -1884,7 +1884,7 @@ reset_all() {
 
   # Both dotenv files, always, and without asking - which is only defensible
   # because this tier has already removed pmm-data. Keeping them would be worse
-  # than dropping them: PMM_SEP_POSTGRES_PASSWORD would survive into a workspace
+  # than dropping them: PMM_EXTENSIONS_POSTGRES_PASSWORD would survive into a workspace
   # whose `sep` role no longer exists, and `./om env` would faithfully reuse a
   # password for a role that is about to be provisioned with a different one.
   rm -f "$PMM_DIR/.env" "$SEP_DIR/.env"
@@ -2392,7 +2392,7 @@ om_pmm_key() {
   grep -oP '(?<=PMM__API_KEY=).*' "$SEP_DIR/.env" | tail -1
 }
 
-# SEP derives the internal token from SECRET_KEY when SEP_INTERNAL_TOKEN is unset, so
+# SEP derives the internal token from SECRET_KEY when EXTENSIONS_INTERNAL_TOKEN is unset, so
 # it is always available and always matches what the running backend accepts.
 sep_token() {
   [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
