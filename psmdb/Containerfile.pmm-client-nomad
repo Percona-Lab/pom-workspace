@@ -56,8 +56,17 @@ COPY --from=py /usr/share/python3-wheels /usr/share/python3-wheels
 
 # pip installs the probe's one dependency (pymongo) from PyPI over TLS, and the
 # client image's trust store does not cover it.
+#
+# Both the bundle and the symlink: pip resolves its CA through
+# /etc/pki/tls/certs/ca-bundle.crt, which on RHEL is a link to the extracted
+# PEM. Copying only the PEM leaves that path missing and every install dies
+# with "Could not find a suitable TLS CA certificate bundle, invalid path" -
+# the probe's prepare-env step then fails and the host reports "no output".
 COPY --from=py /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
                /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+RUN mkdir -p /etc/pki/tls/certs \
+    && ln -sf /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+              /etc/pki/tls/certs/ca-bundle.crt
 
 # The payloads invoke `python3`, and the run-python job template builds its venv
 # with `pip3`; neither names a version.
