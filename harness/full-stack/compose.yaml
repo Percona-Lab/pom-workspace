@@ -91,11 +91,23 @@ services:
       start_period: 240s
 
   sep-sidecar:
-    # SEP's PMM-15347-om-integration-v3: main plus the two open PRs, #1613
-    # (om_inventory dispatch fixes) and #1619 (start_service restart). Tagged
-    # by that branch's commit, which is also what the workspace pins its SEP
-    # submodule to. SEP publishes no side-car image - its CI only builds
-    # sep:builder for tests - so this is a local build in a personal registry.
+    # SEP's main plus the two open PRs #1613 (om_inventory dispatch fixes) and
+    # #1619 (start_service restart), tagged by that build's commit. SEP
+    # publishes no side-car image - its CI only builds sep:builder for tests -
+    # so this is a local build in a personal registry.
+    #
+    # No longer the submodule's pin, and the note that said it was is what this
+    # replaces. The submodule now carries two further PRs this tag predates:
+    # #1624, which takes the Nomad dispatch path off the event loop, and #1625,
+    # which stops a dispatch lock's own bookkeeping failing the dispatch.
+    #
+    # That makes the gap worth stating rather than just recording. #1624 also
+    # carries the fix for the regression it shipped with, where every
+    # request-less caller reached for an aiohttp session nothing had opened and
+    # the dispatch answered 500 - an om_inventory sweep failed on all 14 hosts.
+    # This tag is old enough to have neither, so it is unaffected; a rebuild
+    # onto anything between that port and its fix would not be. Rebuild from
+    # the submodule's commit to exercise either PR here.
     image: ghcr.io/plebioda/sep:integration-f786f7558
     depends_on:
       pmm-server:
