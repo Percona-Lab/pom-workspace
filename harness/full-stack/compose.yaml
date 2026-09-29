@@ -22,6 +22,14 @@ services:
     # pmm_extensions role and database and proxies `location /extensions/`.
     # Matched pair with the side-car below; neither half works against a
     # pre-rename counterpart.
+    #
+    # Lags the submodule: the bundle has since moved to d1e0d0542, which adds
+    # PMM-15360's startup reconcile retry (pmm-managed now re-PATCHes
+    # om_inventory's ENABLED each tick until it lands, instead of giving up
+    # after one refused attempt). This image still has the one-shot version, so
+    # a cold start here can leave OpenManager enabled in PMM and off in the
+    # side-car until pmm-managed restarts. Rebuild the feature build and bump
+    # PMM_FB_TAG to test that fix end to end.
     image: docker.io/perconalab/pmm-server-fb:${PMM_FB_TAG:-PR-4571-3c88545}
     environment:
       PMM_ENABLE_EXTENSIONS: "1"
