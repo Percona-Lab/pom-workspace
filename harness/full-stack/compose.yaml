@@ -23,13 +23,22 @@ services:
     # Matched pair with the side-car below; neither half works against a
     # pre-rename counterpart.
     #
-    # Lags the submodule: the bundle has since moved to d1e0d0542, which adds
-    # PMM-15360's startup reconcile retry (pmm-managed now re-PATCHes
-    # om_inventory's ENABLED each tick until it lands, instead of giving up
-    # after one refused attempt). This image still has the one-shot version, so
-    # a cold start here can leave OpenManager enabled in PMM and off in the
-    # side-car until pmm-managed restarts. Rebuild the feature build and bump
-    # PMM_FB_TAG to test that fix end to end.
+    # Lags the submodule, and by more than it used to. The pin is now
+    # PMM-15299-open-manager's tip, which carries all five of the OM stack's
+    # merged PRs: the service gate (#5888), the bearer-token log fix (#5995),
+    # and the whole bootstrap chain (#5949, #5950, #5951).
+    #
+    # This tag has not been rebuilt since before PMM-15360's startup reconcile
+    # retry landed, so it still has the one-shot version: a cold start here can
+    # leave OpenManager enabled in PMM and off in the side-car until
+    # pmm-managed restarts. Everything merged after that, the bootstrap backend
+    # and its UI included, is absent from the image too.
+    #
+    # The exact delta cannot be read off the history: the tag's own source
+    # commit (3c88545) no longer resolves in this repo or on either remote, so
+    # treat the image as predating the stack rather than trying to diff it.
+    # Rebuild the feature build and bump PMM_FB_TAG to exercise any of it end
+    # to end.
     image: docker.io/perconalab/pmm-server-fb:${PMM_FB_TAG:-PR-4571-3c88545}
     environment:
       PMM_ENABLE_EXTENSIONS: "1"
