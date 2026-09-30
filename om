@@ -76,7 +76,7 @@
 #   ./om topology api <p>   any /v1/om path, e.g. `api topology/runs:collect -X POST -d {}`
 #                           or `api inventory/hosts` for the proxied estate
 #
-# OM inventory in SEP (schema om: host, service, inventory_run;
+# OM inventory in SEP (schema om: om_host, om_service, om_inventory_run;
 #                      API /api/apps/om_inventory):
 #
 #   ./om inventory          overview: how much of the estate is probed and failing
@@ -2391,10 +2391,35 @@ cmd_logs() {
 
 # SEP's three databases all point at PMM's embedded PostgreSQL, so this is the
 # one connection for inventory, tasks and OM's own tables alike.
-SEP_DB_HOST=127.0.0.1
-SEP_DB_PORT=5432
-SEP_DB_NAME=sep
-SEP_DB_USER=sep
+#
+# Read from the overlay that pins them rather than repeated here. They were
+# repeated here, and the copy went stale exactly the way a snapshot does: PMM
+# renamed the role and database it provisions under PMM_ENABLE_EXTENSIONS from
+# `sep` to `pmm_extensions`, harness/sep-settings-overlay.yaml followed, and these
+# four lines did not. SEP itself went on connecting fine - it reads the overlay -
+# while every ./om inventory/topology query died with
+#   psql: FATAL:  role "sep" does not exist
+# which reads like PMM is down rather than like a stale constant in this script.
+#
+# Tolerant by design: a key the overlay stops pinning falls back to the literal
+# passed here, so a parse that comes up empty cannot build a connection string
+# with a hole in it.
+sep_db_setting() {
+  local key="$1" fallback="$2" value=
+  value="$(awk -v key="$key" '
+    /^[[:space:]]*DATABASE:[[:space:]]*&pmm_embedded_db/ {
+      indent = match($0, /[^ ]/); inblock = 1; next
+    }
+    inblock && match($0, /[^ ]/) > 0 && match($0, /[^ ]/) <= indent { inblock = 0 }
+    inblock && $1 == key ":" { print $2; exit }
+  ' "$HARNESS_DIR/sep-settings-overlay.yaml" 2>/dev/null)"
+  printf '%s' "${value:-$fallback}"
+}
+
+SEP_DB_HOST="$(sep_db_setting HOST 127.0.0.1)"
+SEP_DB_PORT="$(sep_db_setting PORT 5432)"
+SEP_DB_NAME="$(sep_db_setting NAME pmm_extensions)"
+SEP_DB_USER="$(sep_db_setting USER pmm_extensions)"
 
 
 # Reads the SEP database password from SEP/.env. `head -1`: several *__DATABASE__
@@ -2428,7 +2453,7 @@ sep_token() {
 #
 # OM is split across both products, so there are two stores and two APIs:
 #
-#   sep_psql   SEP's database      om.host/service/inventory_run - what the probe saw
+#   sep_psql   SEP's database      om.om_host/om_service/om_inventory_run - the probe's
 #   pmm_psql   pmm-managed's       om_topology_runs/_snapshots — the topology documents
 #   pmm_api    /v1/om              what the UI reads
 #   sep_api    /api/apps/<app>     any SEP app, om_inventory being the first
@@ -2464,8 +2489,15 @@ sep_sqlite_file() { printf '%s/sep.db' "$SEP_DB_DIR"; }
 #
 # The models declare a *symbolic* schema that the engine translates per bind: to
 # `om` on PostgreSQL, and to the default schema on SQLite, which has no schemas.
-# So the same table is `om.host` in one and plain `host` in the other, and a query
-# written for one is a syntax error against the other.
+# So the same table is `om.om_host` in one and plain `om_host` in the other, and a
+# query written for one is a syntax error against the other.
+#
+# Takes the table's real name, not a logical one. It used to be called with `host`
+# and `service` while om_inventory's models declare `om_host` and `om_service`
+# (app/extensions/apps/om_inventory/models.py), so every caller produced
+#   ERROR:  relation "om.host" does not exist
+# Do not be tempted to add the `om_` here instead: om_bootstrap's table in the same
+# schema is plain `bootstrap_run`, so the prefix is part of the name, not the rule.
 om_table() {
   if [[ -n "$SEP_DB_DIR" ]]; then printf '%s' "$1"; else printf 'om.%s' "$1"; fi
 }
@@ -2847,11 +2879,11 @@ inv_cmd_estate() {
            coalesce(cast(h.last_success_at as text), ''),
            coalesce(cast(h.observed as text), '{}'),
            coalesce(h.consecutive_failures, 0)
-    from $(om_table host) h order by h.name;")"
+    from $(om_table om_host) h order by h.name;")"
   services="$(sep_query "
     select s.node_id, coalesce(s.name, '?'), coalesce(cast(s.port as text), '?'),
            coalesce(cast(s.last_success_at as text), '')
-    from $(om_table service) s order by s.name;")"
+    from $(om_table om_service) s order by s.name;")"
 
   FILTER="$filter" SERVICES="$services" python3 -c '
 import json, os, sys
@@ -2933,7 +2965,7 @@ if not shown:
 
 inv_cmd_sql() {
   [[ $# -gt 0 ]] || die "usage: ./om inventory sql <query>
-    tables: $(om_table host), $(om_table service), $(om_table inventory_run)"
+    tables: $(om_table om_host), $(om_table om_service), $(om_table om_inventory_run)"
   if [[ -z "$SEP_DB_DIR" ]]; then
     sep_psql -c "$*"
     return
@@ -2998,8 +3030,8 @@ inv_cmd_sync() {
   out="$( cd "$SEP_DIR" && "$SEP_DIR/venv/bin/python" - <<'PY' 2>&1
 import asyncio, logging, sys
 logging.basicConfig(level=logging.WARNING, stream=sys.stdout)
-from app.sep.apps.inventory.sync import run_scheduled_inventory_sync
-asyncio.run(run_scheduled_inventory_sync("app.sep.sync.syncers.pmm.PMMSyncer"))
+from app.extensions.apps.inventory.sync import run_scheduled_inventory_sync
+asyncio.run(run_scheduled_inventory_sync("app.extensions.sync.syncers.pmm.PMMSyncer"))
 PY
   )" || rc=$?
   [[ -n "$out" ]] && printf '%s\n' "$out"
