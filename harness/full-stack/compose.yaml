@@ -154,8 +154,28 @@ services:
   # om_bootstrap dispatches its MongoDB replica-set bootstrap payload onto
   # these. Real systemd as PID 1 (systemctl enable/start mongod.service is
   # part of the payload).
+  #
+  # Tagged after the same feature build as pmm-server, and that is a real
+  # constraint rather than a naming habit. psmdb/Dockerfile overlays
+  # tools/nomad from the FB client image over the released package, so this tag
+  # decides the Nomad *client* version while pmm-server decides the Nomad
+  # *server*. The previous build was v2.0.5 on both sides; this one is v2.0.7 on
+  # both. OM's whole dispatch path is Nomad - om_inventory sweeps and
+  # om_bootstrap runs are Nomad jobs landing on these hosts - so a skew here
+  # surfaces as hosts unreachable, which looks like the app's fault.
+  #
+  # Rebuild both, from psmdb/, with the tag pmm-server uses:
+  #   docker build --build-arg WITH_PSMDB=0 --build-arg BASE_OS=ubuntu \
+  #     --build-arg PMM_CLIENT_FB_IMAGE=docker.io/perconalab/pmm-client-fb:<tag> \
+  #     -t ghcr.io/plebioda/pmm-client-node:<tag> .
+  # and again with BASE_OS=rocky. Check `tools/nomad version` in the result
+  # against the server image before pinning it here.
+  #
+  # psmdb/Dockerfile's own default stays on the older build on purpose: it is
+  # what ./om's dev loop builds from, and that stack's pmm-server is still
+  # v2.0.5. Bumping the default would fix this pairing and break that one.
   pmm-client-node00: &client-node
-    image: ghcr.io/plebioda/pmm-client-node:pr-4571-3c88545
+    image: ghcr.io/plebioda/pmm-client-node:pr-4571-2f183d5
     restart: unless-stopped
     networks: [om-demo]
     cgroup: host
@@ -182,17 +202,17 @@ services:
 
   pmm-client-rocky-node00:
     <<: *client-node
-    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-3c88545
+    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-2f183d5
     hostname: pmm-client-rocky-node00
 
   pmm-client-rocky-node01:
     <<: *client-node
-    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-3c88545
+    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-2f183d5
     hostname: pmm-client-rocky-node01
 
   pmm-client-rocky-node02:
     <<: *client-node
-    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-3c88545
+    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-2f183d5
     hostname: pmm-client-rocky-node02
 
 networks:

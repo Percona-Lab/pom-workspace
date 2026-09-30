@@ -50,6 +50,21 @@
 # build under test, most often. Its own stage regardless of BASE_OS, so
 # switching it is one --build-arg, not a Dockerfile edit; WITH_PSMDB=1 below
 # never reads from this stage and keeps installing the released package.
+#
+# This default is deliberately NOT the newest feature build, and the reason is
+# Nomad. The overlay below replaces tools/nomad as well as the two PMM binaries,
+# so this pin decides the Nomad *client* version on every bare host, while the
+# pmm-server image decides the Nomad *server* it talks to. They have to match.
+#
+#   ./om's dev loop  server perconalab/pmm-server (harness/pmm-env.example's
+#                    pinned sha)            Nomad v2.0.5  <- this default, v2.0.5
+#   full-stack demo  server pmm-server-fb:PR-4571-2f183d5 Nomad v2.0.7
+#
+# So the demo's three ghcr images are built with an explicit --build-arg for the
+# newer client and the dev loop keeps this one. Bumping this default to follow a
+# new feature build therefore *creates* a skew in the dev loop while fixing the
+# demo's - it does not help both. Move it only when the dev-loop server image
+# moves, and check `tools/nomad version` in both halves when you do.
 ARG PMM_CLIENT_FB_IMAGE=docker.io/perconalab/pmm-client-fb:PR-4571-3c88545
 ARG BASE_OS=ubuntu
 
