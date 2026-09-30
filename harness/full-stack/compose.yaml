@@ -95,19 +95,26 @@ services:
 
   sep-sidecar:
     # Built from the workspace's SEP pin, so the tag is that commit: PMM
-    # Extensions main plus the four open PRs #1613 (om_inventory dispatch
+    # Extensions main plus the five open PRs #1613 (om_inventory dispatch
     # fixes), #1619 (start_service restart), #1624 (the Nomad dispatch path off
-    # the event loop) and #1625 (the dispatch lock's connection use). PMM
-    # Extensions publishes no side-car image - its CI only builds
-    # extensions:builder for tests - so this is a local build in a personal
-    # registry.
+    # the event loop), #1625 (the dispatch lock's connection use) and #1630 (the
+    # monitoring user on the primary). PMM Extensions publishes no side-car
+    # image - its CI only builds extensions:builder for tests - so this is a
+    # local build in a personal registry.
     #
     # Matched pair with pmm-server above, and the pairing is what matters here
     # rather than either tag: #1624 is the async Nomad port, and the PMM side
     # reads om_inventory over that path. A side-car older than #1624's session
     # fix answers 500 to every dispatch and an inventory sweep fails on all its
-    # hosts, which is what the previous tag would have done had it carried the
-    # port. It predated it, so it was merely old rather than broken.
+    # hosts.
+    #
+    # #1630 is what makes an om_bootstrap run onto these hosts survive its own
+    # election. create_pmm_monitoring_user ran on the seed member and createUser
+    # needs the primary, which the seed is not reliably elected to be - so a run
+    # failed "not primary" and rolled back a healthy replica set, on whichever
+    # runs the seed happened to lose. Found on a CHAOS deployment where three
+    # Rocky hosts rolled back and four Ubuntu hosts, minutes earlier, did not.
+    # A side-car without it bootstraps by luck.
     #
     # Rebuild with, from the SEP checkout at the pinned commit:
     #   docker build -t localhost/extensions:builder -f Containerfile.base .
@@ -124,7 +131,7 @@ services:
     # `make pack` archives a *committed ref*, so uncommitted work in the SEP
     # checkout is invisible to the image while sidecar/ and alembic.ini come
     # from the working tree. Two sources of truth in one build.
-    image: ghcr.io/plebioda/sep:integration-271386485
+    image: ghcr.io/plebioda/sep:integration-a998058d5
     depends_on:
       pmm-server:
         condition: service_healthy
