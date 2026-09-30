@@ -119,6 +119,27 @@
 
 set -euo pipefail
 
+# An inherited VIRTUAL_ENV is always wrong here, so it is dropped before anything
+# reads it.
+#
+# om owns SEP/venv: it hardcodes SEP/venv/bin/python at every call site and
+# `./om reset` deletes that exact path. SEP's Makefile, though, treats VIRTUAL_ENV
+# as an override -- `ifdef VIRTUAL_ENV` makes it VENV, and the venv target's guard
+# is `[ ! -z "${VIRTUAL_ENV}" ] || [ -d "${VENV}" ]`, which takes a set VIRTUAL_ENV
+# as proof the environment already exists.
+#
+# VS Code exports VIRTUAL_ENV into every terminal and into the extension host once
+# SEP/venv is the selected interpreter, which breaks the documented recovery loop:
+# `./om reset all` removes SEP/venv, the stale variable still names it, so the
+# guard short-circuits, `python3 -m venv` never runs, and the next line dies with
+#   bash: SEP/venv/bin/pip: No such file or directory   (make: *** Error 127)
+# on a workspace whose whole point is rebuilding from a clean slate.
+#
+# Unsetting rather than passing VENV= on each make line because dev-backend,
+# dev-frontend and migrate resolve it too, and a venv om will not subsequently use
+# is not worth populating.
+unset VIRTUAL_ENV
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SEP_DIR="$ROOT/SEP"
 PMM_DIR="$ROOT/pmm"
