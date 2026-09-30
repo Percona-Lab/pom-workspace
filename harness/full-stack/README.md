@@ -57,7 +57,7 @@ available in SEP" - a decidedly misleading message for a wrong bearer token.
 
 ## Tuning
 
-- `PMM_FB_TAG` - repin the PMM image (default `PR-4571-a08488b`).
+- `PMM_FB_TAG` - repin the PMM image (default `PR-4571-2f183d5`).
 - `SEP_INVENTORY_SYNC_MINUTES` - how often SEP's `PMMSyncer` pulls PMM's
   node/service inventory (default `1`; the shipped production profile
   defaults to 15).
