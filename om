@@ -2538,12 +2538,93 @@ pmm_api() {
     "https://127.0.0.1:${PMM_HTTPS_PORT}/v1/om/${path}" "$@"
 }
 
+# The same, for a reader that goes on to index the document: prints the document, or
+# fails with what actually went wrong and prints nothing.
+#
+# pmm-managed answers a gated-off service with a gRPC error envelope and HTTP 400,
+#   {"error": "...", "code": 9, "message": "Service om.v1.OmService is disabled."}
+# which has none of the fields the topology readers index, so they died on
+#   KeyError: 'summary'   and   KeyError: 'environments'
+# in the one state a freshly bootstrapped workspace is guaranteed to be in - OM is
+# off in PMM until PMM_ENABLE_OM says otherwise. A traceback there says nothing
+# about which of the two products is not set up yet, which is the only question
+# being asked at that point.
+pmm_api_om() {
+  pmm_api "$1" | OM_PATH="$1" python3 -c '
+import json, os, sys
+
+path = os.environ["OM_PATH"]
+raw = sys.stdin.read()
+if not raw.strip():
+    sys.exit("  no answer from /v1/om/%s - is pmm-managed up?" % path)
+try:
+    doc = json.loads(raw)
+except ValueError:
+    sys.exit("  /v1/om/%s did not answer JSON:\n  %s" % (path, raw[:200]))
+# The envelope and a real document are both objects, so the discriminator is the
+# error pair rather than the type.
+if isinstance(doc, dict) and "code" in doc and "message" in doc:
+    note = doc["message"]
+    if "is disabled" in note:
+        note += ("\n  OpenManager is off in PMM. Add PMM_ENABLE_OM=1 to pmm/.env and"
+                 "\n  ./om restart pmm, or turn it on in PMM under Configuration.")
+    sys.exit("  /v1/om/%s: %s" % (path, note))
+json.dump(doc, sys.stdout)
+'
+}
+
 # The same for any SEP app's API. `app` is the module name as registered in
 # settings.yaml, so this keeps working for the upgrade and restart apps to come.
 sep_api() {
   local app="$1" path="${2#/}"; shift 2 || true
   curl -s -m 30 -H "Authorization: Bearer $(sep_token)" \
     "http://127.0.0.1:8000/api/apps/${app}/${path}" "$@"
+}
+
+# The same, for an endpoint that answers with a page rather than a list: walks every
+# page and prints the rows as one JSON array.
+#
+# om_inventory's /hosts and /services return PaginatedResponse - {items, total,
+# offset, limit} - and cap limit at 200. A plain GET is therefore both the wrong
+# shape for the readers below, which all want a list and said
+#   unexpected answer from /hosts: {'items': [], 'total': 0, ...}
+# and a silent truncation the day an estate outgrows one page. Paging belongs here
+# rather than in each reader, so they go on taking a list.
+#
+# An endpoint that is not paginated after all is handed back untouched, so this is
+# safe to use on one that may or may not have grown a page yet. Failures print
+# nothing, which the readers already turn into "could not read the app".
+sep_api_paged() {
+  local app="$1" path="${2#/}"
+  APP="$app" API_PATH="$path" TOKEN="$(sep_token)" python3 - <<'PY'
+import json, os, sys, urllib.error, urllib.request
+
+app, path = os.environ["APP"], os.environ["API_PATH"]
+base = "http://127.0.0.1:8000/api/apps/%s/%s" % (app, path)
+joiner = "&" if "?" in path else "?"
+headers = {"Authorization": "Bearer " + os.environ["TOKEN"]}
+
+rows, offset, limit = [], 0, 200
+while True:
+    url = "%s%soffset=%d&limit=%d" % (base, joiner, offset, limit)
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, headers=headers), timeout=30
+        ) as response:
+            page = json.load(response)
+    except (urllib.error.URLError, OSError, ValueError):
+        sys.exit(0)
+    if not isinstance(page, dict) or "items" not in page:
+        json.dump(page, sys.stdout)
+        sys.exit(0)
+    rows.extend(page["items"])
+    offset += len(page["items"])
+    # len(), not limit: a short page means the end regardless of what total says,
+    # and without it a total that overcounts loops forever.
+    if not page["items"] or offset >= page.get("total", offset):
+        break
+json.dump(rows, sys.stdout)
+PY
 }
 
 # Pretty-prints a JSON body, or passes it through when it is not JSON (an error page,
@@ -2564,12 +2645,10 @@ except ValueError:
 
 topology_cmd_show() {
   info "OM topology (pmm-managed)"
-  pmm_api topology | python3 -c '
+  local doc; doc="$(pmm_api_om topology)" || return 1
+  printf '%s' "$doc" | python3 -c '
 import json, sys
-try:
-    d = json.load(sys.stdin)
-except ValueError:
-    sys.exit("  could not read /v1/om/topology — is pmm-managed up with the OM service?")
+d = json.load(sys.stdin)
 s, snap = d["summary"], d["snapshot"]
 gen, obs, stale = snap["generated_at"], snap["observed_at"], snap["stale"]
 run, origin = snap["run_id"], d.get("origin_node")
@@ -2591,7 +2670,8 @@ print("  roles: " + ", ".join("%s=%d" % (short(k), n) for k, n in sorted(s["proc
 # One row per service, which is what you actually want to look at: the document is
 # nested environment -> cluster -> service and unreadable as raw JSON at any size.
 topology_cmd_services() {
-  pmm_api topology | python3 -c '
+  local doc; doc="$(pmm_api_om topology)" || return 1
+  printf '%s' "$doc" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 rows = [(e.get("env_name") or "-", c.get("name") or "-", s)
@@ -2698,7 +2778,7 @@ cmd_topology() {
 
 inv_cmd_show() {
   info "OM inventory (SEP app om_inventory)"
-  sep_api om_inventory hosts | python3 -c '
+  sep_api_paged om_inventory hosts | python3 -c '
 import json, sys
 from collections import Counter
 try:
@@ -2739,7 +2819,7 @@ if fields:
 # disagreement between this and the sql view is a serialisation bug worth finding.
 # The optional argument matches the name or any observed value.
 inv_cmd_facts() {
-  sep_api om_inventory services | FILTER="${1:-}" python3 -c '
+  sep_api_paged om_inventory services | FILTER="${1:-}" python3 -c '
 import json, os, sys
 
 services = json.load(sys.stdin)
