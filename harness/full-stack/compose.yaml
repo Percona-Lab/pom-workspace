@@ -17,32 +17,27 @@ name: om-demo
 
 services:
   pmm-server:
-    # Feature build of percona/pmm's PMM-15299-open-manager at 0bcc5f13c, which
-    # is what the workspace pins its pmm submodule to - so for the first time in
-    # a while the image and the checkout are the same code. It provisions the
-    # pmm_extensions role and database, proxies `location /extensions/`, and
-    # carries all eight merged OM chains: the Settings flag (#5866), nav gating
-    # (#5853), the service gate (#5888), the paginated envelope (#5921), the
-    # token log fix (#5995) and the whole bootstrap chain (#5949, #5950, #5951).
+    # Feature build PR-4571-1a75a83: percona/pmm#6054 at cdcadc31a, the
+    # "Operations for MongoDB" rename and page consolidation, on top of
+    # PMM-15299-open-manager. That integration branch carries every merged OM
+    # chain - the Settings flag (#5866), nav gating (#5853), the service gate
+    # (#5888), the paginated envelope (#5921), the token log fix (#5995), the
+    # whole bootstrap chain (#5949, #5950, #5951) and push-mode exporters for
+    # bootstrapped hosts (#6018). It provisions the pmm_extensions role and
+    # database and proxies `location /extensions/`.
     #
     # Matched pair with the side-car below; neither half works against a
     # pre-rename counterpart, and OM in particular is split across the two -
     # pmm-managed holds the topology half and reads the side-car's om_inventory.
     #
     # The tag's sha is the pmm-submodules commit that triggered the build, not a
-    # percona/pmm commit. An earlier version of this note claimed 3c88545 "no
-    # longer resolves on either remote", which was wrong in a way worth naming:
-    # it was looked up in the pmm repo, where it never existed. `git log` it in
-    # pmm-submodules instead, and read ci.yml there for what a build pinned.
-    #
-    # That ci.yml also explains why this build comes off a fork of the branch
-    # rather than percona/pmm: ci.py refuses a dependency branch whose open PR
-    # is dirty, and #5872 conflicts on one line of api/Makefile. Same tree
-    # either way.
+    # percona/pmm commit. `git log` it in pmm-submodules, and read ci.yml there
+    # for what a build pinned. /v1/server/version reports the pmm-managed
+    # commit the image actually carries.
     #
     # OM is still off until PMM_ENABLE_OM or the Configuration toggle turns it
     # on - the image having the code is not the feature being enabled.
-    image: docker.io/perconalab/pmm-server-fb:${PMM_FB_TAG:-PR-4571-2f183d5}
+    image: docker.io/perconalab/pmm-server-fb:${PMM_FB_TAG:-PR-4571-1a75a83}
     environment:
       PMM_ENABLE_EXTENSIONS: "1"
       PMM_EXTENSIONS_ADDRESS: sep-sidecar:9000
@@ -94,13 +89,13 @@ services:
       start_period: 240s
 
   sep-sidecar:
-    # Built from the workspace's SEP pin, so the tag is that commit: PMM
-    # Extensions main plus the five open PRs #1613 (om_inventory dispatch
-    # fixes), #1619 (start_service restart), #1624 (the Nomad dispatch path off
-    # the event loop), #1625 (the dispatch lock's connection use) and #1630 (the
-    # monitoring user on the primary). PMM Extensions publishes no side-car
-    # image - its CI only builds extensions:builder for tests - so this is a
-    # local build in a personal registry.
+    # Built from percona/SEP#1624's head, 04c82dd9c, which sits directly on
+    # PMM Extensions main at 835da2a16. Main already carries every other fix
+    # the previous pin bundled (#1613, #1619, #1625, #1630) and the SEP half of
+    # the Operations rename (#1655); #1624 is the one still open. PMM
+    # Extensions' own published images (percona/pmm-extensions) stop at
+    # fbc2923a4, 37 commits short of that, so this is a local build in a
+    # personal registry.
     #
     # Matched pair with pmm-server above, and the pairing is what matters here
     # rather than either tag: #1624 is the async Nomad port, and the PMM side
@@ -108,13 +103,12 @@ services:
     # fix answers 500 to every dispatch and an inventory sweep fails on all its
     # hosts.
     #
-    # #1630 is what makes an om_bootstrap run onto these hosts survive its own
-    # election. create_pmm_monitoring_user ran on the seed member and createUser
-    # needs the primary, which the seed is not reliably elected to be - so a run
-    # failed "not primary" and rolled back a healthy replica set, on whichever
-    # runs the seed happened to lose. Found on a CHAOS deployment where three
-    # Rocky hosts rolled back and four Ubuntu hosts, minutes earlier, did not.
-    # A side-car without it bootstraps by luck.
+    # Checked against PR-4571-1a75a83 on 2026-10-06, with the pr-4571-1a75a83
+    # client images below: a scan answered on all seven nodes, and a
+    # three-member PSMDB 7.0 install succeeded on the Rocky hosts and again on
+    # the Ubuntu ones, through rs_initiate and the monitoring user, with
+    # push-mode exporters and mongodb_up=1 on every member. PSMDB 8.0 refuses to start on
+    # a 6.19+ host kernel (SERVER-121912), so pick 7.0 on such a host.
     #
     # Rebuild with, from the SEP checkout at the pinned commit:
     #   docker build -t localhost/extensions:builder -f Containerfile.base .
@@ -131,7 +125,7 @@ services:
     # `make pack` archives a *committed ref*, so uncommitted work in the SEP
     # checkout is invisible to the image while sidecar/ and alembic.ini come
     # from the working tree. Two sources of truth in one build.
-    image: ghcr.io/plebioda/sep:integration-a998058d5
+    image: ghcr.io/plebioda/sep:pr1624-04c82dd9c
     depends_on:
       pmm-server:
         condition: service_healthy
@@ -166,8 +160,7 @@ services:
   # constraint rather than a naming habit. psmdb/Dockerfile overlays
   # tools/nomad from the FB client image over the released package, so this tag
   # decides the Nomad *client* version while pmm-server decides the Nomad
-  # *server*. The previous build was v2.0.5 on both sides; this one is v2.0.7 on
-  # both. OM's whole dispatch path is Nomad - om_inventory sweeps and
+  # *server*. Both sides are v2.0.7 in this build. OM's whole dispatch path is Nomad - om_inventory sweeps and
   # om_bootstrap runs are Nomad jobs landing on these hosts - so a skew here
   # surfaces as hosts unreachable, which looks like the app's fault.
   #
@@ -182,7 +175,7 @@ services:
   # what ./om's dev loop builds from, and that stack's pmm-server is still
   # v2.0.5. Bumping the default would fix this pairing and break that one.
   pmm-client-node00: &client-node
-    image: ghcr.io/plebioda/pmm-client-node:pr-4571-2f183d5
+    image: ghcr.io/plebioda/pmm-client-node:pr-4571-1a75a83
     restart: unless-stopped
     networks: [om-demo]
     cgroup: host
@@ -209,17 +202,17 @@ services:
 
   pmm-client-rocky-node00:
     <<: *client-node
-    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-2f183d5
+    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-1a75a83
     hostname: pmm-client-rocky-node00
 
   pmm-client-rocky-node01:
     <<: *client-node
-    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-2f183d5
+    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-1a75a83
     hostname: pmm-client-rocky-node01
 
   pmm-client-rocky-node02:
     <<: *client-node
-    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-2f183d5
+    image: ghcr.io/plebioda/pmm-client-node-rocky:pr-4571-1a75a83
     hostname: pmm-client-rocky-node02
 
 networks:
