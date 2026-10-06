@@ -42,7 +42,7 @@ genuine first-boot test rather than a restart of the previous one.
 ## Why not just `docker compose up -d`?
 
 `compose.yaml` alone cannot wire OpenManager's PMM-side probe correctly.
-Enabling it authenticates to SEP with `PMM_SEP_TOKEN`, which must equal
+Enabling it authenticates to SEP with `PMM_EXTENSIONS_TOKEN`, which must equal
 SEP's own derived internal token - an HMAC of a secret (`SECRET_KEY`) that
 PMM itself mints on first boot and writes into the shared `pmm-extensions` volume.
 That secret does not exist until pmm-server has already started once, so

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Bring up the whole stack (or bring it back up after --fresh wipes it),
-# deriving PMM_SEP_TOKEN from whatever SECRET_KEY this boot's pmm-server
+# deriving PMM_EXTENSIONS_TOKEN from whatever SECRET_KEY this boot's pmm-server
 # actually minted rather than needing one supplied ahead of time.
 #
-# compose.yaml alone cannot do this: PMM_SEP_TOKEN must equal SEP's own
-# derived SEP_INTERNAL_TOKEN (HMAC-SHA256 of the SECRET_KEY PMM writes into
+# compose.yaml alone cannot do this: PMM_EXTENSIONS_TOKEN must equal SEP's own
+# derived EXTENSIONS_INTERNAL_TOKEN (HMAC-SHA256 of the SECRET_KEY PMM writes into
 # the pmm-extensions volume on first boot, label b"extensions-internal-token" - see SEP's
 # Settings.derive_internal_token), and that key does not exist until
 # pmm-server has already started once. So this script starts pmm-server and
@@ -44,7 +44,7 @@ if [[ $fresh -eq 1 ]]; then
     docker compose down -v
 fi
 
-echo "==> Starting pmm-server + sep-sidecar (PMM_SEP_TOKEN may still be the placeholder)"
+echo "==> Starting pmm-server + sep-sidecar (PMM_EXTENSIONS_TOKEN may still be the placeholder)"
 docker compose up -d pmm-server sep-sidecar
 
 echo "==> Waiting for sep-sidecar to report healthy"
@@ -52,20 +52,20 @@ until [[ "$(docker inspect -f '{{.State.Health.Status}}' om-demo-sep-sidecar-1 2
     sleep 3
 done
 
-echo "==> Deriving PMM_SEP_TOKEN from this boot's SECRET_KEY"
+echo "==> Deriving PMM_EXTENSIONS_TOKEN from this boot's SECRET_KEY"
 secret_key="$(docker exec om-demo-sep-sidecar-1 cat /run/secrets/extensions/SECRET_KEY)"
 token="$(python3 -c "
 import hmac, hashlib, sys
 print(hmac.new(sys.argv[1].encode(), b'extensions-internal-token', hashlib.sha256).hexdigest())
 " "$secret_key")"
 
-echo "==> Writing PMM_SEP_TOKEN to .env and recreating pmm-server"
+echo "==> Writing PMM_EXTENSIONS_TOKEN to .env and recreating pmm-server"
 # .env, not a one-off overlay: compose auto-loads it for every subsequent
 # `up`, including the plain one below - an overlay used for only one `up`
 # call gets silently reverted the next time compose reconciles against
 # compose.yaml alone, right back to the placeholder.
-grep -v '^PMM_SEP_TOKEN=' .env 2> /dev/null > .env.tmp || true
-printf 'PMM_SEP_TOKEN=%s\n' "$token" >> .env.tmp
+grep -v '^PMM_EXTENSIONS_TOKEN=' .env 2> /dev/null > .env.tmp || true
+printf 'PMM_EXTENSIONS_TOKEN=%s\n' "$token" >> .env.tmp
 mv .env.tmp .env
 docker compose up -d pmm-server
 
