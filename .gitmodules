@@ -1,8 +1,8 @@
 [submodule "pmm"]
 	path = pmm
 	url = git@github.com:percona/pmm.git
-	branch = PMM-15742-om-admin-user
+	branch = main
 [submodule "SEP"]
 	path = SEP
 	url = git@github.com:percona/SEP.git
-	branch = PMM-15742-om-admin-user
+	branch = main
