@@ -1,0 +1,77 @@
+# PMM and PMM Extensions from their published images, nothing built from the pmm/
+# or SEP/ checkouts: the stack the operations-demo host runs, as a customer would.
+# The dev loop (./om start pmm sep) runs the same pair from source instead.
+#
+# The psmdb/compose.yaml nodes join this unchanged, because it keeps everything
+# they address: the container name pmm-server, admin/admin, and the pmm_default
+# network. README.md covers bring-up, the RC node images, and switching between
+# this and the dev stack on one host.
+
+name: om-release
+
+services:
+  pmm-server:
+    # 3.10.0-rc is a moving tag; rc<build> is the one it pointed at when pinned.
+    image: ${PMM_SERVER_IMAGE:-perconalab/pmm-server:3.10.0-rc3002@sha256:0014c6dd7ab5a68a2a3a91ff56a7eb0f9848b708f22d5a8d975946c03c6ce89a}
+    container_name: pmm-server
+    hostname: pmm-server
+    restart: unless-stopped
+    environment:
+      PMM_ENABLE_OM: "1"
+      PMM_ENABLE_NOMAD: "1"
+      PMM_PUBLIC_ADDRESS: pmm-server
+      PMM_ENABLE_EXTENSIONS: "1"
+      PMM_EXTENSIONS_ADDRESS: pmm-extensions:9000
+      PMM_EXTENSIONS_URL: http://pmm-extensions:9000
+      PMM_EXTENSIONS_TOKEN: ${PMM_EXTENSIONS_TOKEN:?generate one into .env, see README.md}
+    ports:
+      - "${PMM_PORT_HTTPS:-8443}:8443"
+    volumes:
+      - pmm-data:/srv
+      - pmm-extensions:/srv/extensions
+    # The image ships no HEALTHCHECK, and depends_on below needs one. 240s covers
+    # a first boot on an empty /srv, as in harness/pmm-compose.override.yml.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/v1/server/readyz"]
+      interval: 4s
+      timeout: 2s
+      retries: 3
+      start_period: 240s
+
+  pmm-extensions:
+    image: ${PMM_EXTENSIONS_IMAGE:-percona/pmm-extensions:3.10.0-rc1@sha256:11f3d63458e6dce2d2f7c1e51d99eee6113e235b936b57e972e43b5b5339a4c1}
+    container_name: pmm-extensions
+    hostname: pmm-extensions
+    restart: unless-stopped
+    depends_on:
+      pmm-server:
+        condition: service_healthy
+    # PMM writes the secrets 0640 group 0; the image runs as uid 1001.
+    group_add: ["0"]
+    environment:
+      SECRETS_DIR: /run/secrets/extensions
+      EXTENSIONS_INTERNAL_TOKEN: ${PMM_EXTENSIONS_TOKEN:?generate one into .env, see README.md}
+      # Where Nomad jobs on the nodes download from, so a name they resolve.
+      BASE_URL: https://pmm-server:8443/extensions
+    volumes:
+      - pmm-extensions:/run/secrets/extensions:ro
+      # The minted ENCRYPTION_KEY and Grafana token; losing the key is unrecoverable.
+      - pmm-extensions-state:/home/extensions/state
+    # The published image lost its HEALTHCHECK in the OCI build (SEP/sidecar/README.md
+    # "docker manifest format"); these are the values that file documents.
+    healthcheck:
+      test: ["CMD", "/home/extensions/app/healthcheck.sh"]
+      interval: 15s
+      timeout: 15s
+      retries: 5
+      start_period: 150s
+
+networks:
+  default:
+    name: pmm_default
+    external: true
+
+volumes:
+  pmm-data:
+  pmm-extensions:
+  pmm-extensions-state:

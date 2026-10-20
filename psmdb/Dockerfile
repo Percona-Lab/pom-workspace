@@ -83,6 +83,10 @@ ARG BASE_OS=ubuntu
 # need a rebuild.
 ARG PSMDB_REPO=psmdb-70
 
+# The percona-release channel pmm-client comes from. `testing` carries release
+# candidates, which is how harness/release/ puts an RC client on every node.
+ARG PMM_CLIENT_CHANNEL=release
+
 # 1 for a database node, 0 for a pmm-client-only host. Everything that differs
 # between the two is conditional on this single argument, so the client build
 # cannot drift into being a different base image with a different libc, a
@@ -170,7 +174,7 @@ RUN if [ "${BASE_OS}" = "ubuntu" ]; then \
 # build stays a true preview of what a bootstrap run does.
 RUN percona-release enable-only "${PSMDB_REPO}" release \
     && percona-release enable pbm release \
-    && percona-release enable pmm3-client release \
+    && percona-release enable pmm3-client "${PMM_CLIENT_CHANNEL}" \
     && if [ "${BASE_OS}" = "ubuntu" ]; then \
         apt-get update \
         && apt-get install -y --no-install-recommends pmm-client \
