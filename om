@@ -10,6 +10,12 @@
 #                           .env files, PMM, SEP's venv and migrations, then
 #                           everything else. Idempotent, so it is also the way
 #                           back when a workspace has drifted.
+#   ./om bootstrap --release
+#                           the same, but PMM and PMM Extensions from the published
+#                           images pinned in harness/release/versions.env, and
+#                           nodes on the matching client. Needs neither checkout
+#                           and compiles nothing. Remembered, so later commands
+#                           drive that stack; --dev switches back.
 #   ./om env                write pmm/.env and SEP/.env from the harness templates,
 #                           generating the secrets they share (-y to skip the
 #                           overwrite prompt). Run it again after ./om start pmm if
@@ -280,6 +286,29 @@ PY
 }
 PID_DIR="$STATE_DIR/pids"
 LOG_DIR="$STATE_DIR/logs"
+
+# The release stack (harness/release): PMM and PMM Extensions from published images
+# instead of the dev container and native SEP. `./om bootstrap --release` records
+# the choice in STACK_FILE and every later command follows it; reset leaves it.
+RELEASE_DIR="$HARNESS_DIR/release"
+RELEASE_VERSIONS="$RELEASE_DIR/versions.env"
+RELEASE_ENV="$RELEASE_DIR/.env"
+RELEASE_PROJECT=om-release
+EXTENSIONS_CONTAINER=pmm-extensions
+STACK_FILE="$STATE_DIR/stack"
+
+release_mode() { [[ "$(cat "$STACK_FILE" 2>/dev/null)" == release ]]; }
+
+# What a bare start/stop/status acts on: in release mode SEP is the side-car, which
+# comes and goes with pmm.
+default_components() {
+  if release_mode; then echo pmm; else echo pmm sep-backend sep-frontend; fi
+}
+
+release_skips_sep() { # comp -> 0 when release mode has nothing to do for it
+  release_mode || return 1
+  dim "$1: PMM Extensions runs as the $EXTENSIONS_CONTAINER container, with pmm"
+}
 
 # PMM's dev container publishes HTTPS on this host port. 8443 (not PMM's own
 # default of 443) because SEP's settings.yaml pins PMM.ENDPOINT to
@@ -607,6 +636,11 @@ cmd_doctor() {
 
   if docker compose version >/dev/null 2>&1; then ok "docker compose plugin"
   else err "'docker compose' plugin not found (v1 'docker-compose' is not supported)"; fail=1; fi
+
+  if release_mode; then
+    ok "release stack: no make, node, pnpm or pmm/ and SEP/ checkouts needed"
+    return $fail
+  fi
 
   command -v make >/dev/null 2>&1 && ok "make" || { err "make not found"; fail=1; }
   command -v python3 >/dev/null 2>&1 && ok "python3 $(python3 -V 2>&1 | awk '{print $2}')" \
@@ -939,6 +973,7 @@ env_sep() { # mode: create | refresh
 }
 
 cmd_env() {
+  release_mode && die "pmm/.env and SEP/.env belong to the dev stack; the release stack's token is in ${RELEASE_ENV#"$ROOT"/}"
   local mode=refresh
   while (($#)); do
     case "$1" in
@@ -1004,6 +1039,7 @@ om_setup_pmm() {
 }
 
 cmd_setup() {
+  release_mode && die "the release stack has no SEP venv or migrations to set up; ./om bootstrap --release"
   cmd_doctor || warn "some prerequisites are missing — continuing with what is possible"
   echo
   # Before either component: SEP's .env derives its password from PMM's, so the
@@ -1048,6 +1084,28 @@ cmd_setup() {
 # an up-to-date venv are all left as they are, so this doubles as the "put it back
 # the way it should be" command rather than being a one-shot.
 cmd_bootstrap() {
+  local have=dev want=""
+  release_mode && have=release
+  case "${1:-}" in
+    "") want="$have" ;;
+    --release) want=release ;;
+    --dev) want=dev ;;
+    *) die "usage: ./om bootstrap [--release|--dev]" ;;
+  esac
+  if [[ "$want" != "$have" ]]; then
+    if stack_has_state "$have"; then
+      err "this workspace runs the $have stack, and its PMM or registered nodes are still here"
+      dim "nodes register with one PMM server, so switching starts PMM and every node"
+      dim "from scratch. That deletes the cluster data and PMM's /srv:"
+      dim "  ./om reset data && ./om bootstrap --$want"
+      exit 1
+    fi
+    mkdir -p "$STATE_DIR"
+    if [[ "$want" == release ]]; then echo release > "$STACK_FILE"; else rm -f "$STACK_FILE"; fi
+    ok "this workspace now runs the $want stack"
+  fi
+  [[ "$want" == release ]] && { bootstrap_release; return 0; }
+
   info "bootstrap: PMM, SEP, and the dotenv files they share"
   dim "safe to re-run - each step leaves existing state alone"
   echo
@@ -1079,6 +1137,34 @@ cmd_bootstrap() {
   dim "PMM:  https://localhost:$PMM_HTTPS_PORT  (admin/admin)"
   dim "next: ./om build pmm     compile the PMM working tree into the server"
   dim "      ./om start <cluster>   standalone | replicaset-cluster | sharded-cluster | ..."
+}
+
+bootstrap_release() {
+  info "bootstrap: PMM and PMM Extensions from published images"
+  dim "pinned in ${RELEASE_VERSIONS#"$ROOT"/}; pmm/ and SEP/ are not used"
+  echo
+
+  info "1/2  PMM and PMM Extensions"
+  start_release
+  echo
+
+  info "2/2  the rest of the stack"
+  cmd_start
+  echo
+
+  ok "bootstrap complete"
+  dim "PMM:  https://localhost:$PMM_HTTPS_PORT  (admin/admin), Operations for MongoDB on"
+  dim "next: ./om start <cluster>   standalone | replicaset-single | replicaset-cluster | pmm-client | pmm-client-rocky"
+}
+
+# Whether a stack holds anything a switch would strand: its PMM container, or nodes,
+# whose identity on the agent-state volume belongs to that stack's server.
+stack_has_state() { # dev|release
+  local project=pmm
+  [[ "$1" == release ]] && project="$RELEASE_PROJECT"
+  [[ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$project" \
+            --filter "label=com.docker.compose.service=pmm-server" 2>/dev/null)" ]] && return 0
+  docker volume inspect psmdb-sandbox_agent-state >/dev/null 2>&1
 }
 
 # A fresh clone has empty submodule directories and every later step then fails in
@@ -1302,6 +1388,54 @@ stop_pmm() {
   # is what removes them.
   pmm_compose stop
   ok "pmm stopped (container kept; ./om reset removes it and its /srv)"
+}
+
+# Pins from versions.env; the token comes from .env, which compose loads from the
+# project directory. The placeholder only lets stop/down run before one exists.
+release_compose() {
+  (
+    set -a
+    # shellcheck source=/dev/null
+    . "$RELEASE_VERSIONS"
+    set +a
+    [[ -f "$RELEASE_ENV" ]] || export PMM_EXTENSIONS_TOKEN=not-generated
+    cd "$RELEASE_DIR" && docker compose "$@"
+  )
+}
+
+start_release() {
+  info "pmm: release stack (harness/release)"
+  [[ -f "$RELEASE_VERSIONS" ]] || die "$RELEASE_VERSIONS is missing"
+  docker network inspect "$PSMDB_NETWORK" >/dev/null 2>&1 \
+    || docker network create "$PSMDB_NETWORK" >/dev/null
+  if [[ ! -f "$RELEASE_ENV" ]]; then
+    ( umask 077 && printf 'PMM_EXTENSIONS_TOKEN=%s\n' "$(gen_secret 32)" > "$RELEASE_ENV" )
+    ok "generated the token PMM and PMM Extensions share (${RELEASE_ENV#"$ROOT"/})"
+  fi
+
+  # Pulled first so the wait below measures health rather than a download (start_pmm).
+  local key img
+  for key in PMM_SERVER_IMAGE PMM_EXTENSIONS_IMAGE; do
+    img="$(env_value "$RELEASE_VERSIONS" "$key")"
+    docker image inspect "$img" >/dev/null 2>&1 && continue
+    info "pulling $img"
+    docker pull -q "$img" >/dev/null || die "could not pull $img - check the pin and your network"
+  done
+
+  local t0=$SECONDS
+  if ! release_compose up -d --wait --wait-timeout 600; then
+    err "the release stack did not become healthy (gave up after $((SECONDS - t0))s)"
+    dim "docker logs $PMM_CONTAINER | tail -50"
+    dim "docker logs $EXTENSIONS_CONTAINER | tail -50"
+    die "aborting; re-run ./om start pmm once it is healthy"
+  fi
+  ok "$PMM_CONTAINER and $EXTENSIONS_CONTAINER up - https://localhost:$PMM_HTTPS_PORT (admin/admin)"
+}
+
+stop_release() {
+  info "pmm: release stack stopped"
+  release_compose stop
+  ok "pmm stopped (containers and volumes kept)"
 }
 
 start_sep_backend() {
@@ -1634,11 +1768,29 @@ cmd_hosts() {
 # vice versa. Both are cached on the tag alone: change the Dockerfile or anything
 # under psmdb/scripts and you must rebuild by hand, since an existing tag is
 # taken at face value here.
+#
+# The one exception is the client: the release stack overlays every node with the
+# client image versions.env pins, recorded as the om.client label. An image whose
+# label does not match the stack is rebuilt, so switching stacks or bumping the pin
+# needs no manual step. Images built before the label existed count as dev.
 ensure_node_image() {
   local image="$1"; shift
-  docker image inspect "$image" >/dev/null 2>&1 && return 0
-  info "psmdb: building $image (first time only, a few minutes)"
-  ( cd "$PSMDB_DIR" && docker build "$@" -t "$image" . ) \
+  local flavor=dev client have
+  local -a args=()
+  if release_mode; then
+    client="$(env_value "$RELEASE_VERSIONS" PMM_CLIENT_IMAGE)"
+    flavor="release $client"
+    args=(--build-arg PMM_CLIENT_OVERLAY=full --build-arg PMM_CLIENT_FB_IMAGE="$client"
+          --build-arg PMM_CLIENT_CHANNEL="$(env_value "$RELEASE_VERSIONS" PMM_CLIENT_CHANNEL)")
+  fi
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    have="$(docker image inspect -f '{{index .Config.Labels "om.client"}}' "$image" 2>/dev/null || true)"
+    [[ "${have:-dev}" == "$flavor" ]] && return 0
+    info "psmdb: rebuilding $image for the ${flavor%% *} stack's client (a few minutes)"
+  else
+    info "psmdb: building $image (first time only, a few minutes)"
+  fi
+  ( cd "$PSMDB_DIR" && docker build "$@" "${args[@]}" --label "om.client=$flavor" -t "$image" . ) \
     || die "failed to build $image"
   ok "image built"
 }
@@ -1745,11 +1897,24 @@ start_sandbox_node() {
     done < <(docker ps --format '{{.Names}}' | grep -E "$pattern" || true)
     if [[ "$ready" -ge "$nodes" ]] && [[ "$nodes" -gt 0 ]]; then
       ok "$profile: $nodes/$nodes node(s) up and registered with PMM"
+      release_mode && release_inventory_sync
       return 0
     fi
     sleep 5
   done
   warn "$profile: only $ready/$nodes node(s) finished bootstrap — ./om logs $profile"
+}
+
+# PMM Extensions pulls PMM's inventory every 15 minutes, the shipped default (the dev
+# overlay says 1), so a node started now would stay out of Operations until then.
+release_inventory_sync() {
+  local code
+  code="$(sep_api inventory sync/ -X POST -o /dev/null -w '%{http_code}' 2>/dev/null || true)"
+  if [[ "$code" == 202 ]]; then
+    dim "asked PMM Extensions to pull PMM's inventory now"
+  else
+    warn "could not trigger the inventory sync (HTTP ${code:-none}); it runs by itself within 15 minutes"
+  fi
 }
 
 stop_sandbox_node() {
@@ -1830,7 +1995,20 @@ reset_data() {
     ok "psmdb containers and data volumes removed"
   fi
 
+  reset_release_data
   reset_pmm_data
+}
+
+# Both stacks' data whichever one is current, so `reset data` is also how a
+# workspace switches stacks cleanly (see cmd_bootstrap).
+reset_release_data() {
+  [[ -f "$RELEASE_VERSIONS" ]] || return 0
+  [[ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$RELEASE_PROJECT" 2>/dev/null)" \
+     || -n "$(docker volume ls -q --filter "label=com.docker.compose.project=$RELEASE_PROJECT" 2>/dev/null)" ]] \
+    || return 0
+  release_compose down -v >/dev/null 2>&1 \
+    && ok "removed the release stack's containers and volumes (PMM's /srv, the side-car's keys)" \
+    || warn "could not remove the release stack - docker ps -a --filter label=com.docker.compose.project=$RELEASE_PROJECT"
 }
 
 # PMM's /srv, which is the volume people mean when a container will not start.
@@ -1848,9 +2026,13 @@ reset_data() {
 reset_pmm_data() {
   docker volume inspect pmm-data >/dev/null 2>&1 || { dim "no pmm-data volume"; return 0; }
 
+  # Found by compose label, not by name: the release stack's container is also
+  # called pmm-server, and a renamed dev container still holds the volume.
+  local dev=(--filter "label=com.docker.compose.project=pmm" --filter "label=com.docker.compose.service=pmm-server")
+
   # The container holds the volume open, and a running PMM is also the one case
   # where wiping it is more likely to be a mistake than an intention.
-  if docker ps --format '{{.Names}}' | grep -qx "$PMM_CONTAINER"; then
+  if [[ -n "$(docker ps -q "${dev[@]}")" ]]; then
     warn "$PMM_CONTAINER is running; kept its /srv volume"
     dim "to clear it: ./om stop pmm && ./om reset data"
     return 0
@@ -1860,9 +2042,10 @@ reset_pmm_data() {
   # stopped rather than removing it, that is the normal state by the time a reset
   # gets here. Without this the removal below fails and reports "something still has
   # it open" about a container the reset itself stopped a second earlier.
-  if docker ps -a --format '{{.Names}}' | grep -qx "$PMM_CONTAINER" \
-     && docker rm -f "$PMM_CONTAINER" >/dev/null 2>&1; then
-    ok "removed the stopped $PMM_CONTAINER, which held /srv open"
+  local stopped
+  stopped="$(docker ps -aq "${dev[@]}")"
+  if [[ -n "$stopped" ]] && docker rm -f $stopped >/dev/null 2>&1; then
+    ok "removed the stopped dev PMM container, which held /srv open"
   fi
 
   if docker volume rm pmm-data >/dev/null 2>&1; then
@@ -1908,8 +2091,8 @@ reset_all() {
   # than dropping them: PMM_EXTENSIONS_POSTGRES_PASSWORD would survive into a workspace
   # whose `sep` role no longer exists, and `./om env` would faithfully reuse a
   # password for a role that is about to be provisioned with a different one.
-  rm -f "$PMM_DIR/.env" "$SEP_DIR/.env"
-  ok "removed pmm/.env and SEP/.env"
+  rm -f "$PMM_DIR/.env" "$SEP_DIR/.env" "$RELEASE_ENV"
+  ok "removed pmm/.env, SEP/.env and the release stack's token"
   dim "./om env regenerates both, including a fresh Grafana token"
 }
 
@@ -1920,6 +2103,14 @@ reset_all() {
 # "and re-download the image", and the ones who do know they mean it.
 reset_images() {
   local img
+  if release_mode; then
+    local key
+    for key in PMM_SERVER_IMAGE PMM_EXTENSIONS_IMAGE PMM_CLIENT_IMAGE; do
+      img="$(env_value "$RELEASE_VERSIONS" "$key")"
+      docker image rm -f "$img" >/dev/null 2>&1 && ok "removed $img" || dim "$img was not present locally"
+    done
+    return 0
+  fi
   img="$(env_value "$PMM_DIR/.env" PMM_SERVER_IMAGE)"
   [[ -n "$img" ]] || img="$(sed -n 's/^PMM_SERVER_IMAGE=//p' "$PMM_DIR/.env.dev.example" | tail -1)"
   [[ -n "$img" ]] || { dim "no PMM_SERVER_IMAGE to remove"; return 0; }
@@ -1934,7 +2125,8 @@ reset_images() {
 
 RESET_USAGE="usage: ./om reset <state|data|all> [--env] [--images]
     state    run state and rendered settings (safe)
-    data     ...and SEP's databases, the cluster volumes and PMM's /srv (pmm-data)
+    data     ...and SEP's databases, the cluster volumes and PMM's /srv (pmm-data,
+             and the release stack's volumes)
     all      ...and the venv, node_modules, devcontainer caches, the PMM
              container, the psmdb images, and both .env files
     --env    also delete the .env files on the state/data tiers ('all' always does)
@@ -2017,6 +2209,7 @@ cmd_build() {
     pmm|ui) ;;
     *) die "only 'pmm' (Go services) or 'ui' (frontend) can be built; got '$what'" ;;
   esac
+  release_mode && die "the release stack runs published images; ./om bootstrap --dev to build from source"
   docker inspect "$PMM_CONTAINER" >/dev/null 2>&1 \
     || die "$PMM_CONTAINER is not running — ./om start pmm first"
   if [[ "$what" == "ui" ]]; then
@@ -2178,7 +2371,10 @@ component_uris() { # comp -> "label<TAB>uri" lines
         "VM targets"      "$pmm/prometheus/targets" \
         "VMAlert rules"   "$pmm/prometheus/rules" \
         "VMAlert alerts"  "$pmm/prometheus/alerts" \
-        "Swagger UI"      "$pmm/swagger/" \
+        "Swagger UI"      "$pmm/swagger/"
+      # The dev container publishes these; the release stack publishes 8443 alone.
+      release_mode && return 0
+      printf '%s\t%s\n' \
         "PostgreSQL"      "postgres://$SEP_DB_USER@$SEP_DB_HOST:$SEP_DB_PORT/$SEP_DB_NAME" \
         "Delve (headless)" "127.0.0.1:2345"
       ;;
@@ -2218,7 +2414,7 @@ comp_up() { # comp -> 0 when it is running
 
 cmd_urls() {
   local only=("$@")
-  [[ ${#only[@]} -gt 0 ]] || only=(pmm sep-backend sep-frontend)
+  [[ ${#only[@]} -gt 0 ]] || read -ra only <<< "$(default_components)"
   local comp
   for comp in "${only[@]}"; do
     case "$comp" in
@@ -2247,10 +2443,28 @@ status_line() { # label, up(0/1), detail
   fi
 }
 
+status_release() {
+  if ! comp_up pmm; then
+    status_line pmm 1 "stopped (release stack)"
+    return 0
+  fi
+  status_line pmm 0 "https://localhost:$PMM_HTTPS_PORT (release stack, harness/release)"
+  local c state
+  for c in "$PMM_CONTAINER" "$EXTENSIONS_CONTAINER"; do
+    state="not created"
+    docker inspect "$c" >/dev/null 2>&1 && state="$(docker inspect -f \
+      '{{.Config.Image}} - {{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$c")"
+    dim "$c: $state"
+  done
+  print_uris pmm
+}
+
 cmd_status() {
   info "Components"
 
-  if [[ "$(docker inspect -f '{{.State.Running}}' "$PMM_CONTAINER" 2>/dev/null)" == "true" ]]; then
+  if release_mode; then
+    status_release
+  elif [[ "$(docker inspect -f '{{.State.Running}}' "$PMM_CONTAINER" 2>/dev/null)" == "true" ]]; then
     local ui_note="image bundle — no SEP apps, run './om build ui'"
     pmm_ui_has_sep && ui_note="working tree UI, SEP apps included"
     status_line pmm 0 "https://localhost:$PMM_HTTPS_PORT (container $PMM_CONTAINER)"
@@ -2260,8 +2474,9 @@ cmd_status() {
     status_line pmm 1 "stopped"
   fi
 
-  local comp pid port
-  for comp in sep-backend sep-frontend; do
+  local comp pid port sep_comps=(sep-backend sep-frontend)
+  release_mode && sep_comps=()
+  for comp in "${sep_comps[@]}"; do
     case "$comp" in
       sep-backend)  port=$SEP_BACKEND_PORT ;;
       sep-frontend) port=$SEP_FRONTEND_PORT ;;
@@ -2376,11 +2591,16 @@ cmd_logs() {
       # compose profile - see the pmm-client(-rocky) blocks in psmdb/compose.yaml.
       if [[ -n "$follow" ]]; then psmdb_compose --profile "$comp" logs -f --tail=200
       else psmdb_compose --profile "$comp" logs --tail=200; fi ;;
+    extensions|pmm-extensions)
+      docker inspect "$EXTENSIONS_CONTAINER" >/dev/null 2>&1 \
+        || die "$EXTENSIONS_CONTAINER does not exist - it runs only in the release stack"
+      if [[ -n "$follow" ]]; then docker logs -f --tail=200 "$EXTENSIONS_CONTAINER"
+      else docker logs --tail=200 "$EXTENSIONS_CONTAINER"; fi ;;
     sep-backend|sep-frontend)
       local f; f="$(log_file "$comp")"
       [[ -f "$f" ]] || die "no log yet for $comp"
       if [[ -n "$follow" ]]; then tail -f "$f"; else tail -n 200 "$f"; fi ;;
-    "") die "usage: ./om logs <pmm|sep-backend|sep-frontend|replicaset-cluster|replicaset-single|standalone|sharded-cluster|pmm-client[-nodeNN]|pmm-client-rocky[-nodeNN]> [-f]" ;;
+    "") die "usage: ./om logs <pmm|extensions|sep-backend|sep-frontend|replicaset-cluster|replicaset-single|standalone|sharded-cluster|pmm-client[-nodeNN]|pmm-client-rocky[-nodeNN]> [-f]" ;;
     *)  die "unknown component '$comp'" ;;
   esac
 }
@@ -2441,6 +2661,13 @@ om_pmm_key() {
 # SEP derives the internal token from SECRET_KEY when EXTENSIONS_INTERNAL_TOKEN is unset, so
 # it is always available and always matches what the running backend accepts.
 sep_token() {
+  if release_mode; then
+    local token
+    token="$(env_value "$RELEASE_ENV" PMM_EXTENSIONS_TOKEN)"
+    [[ -n "$token" ]] || die "no token in ${RELEASE_ENV#"$ROOT"/} - ./om bootstrap --release first"
+    printf '%s\n' "$token"
+    return 0
+  fi
   [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
   ( cd "$SEP_DIR" && "$SEP_DIR/venv/bin/python" -c \
       'from app.core.security import get_internal_token; print(get_internal_token() or "")' \
@@ -2534,8 +2761,10 @@ pmm_psql() {
 # straight to curl, so a write is `om api topology/runs:collect -X POST -d '{}'`.
 pmm_api() {
   local path="${1#/}"; shift || true
-  curl -sk -m 30 -H "Authorization: Bearer $(om_pmm_key)" \
-    "https://127.0.0.1:${PMM_HTTPS_PORT}/v1/om/${path}" "$@"
+  local -a auth
+  if release_mode; then auth=(-u admin:admin)
+  else auth=(-H "Authorization: Bearer $(om_pmm_key)"); fi
+  curl -sk -m 30 "${auth[@]}" "https://127.0.0.1:${PMM_HTTPS_PORT}/v1/om/${path}" "$@"
 }
 
 # The same, for a reader that goes on to index the document: prints the document, or
@@ -3097,6 +3326,14 @@ inv_cmd_api() {
 }
 
 inv_cmd_sync() {
+  if release_mode; then
+    info "Syncing PMM Extensions inventory from PMM"
+    local code
+    code="$(sep_api inventory sync/ -X POST -o /dev/null -w '%{http_code}' || true)"
+    [[ "$code" == 202 ]] || die "the side-car refused the sync (HTTP ${code:-none}) - ./om logs extensions"
+    ok "sync queued; it runs in the background in $EXTENSIONS_CONTAINER"
+    return 0
+  fi
   [[ -x "$SEP_DIR/venv/bin/python" ]] || die "SEP venv missing — run ./om setup first"
   info "Syncing SEP inventory from PMM"
   dim "run this after rebuilding a cluster, or every service maps as orphaned"
@@ -3169,13 +3406,13 @@ COMPONENTS=()
 expand_components() {
   COMPONENTS=()
   if [[ $# -eq 0 ]]; then
-    COMPONENTS=(pmm sep-backend sep-frontend)
+    read -ra COMPONENTS <<< "$(default_components)"
     return 0
   fi
   local a
   for a in "$@"; do
     case "$a" in
-      all)          COMPONENTS+=(pmm sep-backend sep-frontend) ;;
+      all)          COMPONENTS+=(pmm sep-backend sep-frontend) ;;  # sep is skipped in release mode
       sep)          COMPONENTS+=(sep-backend sep-frontend) ;;
       pmm)          COMPONENTS+=(pmm) ;;
       sep-backend|backend)   COMPONENTS+=(sep-backend) ;;
@@ -3203,20 +3440,21 @@ expand_components() {
 # components explicitly bypasses all of that and means exactly what it says.
 cmd_start() {
   if [[ $# -eq 0 ]]; then
-    local remembered=() line
+    local remembered=() defaults=() line
     while read -r line; do [[ -n "$line" ]] && remembered+=("$line"); done < <(psmdb_remembered)
     if [[ ${#remembered[@]} -gt 0 ]]; then
       dim "clusters from the last ./om stop: ${remembered[*]}"
-      set -- pmm sep-backend sep-frontend "${remembered[@]}"
+      read -ra defaults <<< "$(default_components)"
+      set -- "${defaults[@]}" "${remembered[@]}"
     fi
   fi
   expand_components "$@"
   local c
   for c in "${COMPONENTS[@]}"; do
     case "$c" in
-      pmm)          start_pmm ;;
-      sep-backend)  start_sep_backend ;;
-      sep-frontend) start_sep_frontend ;;
+      pmm)          if release_mode; then start_release; else start_pmm; fi ;;
+      sep-backend)  release_skips_sep "$c" || start_sep_backend ;;
+      sep-frontend) release_skips_sep "$c" || start_sep_frontend ;;
       standalone|replicaset-single|replicaset-cluster|sharded-cluster) start_sandbox_node "$c" ;;
       pmm-client|pmm-client-node[0-9][0-9]) start_sandbox_node "$c" ;;
       pmm-client-rocky|pmm-client-rocky-node[0-9][0-9]) start_sandbox_node "$c" ;;
@@ -3230,10 +3468,11 @@ cmd_stop() {
   if [[ $# -eq 0 ]]; then
     # Record before stopping anything: afterwards there is nothing left to look at.
     psmdb_remember_up
-    local running=() line
+    local running=() defaults=() line
     while read -r line; do [[ -n "$line" ]] && running+=("$line"); done < <(psmdb_remembered)
     [[ ${#running[@]} -gt 0 ]] && dim "clusters to restore on the next ./om start: ${running[*]}"
-    set -- pmm sep-backend sep-frontend "${running[@]}"
+    read -ra defaults <<< "$(default_components)"
+    set -- "${defaults[@]}" "${running[@]}"
   fi
   expand_components "$@"
   # Reverse order so dependents go down before what they depend on.
@@ -3242,9 +3481,9 @@ cmd_stop() {
   local c
   for c in "${comps[@]}"; do
     case "$c" in
-      pmm)          stop_pmm ;;
-      sep-backend)  info "sep-backend: stopping";  stop_native sep-backend ;;
-      sep-frontend) info "sep-frontend: stopping"; stop_native sep-frontend ;;
+      pmm)          if release_mode; then stop_release; else stop_pmm; fi ;;
+      sep-backend)  release_skips_sep "$c" || { info "sep-backend: stopping";  stop_native sep-backend; } ;;
+      sep-frontend) release_skips_sep "$c" || { info "sep-frontend: stopping"; stop_native sep-frontend; } ;;
       standalone|replicaset-single|replicaset-cluster|sharded-cluster) stop_sandbox_node "$c" ;;
       pmm-client|pmm-client-node[0-9][0-9]) stop_sandbox_node "$c" ;;
       pmm-client-rocky|pmm-client-rocky-node[0-9][0-9]) stop_sandbox_node "$c" ;;
@@ -3368,7 +3607,7 @@ main() {
   # Before anything, so every command works from one rendered file. Cheap, and it
   # has to happen here rather than in start_sep_backend: migrations, the beat
   # bootstrap and the inventory sync all build settings in their own processes.
-  render_sep_settings
+  release_mode || render_sep_settings
   case "$cmd" in
     bootstrap) cmd_bootstrap "$@" ;;
     setup)   cmd_setup "$@" ;;

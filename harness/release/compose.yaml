@@ -4,15 +4,14 @@
 #
 # The psmdb/compose.yaml nodes join this unchanged, because it keeps everything
 # they address: the container name pmm-server, admin/admin, and the pmm_default
-# network. README.md covers bring-up, the RC node images, and switching between
-# this and the dev stack on one host.
+# network. `./om bootstrap --release` drives it; README.md has the details.
+# Image pins live in versions.env.
 
 name: om-release
 
 services:
   pmm-server:
-    # 3.10.0-rc is a moving tag; rc<build> is the one it pointed at when pinned.
-    image: ${PMM_SERVER_IMAGE:-perconalab/pmm-server:3.10.0-rc3002@sha256:0014c6dd7ab5a68a2a3a91ff56a7eb0f9848b708f22d5a8d975946c03c6ce89a}
+    image: ${PMM_SERVER_IMAGE:?pinned in versions.env}
     container_name: pmm-server
     hostname: pmm-server
     restart: unless-stopped
@@ -23,7 +22,7 @@ services:
       PMM_ENABLE_EXTENSIONS: "1"
       PMM_EXTENSIONS_ADDRESS: pmm-extensions:9000
       PMM_EXTENSIONS_URL: http://pmm-extensions:9000
-      PMM_EXTENSIONS_TOKEN: ${PMM_EXTENSIONS_TOKEN:?generate one into .env, see README.md}
+      PMM_EXTENSIONS_TOKEN: ${PMM_EXTENSIONS_TOKEN:?generated into .env by ./om}
     ports:
       - "${PMM_PORT_HTTPS:-8443}:8443"
     volumes:
@@ -39,7 +38,7 @@ services:
       start_period: 240s
 
   pmm-extensions:
-    image: ${PMM_EXTENSIONS_IMAGE:-percona/pmm-extensions:3.10.0-rc1@sha256:11f3d63458e6dce2d2f7c1e51d99eee6113e235b936b57e972e43b5b5339a4c1}
+    image: ${PMM_EXTENSIONS_IMAGE:?pinned in versions.env}
     container_name: pmm-extensions
     hostname: pmm-extensions
     restart: unless-stopped
@@ -48,9 +47,14 @@ services:
         condition: service_healthy
     # PMM writes the secrets 0640 group 0; the image runs as uid 1001.
     group_add: ["0"]
+    # Loopback only, on the dev stack's SEP port, so ./om's inventory and sep-api
+    # commands reach the side-car the way they reach native SEP. Browsers use
+    # PMM's /extensions/ instead.
+    ports:
+      - "127.0.0.1:8000:9000"
     environment:
       SECRETS_DIR: /run/secrets/extensions
-      EXTENSIONS_INTERNAL_TOKEN: ${PMM_EXTENSIONS_TOKEN:?generate one into .env, see README.md}
+      EXTENSIONS_INTERNAL_TOKEN: ${PMM_EXTENSIONS_TOKEN:?generated into .env by ./om}
       # Where Nomad jobs on the nodes download from, so a name they resolve.
       BASE_URL: https://pmm-server:8443/extensions
     volumes:

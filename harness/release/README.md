@@ -1,83 +1,72 @@
 # Release stack: PMM and PMM Extensions from published images
 
-`compose.yaml` runs `pmm-server` and the `pmm-extensions` side-car from their
-published images, pinned to 3.10.0 RC. Nothing is built from `pmm/` or `SEP/`.
-This is what the operations-demo host runs. The dev loop (`./om start pmm sep`)
-runs the same pair from source instead.
+The dev stack (`./om bootstrap`) compiles `pmm/` into PMM's dev container and runs
+SEP natively from `SEP/`. The release stack runs what ships instead:
 
-The sandbox nodes in `psmdb/compose.yaml` attach unchanged. They still find
-`pmm-server` on `pmm_default` with `admin`/`admin`, so `./om start <cluster>`
-works as usual.
+- `pmm-server` and `pmm-extensions` from the published images in `versions.env`
+- every sandbox node on the client image pinned there, with all binaries copied
+  from it, so the digest pins the client as exactly as it pins the server
 
-## Bring-up
+Today `versions.env` pins 3.10.0 RC: server build rc3002, extensions rc1, and the
+matching client. Everything is at pmm commit `b5463d651`, and Nomad is 2.0.7 on
+both ends. Operations for MongoDB is on from boot. This is what the
+operations-demo host runs.
 
-From the workspace root, with the dev stack stopped (see below):
-
-```bash
-docker network inspect pmm_default >/dev/null 2>&1 || docker network create pmm_default
-cd harness/release
-[ -f .env ] || printf 'PMM_EXTENSIONS_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
-docker compose up -d --wait
-```
-
-`.env` holds the bearer token pmm-managed and the side-car share. Keep it: a new
-token means recreating both containers.
-
-Operations for MongoDB is on from the start (`PMM_ENABLE_OM=1`). PMM's
-`PMMSyncer` pulls inventory into the side-car every 15 minutes, the shipped
-default, so nodes registered after boot are missing from Operations for up to
-15 minutes. To pull now (202 means queued):
+## Run it
 
 ```bash
-T=$(sed -n 's/^PMM_EXTENSIONS_TOKEN=//p' harness/release/.env)
-docker exec pmm-server curl -s -o /dev/null -w '%{http_code}\n' -X POST \
-  -H "Authorization: Bearer $T" http://pmm-extensions:9000/api/apps/inventory/sync/
+git clone git@github.com:Percona-Lab/pom-workspace.git && cd pom-workspace
+git checkout PMM-15347-om-integration
+./om bootstrap --release
+./om start standalone replicaset-single replicaset-cluster pmm-client pmm-client-rocky
 ```
 
-`docker exec pmm-extensions python ...` does not work for this: the side-car's
-minted keys reach its supervised programs only, not an exec'd shell.
+No submodules or toolchains are needed, only Docker with the compose plugin.
+The nodes run systemd, and the full set above needs more than the default 128
+`fs.inotify.max_user_instances`. Raise it to 1024 first, because a node that
+cannot get one exits 255 with no output at all.
 
-## Node images on the RC client
+The first run downloads about 6 GB of images, plus the packages the three node
+images install, so expect 20 to 30 minutes. With everything cached, a run took
+10 minutes on operations-demo. PMM is then at <https://localhost:8443>
+(`admin`/`admin`). The side-car's API is on `127.0.0.1:8000`, which is what
+`./om inventory` and `./om sep-api` use.
 
-The node images normally carry the released pmm-client. For the RC, rebuild all
-three from `psmdb/` before starting any nodes. Nomad has to match on both ends,
-and that is why the bare-client overlay comes from the RC client image:
+`./om` remembers the choice in `.om/stack`, so `start`, `stop`, `status`, `logs`,
+`reset` and `bootstrap` drive this stack from then on. `./om build`, `env` and
+`setup` belong to the dev stack and say so.
+
+Starting nodes also asks PMM Extensions to pull PMM's inventory right away.
+Otherwise they would stay out of Operations until its 15-minute sync. Scans run
+every 10 minutes, or on demand from the Operations pages.
+
+## Switching stacks
+
+Nodes register with one PMM server, so a switch starts PMM and every node from
+scratch:
 
 ```bash
-cd psmdb
-RC_CLIENT=docker.io/perconalab/pmm-client:3.10.0-rc@sha256:5fc2d8f1af16469209a5bdf686b5ec6b99904b9c9160619ca2085adfc02bf13c
-docker build --build-arg PMM_CLIENT_CHANNEL=testing -t openmanager/psmdb-node:7.0 .
-docker build --build-arg PMM_CLIENT_CHANNEL=testing --build-arg WITH_PSMDB=0 \
-  --build-arg PMM_CLIENT_FB_IMAGE=$RC_CLIENT -t openmanager/pmm-client-node:3 .
-docker build --build-arg PMM_CLIENT_CHANNEL=testing --build-arg WITH_PSMDB=0 --build-arg BASE_OS=rocky \
-  --build-arg PMM_CLIENT_FB_IMAGE=$RC_CLIENT -t openmanager/pmm-client-node-rocky:3 .
+./om reset data && ./om bootstrap --release    # or --dev to go back
 ```
 
-Then `./om start standalone replicaset-single replicaset-cluster pmm-client pmm-client-rocky`.
-Check the result with `pmm-admin --version` on a node and `tools/nomad version` on both sides.
-
-## Living next to ./om
-
-Both stacks use the container name `pmm-server` and port 8443, so only one can
-run at a time. Their volumes are separate (`om-release_*` here, `pmm-data` for
-the dev stack), so switching leaves the other one's data alone.
-
-- **Dev to release:** `./om stop sep pmm` keeps the dev container, so rename it
-  out of the way (`docker rename pmm-server pmm-server-dev`). Stop the nodes and
-  empty the `psmdb-sandbox_agent-state` volume, since those identities belong to
-  the dev server. Then do the bring-up above, and the nodes register afresh on
-  their next start.
-- **Release to dev:** `docker compose down` here, then `./om start pmm sep`.
-  Nodes registered with this server need `./om reregister`.
-- `./om start` with no arguments, `./om start pmm` and `./om bootstrap` all
-  start the dev server, so do not run them while this stack is up.
-- `./om status` still describes the dev server, so ignore its Delve, PostgreSQL
-  and "working tree UI" lines. Nothing here publishes more than 8443.
-- `./om reset all` deletes the node images. The next `./om start <cluster>`
-  rebuilds them on the released client, so rebuild them as above afterwards.
+`./om bootstrap` refuses to switch while the other stack's PMM or registered nodes
+are still around, and prints that command.
 
 ## Moving to the next RC or GA
 
-Change the two image pins (or set `PMM_SERVER_IMAGE` / `PMM_EXTENSIONS_IMAGE` in
-`.env`) and run `docker compose up -d --wait`. Keep the volumes, because that
-is the upgrade path PMM supports. Rebuild the node images if the client moved too.
+Edit the pins in `versions.env`, then rerun `./om bootstrap --release` and
+`./om start <the clusters>`. Containers on an older image are recreated, and
+node images whose client does not match the pin are rebuilt. PMM's volumes are
+kept, which is the upgrade path PMM supports.
+
+## Without ./om
+
+```bash
+docker network create pmm_default
+cd harness/release
+printf 'PMM_EXTENSIONS_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
+docker compose --env-file versions.env --env-file .env up -d --wait
+```
+
+Build the node images with `--build-arg PMM_CLIENT_OVERLAY=full`, plus
+`PMM_CLIENT_FB_IMAGE` and `PMM_CLIENT_CHANNEL` from `versions.env`.

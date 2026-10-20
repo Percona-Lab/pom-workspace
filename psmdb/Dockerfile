@@ -202,8 +202,21 @@ RUN percona-release enable-only "${PSMDB_REPO}" release \
 # (verified identical across both: /usr/local/percona/pmm/{bin/pmm-agent,
 # bin/pmm-admin,tools/nomad}, with /usr/sbin/pmm-{agent,admin} symlinked in).
 # WITH_PSMDB=1 database nodes are untouched and keep the released client.
+#
+# PMM_CLIENT_OVERLAY=full instead overlays every node, database ones included,
+# with the image's whole client: both binaries plus the exporters/, tools/ and
+# collectors/ trees. That makes the image digest pin the client exactly, which a
+# package channel cannot (harness/release, ./om bootstrap --release).
+ARG PMM_CLIENT_OVERLAY=agent
 RUN --mount=type=bind,from=pmm-client-fb,target=/mnt/pmm-client-fb \
-    if [ "${WITH_PSMDB}" = "0" ]; then \
+    if [ "${PMM_CLIENT_OVERLAY}" = "full" ]; then \
+        src=/mnt/pmm-client-fb/usr/local/percona/pmm dst=/usr/local/percona/pmm \
+        && cp -f "$src/bin/pmm-agent" "$src/bin/pmm-admin" "$dst/bin/" \
+        && cp -rf "$src/exporters/." "$dst/exporters/" \
+        && cp -rf "$src/tools/." "$dst/tools/" \
+        && cp -rf "$src/collectors/." "$dst/collectors/" \
+        && chown -R pmm-agent:pmm-agent "$dst/bin" "$dst/exporters" "$dst/tools" "$dst/collectors"; \
+    elif [ "${WITH_PSMDB}" = "0" ]; then \
         cp -f /mnt/pmm-client-fb/usr/local/percona/pmm/bin/pmm-agent /usr/local/percona/pmm/bin/pmm-agent \
         && cp -f /mnt/pmm-client-fb/usr/local/percona/pmm/bin/pmm-admin /usr/local/percona/pmm/bin/pmm-admin \
         && cp -f /mnt/pmm-client-fb/usr/local/percona/pmm/tools/nomad /usr/local/percona/pmm/tools/nomad \
