@@ -2554,7 +2554,9 @@ cmd_status() {
   fi
 
   echo
-  dim "logs: ./om logs <pmm|sep-backend|sep-frontend|<cluster>|pmm-client|pmm-client-rocky> [-f]"
+  local sep_logs="sep-backend|sep-frontend"
+  release_mode && sep_logs=extensions
+  dim "logs: ./om logs <pmm|$sep_logs|<cluster>|pmm-client|pmm-client-rocky> [-f]"
   dim "urls: ./om urls [comp...] — the same list for stopped components too"
   # Every line below is about reaching a *database*, so it is gated on a database
   # topology being up rather than on any node: with only client hosts running there
@@ -2907,6 +2909,8 @@ rows = [(e.get("env_name") or "-", c.get("name") or "-", s)
         for e in d["environments"] for c in e["clusters"] for s in c["services"]]
 if not rows:
     sys.exit("  no MongoDB services in the document")
+# protojson omits optional fields that are unset: a standalone has no replica-set
+# state, lag or oplog window, so read those with .get().
 def g(v, dash="-"):
     return dash if v is None else str(v)
 def num(v):
@@ -2927,15 +2931,15 @@ def short(v):
     return v
 hdr = ("SERVICE", "CLUSTER", "ROLE", "STATE", "STATUS", "VERSION", "INSTALLED", "CPU%", "FREE%", "LAG", "OPLOG")
 w = [max(len(h), *(len(x) for x in col)) for h, col in zip(hdr, zip(*[
-    (s["service_name"], cl, short(s["process_role"]), g(s["state"]), short(s["status"]), g(s["version"]),
-     g(s.get("installed_version")), num(s["cpu_usage_percent"]), num(s["connections_free_percent"]),
-     num(s["replication_lag_seconds"]), num(s["oplog_window_seconds"]))
+    (s["service_name"], cl, short(s["process_role"]), g(s.get("state")), short(s["status"]), g(s.get("version")),
+     g(s.get("installed_version")), num(s.get("cpu_usage_percent")), num(s.get("connections_free_percent")),
+     num(s.get("replication_lag_seconds")), num(s.get("oplog_window_seconds")))
     for _, cl, s in rows]))]
 print("  " + "  ".join(h.ljust(n) for h, n in zip(hdr, w)))
 for _, cl, s in rows:
-    cells = (s["service_name"], cl, short(s["process_role"]), g(s["state"]), short(s["status"]), g(s["version"]),
-             g(s.get("installed_version")), num(s["cpu_usage_percent"]), num(s["connections_free_percent"]),
-             num(s["replication_lag_seconds"]), num(s["oplog_window_seconds"]))
+    cells = (s["service_name"], cl, short(s["process_role"]), g(s.get("state")), short(s["status"]), g(s.get("version")),
+             g(s.get("installed_version")), num(s.get("cpu_usage_percent")), num(s.get("connections_free_percent")),
+             num(s.get("replication_lag_seconds")), num(s.get("oplog_window_seconds")))
     print("  " + "  ".join(c.ljust(n) for c, n in zip(cells, w)))
 '
 }
