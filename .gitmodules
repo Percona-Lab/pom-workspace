@@ -1,8 +1,8 @@
 [submodule "pmm"]
 	path = pmm
 	url = git@github.com:percona/pmm.git
-	branch = PMM-15775-blocked-hint
+	branch = PMM-15347-om-integration-v4
 [submodule "SEP"]
 	path = SEP
 	url = git@github.com:percona/SEP.git
-	branch = PMM-15775-restart-orphan
+	branch = PMM-15347-om-integration-v4
