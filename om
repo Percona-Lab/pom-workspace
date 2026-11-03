@@ -435,18 +435,29 @@ read_pid() {
   echo "$p"
 }
 
+# Whether any process of the component's group is left. Not just the leader: its
+# children close their sockets as they exit, and a start right after a stop finds
+# the port still taken until the last one is gone.
+group_alive() { # pid
+  kill -0 -- "-$1" 2>/dev/null || kill -0 "$1" 2>/dev/null
+}
+
 stop_native() { # component
   local comp="$1" pid
   if pid="$(read_pid "$comp")"; then
     # Negative PID targets the process group (see setsid note above).
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
     for _ in $(seq 1 40); do
-      kill -0 "$pid" 2>/dev/null || break
+      group_alive "$pid" || break
       sleep 0.25
     done
-    if kill -0 "$pid" 2>/dev/null; then
+    if group_alive "$pid"; then
       warn "$comp did not exit on TERM; sending KILL"
       kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      for _ in $(seq 1 40); do
+        group_alive "$pid" || break
+        sleep 0.25
+      done
     fi
     rm -f "$(pid_file "$comp")"
     ok "$comp stopped"
@@ -1103,6 +1114,9 @@ cmd_bootstrap() {
     mkdir -p "$STATE_DIR"
     if [[ "$want" == release ]]; then echo release > "$STACK_FILE"; else rm -f "$STACK_FILE"; fi
     ok "this workspace now runs the $want stack"
+    # main() skips this render while the release stack is recorded, and
+    # ensure_submodules renders only on a fresh clone.
+    [[ "$want" == release ]] || render_sep_settings
   fi
   [[ "$want" == release ]] && { bootstrap_release; return 0; }
 
