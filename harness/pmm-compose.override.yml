@@ -55,7 +55,7 @@ services:
       #
       # Nothing here is a workspace-specific config: each file is PMM's own, from
       # the checkout, at the path the image would have baked it. A feature build
-      # of the branch carries all five and needs none of these mounts, which is
+      # of the branch carries all six and needs none of these mounts, which is
       # why harness/full-stack/ pins pmm-server-fb rather than the dev image.
       #
       #   entrypoint.sh       the branch's, per above
@@ -71,7 +71,11 @@ services:
       #                       entrypoint calls it unconditionally - it owns its
       #                       own PMM_ENABLE_EXTENSIONS gate - so a missing file kills
       #                       the container even with SEP disabled
+      #   nginx.conf          names the temp directories the entrypoint creates
+      #                       (/srv/tmp since PMM-15918); the image's copy names
+      #                       /srv/nginx/tmp, so nginx -t fails and the container exits
       - ./build/docker/server/entrypoint.sh:/opt/entrypoint.sh:ro
+      - ./build/ansible/roles/nginx/files/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./build/ansible/roles/postgres/files/postgres-extensions:/opt/ansible/roles/postgres/files/postgres-extensions:ro
       - ./build/ansible/roles/postgres/files/postgres-migration:/opt/ansible/roles/postgres/files/postgres-migration:ro
       - ./build/ansible/roles/nginx/files/extensions/extensions.conf.template:/opt/ansible/roles/nginx/files/extensions/extensions.conf.template:ro
